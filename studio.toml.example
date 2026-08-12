@@ -1,0 +1,15 @@
+# RetComM Studio workspace — copy to studio.toml and adjust paths.
+# Paths are relative to this file unless absolute.
+
+catalog = "../retcomm-catalog"
+# Bundled Project Studio / migrate toolkit (copied from psxrecomp).
+psxrecomp_toolkit = "tools/new_project_layout"
+jobs = 4
+
+checkout_roots = [
+    "..",
+]
+
+# Optional explicit overrides (catalog title id → local path).
+# [titles]
+# "masters-of-teras-kasi-psx" = "../MastersOfTerasKasiRecomp"

@@ -1,0 +1,3 @@
+# Build-time deps for packaging RetComM Studio releases.
+pyinstaller>=6.3
+pillow>=10.0

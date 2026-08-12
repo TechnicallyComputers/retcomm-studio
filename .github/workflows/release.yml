@@ -1,0 +1,323 @@
+name: Release
+
+# Manual only — does not run on push/PR. Leave version empty to auto-bump the
+# next x.x.x from the latest vX.Y.Z tag, then publish a GitHub Release after a
+# successful multi-platform build.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Semver without leading v (e.g. 0.1.2). Leave empty to auto-bump from
+          the latest vX.Y.Z git tag (see bump).
+        required: false
+        type: string
+        default: ""
+      bump:
+        description: "When version is empty, which semver component to increment"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        required: false
+        default: patch
+      prerelease:
+        description: "Mark GitHub release as prerelease"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="$(printf '%s' "${{ inputs.version }}" | tr -d '[:space:]')"
+          BUMP="${{ inputs.bump || 'patch' }}"
+
+          bump_semver() {
+            local base="$1" which="${2:-patch}"
+            local ma mi pa
+            base="${base#v}"
+            base="${base%%[-+]*}"
+            if [[ ! "${base}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::cannot bump non-semver base '${base}'" >&2
+              exit 1
+            fi
+            IFS=. read -r ma mi pa <<<"${base}"
+            ma="${ma:-0}"; mi="${mi:-0}"; pa="${pa:-0}"
+            case "${which}" in
+              major) ma=$((ma + 1)); mi=0; pa=0 ;;
+              minor) mi=$((mi + 1)); pa=0 ;;
+              patch) pa=$((pa + 1)) ;;
+              *)
+                echo "::error::unknown bump '${which}' (want patch|minor|major)" >&2
+                exit 1
+                ;;
+            esac
+            printf '%s.%s.%s' "${ma}" "${mi}" "${pa}"
+          }
+
+          if [[ -z "${RAW}" ]]; then
+            LATEST="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 || true)"
+            BASE="${LATEST#v}"
+            if [[ -z "${BASE}" ]]; then
+              BASE="$(tr -d '[:space:]' < VERSION 2>/dev/null || true)"
+              BASE="${BASE#v}"
+              BASE="${BASE%%[-+]*}"
+            fi
+            BASE="${BASE:-0.0.0}"
+            VER="$(bump_semver "${BASE}" "${BUMP}")"
+            echo "Auto-bumped ${BUMP}: ${LATEST:-none (${BASE})} → ${VER}"
+          else
+            VER="${RAW#v}"
+            if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.+-]*)?$ ]]; then
+              echo "::error::Invalid version: ${VER} (expected semver like 0.1.2)" >&2
+              exit 1
+            fi
+          fi
+
+          TAG="v${VER}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1 || \
+             git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "::error::tag ${TAG} already exists — bump again or pass an explicit version" >&2
+            exit 1
+          fi
+
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building RetComM Studio ${VER} (tag ${TAG})"
+
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            librsvg2-bin imagemagick curl ca-certificates \
+            libtk8.6 libxcb1 libx11-6 fuse libfuse2
+
+      - name: Build icons
+        run: |
+          chmod +x packaging/make-icons.sh packaging/linux/*.sh
+          ./packaging/make-icons.sh
+          test -f assets/retcomm-studio.png
+          test -f assets/retcomm-studio.ico
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r packaging/requirements-build.txt
+          pip install -r tools/new_project_layout/requirements-gui.txt
+
+      - name: PyInstaller
+        run: |
+          python packaging/build_pyinstaller.py \
+            --version "${{ needs.version.outputs.version }}" \
+            --clean
+          test -x dist/RetComM-Studio/RetComM-Studio \
+            || test -f dist/RetComM-Studio/RetComM-Studio
+
+      - name: Package AppImage
+        run: |
+          ./packaging/linux/build-appimage.sh \
+            dist/RetComM-Studio \
+            "${{ needs.version.outputs.version }}" \
+            x86_64
+          test -f dist/RetComM-Studio-linux-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/RetComM-Studio-linux-x86_64.AppImage
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build icons
+        shell: bash
+        run: |
+          chmod +x packaging/make-icons.sh
+          ./packaging/make-icons.sh
+          test -f assets/retcomm-studio.png
+          test -f assets/retcomm-studio.ico
+
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r packaging/requirements-build.txt
+          pip install -r tools/new_project_layout/requirements-gui.txt
+
+      - name: PyInstaller
+        shell: bash
+        run: |
+          python packaging/build_pyinstaller.py \
+            --version "${{ needs.version.outputs.version }}" \
+            --clean
+          test -f dist/RetComM-Studio/RetComM-Studio.exe
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after innosetup install" }
+
+      - name: Package portable + installer
+        shell: pwsh
+        run: |
+          ./packaging/windows/package.ps1 `
+            -Version "${{ needs.version.outputs.version }}" `
+            -Arch x64 `
+            -InnoSetup "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $need = @(
+            "RetComM-Studio-portable-windows.zip",
+            "RetComM-Studio-windows-x64-setup.exe"
+          )
+          foreach ($n in $need) {
+            $p = Join-Path dist $n
+            if (-not (Test-Path $p)) { throw "Missing release artifact: $n" }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/RetComM-Studio-portable-windows.zip
+            dist/RetComM-Studio-windows-x64-setup.exe
+
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build icons
+        run: |
+          brew install librsvg || true
+          chmod +x packaging/make-icons.sh packaging/macos/build-dmg.sh
+          ./packaging/make-icons.sh
+          test -f assets/retcomm-studio.png
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r packaging/requirements-build.txt
+          pip install -r tools/new_project_layout/requirements-gui.txt
+
+      - name: PyInstaller
+        run: |
+          python packaging/build_pyinstaller.py \
+            --version "${{ needs.version.outputs.version }}" \
+            --clean
+          test -f dist/RetComM-Studio/RetComM-Studio
+
+      - name: Package DMG
+        run: |
+          ./packaging/macos/build-dmg.sh \
+            dist/RetComM-Studio \
+            "${{ needs.version.outputs.version }}" \
+            "${{ matrix.arch }}"
+          test -f "dist/RetComM-Studio-macos-${{ matrix.arch }}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/RetComM-Studio-macos-${{ matrix.arch }}.dmg
+
+  publish:
+    needs: [version, linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find artifacts -type f \( -name '*.AppImage' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec cp -v {} dist/ \;
+          ls -lah dist/
+          test -n "$(ls -A dist)" || { echo "No release artifacts found" >&2; exit 1; }
+          test -f dist/RetComM-Studio-linux-x86_64.AppImage
+          test -f dist/RetComM-Studio-windows-x64-setup.exe
+          test -f dist/RetComM-Studio-portable-windows.zip
+          test -f dist/RetComM-Studio-macos-arm64.dmg
+          test -f dist/RetComM-Studio-macos-x86_64.dmg
+
+      - name: Ensure release tag exists
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists locally (from fetch)."
+          elif git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
+            echo "Tag ${TAG} already exists on origin."
+            git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          else
+            echo "Creating annotated tag ${TAG} at ${GITHUB_SHA}"
+            git tag -a "${TAG}" "${GITHUB_SHA}" -m "RetComM Studio ${VERSION}"
+            git push origin "refs/tags/${TAG}"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: RetComM Studio ${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

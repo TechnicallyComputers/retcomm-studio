@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RetComM Studio
+Comment=RetComM Project Studio — new projects, migrate, bulk Git
+Exec=RetComM-Studio
+Icon=retcomm-studio
+Categories=Development;Utility;
+Terminal=false
+StartupNotify=true

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# AppImage entry for RetComM Studio (PyInstaller onedir under usr/bin).
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+export APPDIR="${APPDIR:-${HERE}}"
+export PATH="${HERE}/usr/bin:${PATH}"
+if [[ -d "${HERE}/usr/lib" ]]; then
+  export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+export RETCOMM_STUDIO_FROZEN=1
+if [[ -d "${HERE}/usr/bin/toolkit" ]]; then
+  export RETCOMM_STUDIO_TOOLKIT="${HERE}/usr/bin/toolkit"
+fi
+if [[ -d "${HERE}/usr/bin/assets" ]]; then
+  export RETCOMM_STUDIO_ASSETS="${HERE}/usr/bin/assets"
+fi
+exec "${HERE}/usr/bin/RetComM-Studio" "$@"
