@@ -61,7 +61,7 @@ fs::path find_toolkit_near(const fs::path& start) {
     return {};
 }
 
-std::string find_python() {
+std::string find_system_python() {
 #if defined(_WIN32)
     const char* candidates[] = {"python.exe", "python3.exe", "py.exe"};
 #else
@@ -69,7 +69,6 @@ std::string find_python() {
 #endif
     for (const char* c : candidates) {
 #if defined(_WIN32)
-        // where.exe
         std::string cmd = std::string("where ") + c + " >nul 2>nul";
         if (std::system(cmd.c_str()) == 0) return c;
 #else
@@ -82,6 +81,97 @@ std::string find_python() {
 #else
     return "python3";
 #endif
+}
+
+fs::path retcomm_data_dir() {
+    if (const char* env = std::getenv("RETCOMM_DATA_DIR")) {
+        if (*env) return fs::path(env);
+    }
+#if defined(_WIN32)
+    if (const char* local = std::getenv("LOCALAPPDATA")) {
+        if (*local) return fs::path(local) / "retcomm";
+    }
+    if (const char* home = std::getenv("USERPROFILE")) {
+        if (*home) return fs::path(home) / "AppData" / "Local" / "retcomm";
+    }
+#else
+    if (const char* xdg = std::getenv("XDG_DATA_HOME")) {
+        if (*xdg) return fs::path(xdg) / "retcomm";
+    }
+    if (const char* home = std::getenv("HOME")) {
+        if (*home) return fs::path(home) / ".local" / "share" / "retcomm";
+    }
+#endif
+    return {};
+}
+
+fs::path resolve_toolchain_root() {
+    if (const char* env = std::getenv("RETCOMM_TOOLCHAIN")) {
+        fs::path p(env);
+        std::error_code ec;
+        if (fs::is_directory(p, ec)) return weakly_canonical_path(p);
+    }
+    const fs::path data = retcomm_data_dir();
+    if (data.empty()) return {};
+    const fs::path base = data / "toolchains" / "cmake-clang-v1";
+    std::error_code ec;
+    const fs::path latest = base / "latest";
+    if (fs::exists(latest, ec)) {
+        fs::path resolved = weakly_canonical_path(latest);
+        if (fs::is_directory(resolved, ec)) return resolved;
+    }
+    const fs::path path_file = base / "latest.path";
+    if (fs::is_regular_file(path_file, ec)) {
+        std::FILE* f = std::fopen(path_file.string().c_str(), "r");
+        if (f) {
+            char buf[4096] = {};
+            if (std::fgets(buf, sizeof(buf), f)) {
+                std::string line(buf);
+                while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+                    line.pop_back();
+                if (!line.empty()) {
+                    fs::path p(line);
+                    if (fs::is_directory(p, ec)) {
+                        std::fclose(f);
+                        return weakly_canonical_path(p);
+                    }
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    return {};
+}
+
+std::string find_toolchain_python() {
+    if (const char* env = std::getenv("RETCOMM_PYTHON")) {
+        if (*env) {
+            std::error_code ec;
+            if (fs::is_regular_file(env, ec)) return env;
+        }
+    }
+    const fs::path root = resolve_toolchain_root();
+    if (root.empty()) return {};
+    const fs::path candidates[] = {
+#if defined(_WIN32)
+        root / "python" / "python.exe",
+        root / "python" / "bin" / "python.exe",
+#else
+        root / "python" / "bin" / "python3",
+        root / "python" / "bin" / "python",
+#endif
+    };
+    std::error_code ec;
+    for (const auto& c : candidates) {
+        if (fs::is_regular_file(c, ec)) return weakly_canonical_path(c).string();
+    }
+    return {};
+}
+
+std::string find_python() {
+    const std::string tc = find_toolchain_python();
+    if (!tc.empty()) return tc;
+    return find_system_python();
 }
 
 void prepend_env_path(const char* key, const fs::path& value) {
@@ -268,7 +358,14 @@ bool resolve_runtime(StudioModel& model, std::string* err) {
         if (err) *err = "Could not find Project Studio toolkit (tools/new_project_layout).";
         return false;
     }
+    model.toolchain_root = resolve_toolchain_root();
     model.python_exe = find_python();
+    model.toolchain_ready = !find_toolchain_python().empty();
+    // Prefer toolchain bin on PATH for cmake/ninja/ccache when present.
+    if (!model.toolchain_root.empty()) {
+        prepend_env_path("PATH", model.toolchain_root / "bin");
+        prepend_env_path("PATH", model.toolchain_root / "python" / "bin");
+    }
     return true;
 }
 
@@ -358,6 +455,10 @@ bool load_repos_from_json(StudioModel& model, const std::string& json_text, std:
             e.name = r.value("name", "");
             e.cue = r.value("cue", "");
             e.label = r.value("label", "");
+            e.in_catalog = r.value("in_catalog", false);
+            e.players = r.value("players", 2);
+            if (e.players < 1) e.players = 1;
+            if (e.players > 8) e.players = 8;
             if (e.label.empty()) {
                 e.label = e.name.empty() ? fs::path(e.path).filename().string() : e.name;
             }
@@ -373,6 +474,7 @@ bool load_repos_from_json(StudioModel& model, const std::string& json_text, std:
             model.selected_repo < static_cast<int>(model.repos.size())) {
             const auto& sel = model.repos[static_cast<size_t>(model.selected_repo)];
             std::snprintf(model.disc_cue, sizeof(model.disc_cue), "%s", sel.cue.c_str());
+            model.apply_selected_players();
         }
         return true;
     } catch (const std::exception& ex) {

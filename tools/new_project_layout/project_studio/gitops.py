@@ -1708,7 +1708,14 @@ def run_release_workflow(
         except json.JSONDecodeError:
             pass
 
+    # Prefer gh stdout URL when present (newer gh prints it); else our run-list lookup.
+    # Do not also return ``out`` as detail — CLI prints message + detail and would
+    # duplicate the same actions/runs link.
+    gh_url = (out or "").strip()
+    url = run_url or gh_url
+    if gh_url and run_url and gh_url != run_url:
+        url = run_url
     msg = "Dispatched Release builds workflow"
-    if run_url:
-        msg += f"\n{run_url}"
-    return CmdResult(True, msg, out)
+    if url:
+        msg += f"\n{url}"
+    return CmdResult(True, msg)

@@ -31,4 +31,13 @@ void StudioModel::select_repo_by_path(const std::string& path) {
     }
 }
 
+void StudioModel::apply_selected_players() {
+    if (selected_repo < 0 || selected_repo >= static_cast<int>(repos.size())) return;
+    int n = repos[static_cast<size_t>(selected_repo)].players;
+    if (n < 1) n = 1;
+    if (n > 8) n = 8;
+    players = n;
+    if (players < 2) migrate_netplay = false;
+}
+
 } // namespace retcomm::studio

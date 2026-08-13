@@ -463,6 +463,10 @@ void apply_pending_picks(StudioModel& model) {
             std::snprintf(model.np_disc, sizeof(model.np_disc), "%s", file.c_str());
         } else if (target == "np_bios") {
             std::snprintf(model.np_bios, sizeof(model.np_bios), "%s", file.c_str());
+        } else if (target == "build_scph") {
+            std::snprintf(model.gen_scph_path, sizeof(model.gen_scph_path), "%s", file.c_str());
+            model.gen_bios_mode = 1;
+            model.gen_popup_open = true;
         } else if (target == "export_log") {
             std::string body;
             {
@@ -628,13 +632,17 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
         if (model.selected_repo >= 0 &&
             model.selected_repo < static_cast<int>(model.repos.size()))
             preview = model.repos[static_cast<size_t>(model.selected_repo)].label.c_str();
-        if (ImGui::BeginCombo("##repo", preview)) {
+        if (ImGui::BeginCombo("##repo", preview, ImGuiComboFlags_HeightLarge)) {
+            int shown = 0;
             for (int i = 0; i < static_cast<int>(model.repos.size()); ++i) {
+                const auto& e = model.repos[static_cast<size_t>(i)];
+                if (model.catalog_only && !e.in_catalog) continue;
+                ++shown;
                 const bool sel = (i == model.selected_repo);
-                if (ImGui::Selectable(model.repos[static_cast<size_t>(i)].label.c_str(), sel)) {
+                if (ImGui::Selectable(e.label.c_str(), sel)) {
                     model.selected_repo = i;
-                    const auto& e = model.repos[static_cast<size_t>(i)];
                     std::snprintf(model.disc_cue, sizeof(model.disc_cue), "%s", e.cue.c_str());
+                    model.apply_selected_players();
                     retcomm::studio::run_project_studio_async(
                         model, {"repos", "set-last", "--path", e.path, "--json"},
                         [&model](RunResult r) {
@@ -642,10 +650,18 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
                             retcomm::studio::load_repos_from_json(model, r.stdout_text, &err);
                         },
                         false);
-                    model.append_log("Selected repo: " + e.path);
+                    model.append_log("Selected repo: " + e.path + " (players=" +
+                                     std::to_string(model.players) + ")");
                     refresh_branches(model, false);
                 }
                 if (sel) ImGui::SetItemDefaultFocus();
+            }
+            if (shown == 0) {
+                ImGui::BeginDisabled();
+                ImGui::Selectable(model.catalog_only ? "(no catalog repos indexed)"
+                                                    : "(no repos indexed)",
+                                 false);
+                ImGui::EndDisabled();
             }
             ImGui::EndCombo();
         }
@@ -670,8 +686,32 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
                 [&model](RunResult r) {
                     std::string err;
                     retcomm::studio::load_repos_from_json(model, r.stdout_text, &err);
+                    // If the current selection is hidden by the filter, jump to the
+                    // first catalog-backed repo so the dropdown stays coherent.
+                    if (model.catalog_only) {
+                        const bool ok =
+                            model.selected_repo >= 0 &&
+                            model.selected_repo < static_cast<int>(model.repos.size()) &&
+                            model.repos[static_cast<size_t>(model.selected_repo)].in_catalog;
+                        if (!ok) {
+                            for (int i = 0; i < static_cast<int>(model.repos.size()); ++i) {
+                                if (!model.repos[static_cast<size_t>(i)].in_catalog) continue;
+                                model.selected_repo = i;
+                                const auto& e = model.repos[static_cast<size_t>(i)];
+                                std::snprintf(model.disc_cue, sizeof(model.disc_cue), "%s",
+                                              e.cue.c_str());
+                                model.apply_selected_players();
+                                break;
+                            }
+                        }
+                    }
                 },
                 false);
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "When checked, the Game repo list only shows titles that\n"
+                "have an entry in retcomm-catalog.");
         }
     }
 
@@ -997,6 +1037,15 @@ void draw_git(StudioModel& model, const Theme& th) {
     }
     end_wrapped_line();
 
+    ImGui::TextUnformatted("Targets");
+    checkbox_wrapped("Game", &model.git_tgt_game);
+    checkbox_wrapped("Modules", &model.git_tgt_modules);
+    checkbox_wrapped("Nested", &model.git_tgt_nested);
+    end_wrapped_line();
+    ImGui::TextColored(th.text_muted,
+                       "Tick which checkouts Switch / Pull / Commit / Push "
+                       "should touch (Game / Modules / Nested).");
+
     {
         ImGui::BeginDisabled(model.branches_loading || model.busy.load() || root.empty());
         if (ImGui::Button(model.branches_loading ? "Loading branches…" : "Refresh branches##git"))
@@ -1027,12 +1076,6 @@ void draw_git(StudioModel& model, const Theme& th) {
         ImGui::SameLine();
         ImGui::Checkbox("Create", &model.git_create_branch);
     }
-    if (ImGui::Button("Switch branch")) {
-        std::vector<std::string> args = {"git", "switch", "--root", root, "--branch",
-                                         model.git_branch};
-        if (model.git_create_branch) args.push_back("--create");
-        retcomm::studio::run_project_studio_async(model, args, nullptr);
-    }
 
     constexpr float kBranchW = 260.f;
     branch_combo("##git_psx", "psxrecomp", model.git_psx_branch, sizeof(model.git_psx_branch),
@@ -1043,29 +1086,82 @@ void draw_git(StudioModel& model, const Theme& th) {
                  kLabelW, model.branches_net, kBranchW);
     branch_combo("##git_rb", "rbengine", model.git_rb_branch, sizeof(model.git_rb_branch),
                  kLabelW, model.branches_rb, kBranchW);
-    if (ImGui::Button("Switch modules")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"git", "switch", "--root", root, "--modules"}, nullptr);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Switch nested")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"git", "switch", "--root", root, "--nested"}, nullptr);
+
+    if (ImGui::Button("Switch branch")) {
+        if (!(model.git_tgt_game || model.git_tgt_modules || model.git_tgt_nested)) {
+            model.append_log("[FAIL] Enable at least one Target (Game / Modules / Nested)");
+        } else if (model.git_tgt_game && !model.git_branch[0]) {
+            model.append_log("[FAIL] Select a game Branch (or uncheck Game)");
+        } else {
+            std::vector<std::string> args = {"git", "switch", "--root", root};
+            if (model.git_tgt_game) {
+                args.push_back("--game");
+                args.push_back("--branch");
+                args.push_back(model.git_branch);
+            }
+            if (model.git_tgt_modules) {
+                args.push_back("--modules");
+                args.push_back("--psxrecomp-branch");
+                args.push_back(model.git_psx_branch);
+                args.push_back("--ui-branch");
+                args.push_back(model.git_ui_branch);
+            }
+            if (model.git_tgt_nested) {
+                args.push_back("--nested");
+                args.push_back("--net-branch");
+                args.push_back(model.git_net_branch);
+                args.push_back("--rb-branch");
+                args.push_back(model.git_rb_branch);
+            }
+            if (model.git_create_branch) args.push_back("--create");
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
     }
 
     ImGui::Separator();
     field_row("##git_msg", "Commit msg", model.git_msg, sizeof(model.git_msg), kLabelW);
+    {
+        left_label("Pull mode", kLabelW);
+        ImGui::SetNextItemWidth(140.f);
+        const char* modes[] = {"ff-only", "rebase", "merge", "reset"};
+        int mode = model.git_pull_mode;
+        if (mode < 0 || mode > 3) mode = 0;
+        if (ImGui::Combo("##git_pull_mode", &mode, modes, 4)) model.git_pull_mode = mode;
+    }
+    auto append_git_targets = [&](std::vector<std::string>& args) {
+        if (model.git_tgt_game) args.push_back("--game");
+        if (model.git_tgt_modules) args.push_back("--modules");
+        if (model.git_tgt_nested) args.push_back("--nested");
+    };
+    auto require_git_targets = [&]() -> bool {
+        if (model.git_tgt_game || model.git_tgt_modules || model.git_tgt_nested) return true;
+        model.append_log("[FAIL] Enable at least one Target (Game / Modules / Nested)");
+        return false;
+    };
     if (action("Pull")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"git", "pull", "--root", root, "--ff-only"}, nullptr);
+        if (require_git_targets()) {
+            static const char* modes[] = {"ff-only", "rebase", "merge", "reset"};
+            const int mi =
+                (model.git_pull_mode < 0 || model.git_pull_mode > 3) ? 0 : model.git_pull_mode;
+            std::vector<std::string> args = {"git", "pull", "--root", root, "--mode", modes[mi]};
+            append_git_targets(args);
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
     }
     if (action("Commit")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"git", "commit", "--root", root, "--message", model.git_msg}, nullptr);
+        if (require_git_targets()) {
+            std::vector<std::string> args = {"git", "commit", "--root", root, "--message",
+                                             model.git_msg};
+            append_git_targets(args);
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
     }
     if (action("Push")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"git", "push", "--root", root}, nullptr);
+        if (require_git_targets()) {
+            std::vector<std::string> args = {"git", "push", "--root", root};
+            append_git_targets(args);
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
     }
     end_wrapped_line();
 
@@ -1085,7 +1181,10 @@ void draw_git(StudioModel& model, const Theme& th) {
         retcomm::studio::run_project_studio_async(
             model, {"git", "install-ci", "--root", root}, nullptr);
     }
-    if (action("Dispatch release")) {
+    accent_button(th);
+    const bool dispatch = action("Dispatch release");
+    accent_button_pop();
+    if (dispatch) {
         std::vector<std::string> args = {"git", "release", "--root", root};
         if (model.release_version[0]) {
             args.push_back("--version");
@@ -1102,6 +1201,11 @@ void draw_git(StudioModel& model, const Theme& th) {
 
 void draw_bulk(StudioModel& model, const Theme& th) {
     constexpr float kLabelW = 72.f;
+    constexpr float kBranchW = 160.f;
+    if (!model.branches_loading && model.branches_game.empty() && model.branches_psx.empty() &&
+        !model.busy.load())
+        refresh_branches(model, false);
+
     ImGui::BeginDisabled(model.busy.load());
     left_label("Jobs", kLabelW);
     if (jobs_combo("##jobs", &model.bulk_jobs, 100.f)) {
@@ -1190,12 +1294,58 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     if (bulk_btn("Refresh list")) refresh_repos(model);
     end_wrapped_line();
 
+    ImGui::TextUnformatted("Targets");
     checkbox_wrapped("Game", &model.bulk_tgt_game);
     checkbox_wrapped("Modules", &model.bulk_tgt_modules);
     checkbox_wrapped("psxrecomp", &model.bulk_tgt_psx);
     checkbox_wrapped("Nested", &model.bulk_tgt_nested);
     end_wrapped_line();
-    field_row("##bulk_msg", "Message", model.bulk_msg, sizeof(model.bulk_msg), kLabelW);
+    ImGui::TextColored(th.text_muted,
+                       "Tick which checkouts Switch branches should move "
+                       "(Game / Modules / psxrecomp / Nested).");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Submodule / branch assignments");
+    ImGui::TextColored(th.text_muted,
+                       "Pick branches, then Switch branches. Fetch refreshes remote heads "
+                       "from the selected Game repo (plus module defaults).");
+
+    auto with_default = [](const std::vector<std::string>& src) {
+        std::vector<std::string> out;
+        out.emplace_back("(default)");
+        for (const auto& s : src) {
+            if (s != "(default)") out.push_back(s);
+        }
+        return out;
+    };
+    const auto game_branches = with_default(model.branches_game);
+    const auto psx_branches = with_default(model.branches_psx);
+    const auto ui_branches = with_default(model.branches_ui);
+    const auto net_branches = with_default(model.branches_net);
+    const auto rb_branches = with_default(model.branches_rb);
+
+    branch_combo("##bulk_game", "game", model.bulk_game_branch, sizeof(model.bulk_game_branch),
+                 kLabelW, game_branches, kBranchW);
+    ImGui::SameLine();
+    branch_combo("##bulk_psx", "psx", model.bulk_psx_branch, sizeof(model.bulk_psx_branch), 36.f,
+                 psx_branches, kBranchW);
+    branch_combo("##bulk_ui", "ui", model.bulk_ui_branch, sizeof(model.bulk_ui_branch), kLabelW,
+                 ui_branches, kBranchW);
+    ImGui::SameLine();
+    branch_combo("##bulk_net", "net", model.bulk_net_branch, sizeof(model.bulk_net_branch), 36.f,
+                 net_branches, kBranchW);
+    branch_combo("##bulk_rb", "rb", model.bulk_rb_branch, sizeof(model.bulk_rb_branch), kLabelW,
+                 rb_branches, kBranchW);
+
+    checkbox_wrapped("Create branch", &model.bulk_create_branch);
+    checkbox_wrapped("Set tracking", &model.bulk_set_tracking);
+    end_wrapped_line();
+    {
+        ImGui::BeginDisabled(model.branches_loading);
+        if (bulk_btn(model.branches_loading ? "Loading branches…" : "Fetch branches"))
+            refresh_branches(model, true);
+        ImGui::EndDisabled();
+    }
 
     auto selected_paths = [&]() {
         std::vector<std::string> out;
@@ -1205,6 +1355,113 @@ void draw_bulk(StudioModel& model, const Theme& th) {
         }
         return out;
     };
+    auto select_csv = [&]() {
+        auto paths = selected_paths();
+        std::string select;
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (i) select += ",";
+            select += paths[i];
+        }
+        return select;
+    };
+
+    if (bulk_btn("Switch branches")) {
+        auto paths = selected_paths();
+        if (paths.empty()) {
+            model.append_log("[FAIL] No repos selected");
+        } else if (!(model.bulk_tgt_game || model.bulk_tgt_modules || model.bulk_tgt_psx ||
+                     model.bulk_tgt_nested)) {
+            model.append_log("[FAIL] Enable at least one Target (Game / Modules / psxrecomp / Nested)");
+        } else {
+            std::vector<std::string> args = {"git", "bulk-switch", "--select", select_csv()};
+            if (model.bulk_tgt_game) {
+                args.push_back("--game");
+                args.push_back("--branch");
+                args.push_back(model.bulk_game_branch);
+            }
+            if (model.bulk_tgt_modules) {
+                args.push_back("--modules");
+                args.push_back("--psxrecomp-branch");
+                args.push_back(model.bulk_psx_branch);
+                args.push_back("--ui-branch");
+                args.push_back(model.bulk_ui_branch);
+            }
+            if (model.bulk_tgt_psx && !model.bulk_tgt_modules) {
+                args.push_back("--psxrecomp");
+                args.push_back("--psxrecomp-branch");
+                args.push_back(model.bulk_psx_branch);
+            }
+            if (model.bulk_tgt_nested) {
+                args.push_back("--nested");
+                args.push_back("--net-branch");
+                args.push_back(model.bulk_net_branch);
+                args.push_back("--rb-branch");
+                args.push_back(model.bulk_rb_branch);
+            }
+            if (model.bulk_create_branch) args.push_back("--create");
+            if (!model.bulk_set_tracking) args.push_back("--no-track");
+            model.append_log("--- Bulk switch ---");
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
+    }
+    end_wrapped_line();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Release CI (dispatch)");
+    {
+        left_label("Version", kLabelW);
+        ImGui::SetNextItemWidth(180.f);
+        ImGui::InputTextWithHint("##bulk_rel_ver", "empty = auto-bump", model.release_version,
+                                 sizeof(model.release_version));
+        ImGui::SameLine();
+        left_label("Bump", 44.f);
+        ImGui::SetNextItemWidth(100.f);
+        const char* bumps[] = {"patch", "minor", "major"};
+        ImGui::Combo("##bulk_bump", &model.release_bump, bumps, 3);
+        ImGui::SameLine();
+        ImGui::Checkbox("Publish", &model.release_publish);
+        ImGui::SameLine();
+        ImGui::Checkbox("Reuse emitters", &model.bulk_reuse_emitters);
+    }
+    accent_button(th);
+    const bool dispatch_ci = bulk_btn("Dispatch CI");
+    accent_button_pop();
+    if (dispatch_ci) {
+        auto paths = selected_paths();
+        if (paths.empty()) {
+            model.append_log("[FAIL] No repos selected");
+        } else {
+            std::vector<std::string> args = {"git", "bulk-release", "--select", select_csv()};
+            if (model.release_version[0]) {
+                args.push_back("--version");
+                args.push_back(model.release_version);
+            }
+            static const char* bumps[] = {"patch", "minor", "major"};
+            const int bi = (model.release_bump < 0 || model.release_bump > 2) ? 0 : model.release_bump;
+            args.push_back("--bump");
+            args.push_back(bumps[bi]);
+            if (!model.release_publish) args.push_back("--no-publish");
+            if (!model.bulk_reuse_emitters) args.push_back("--no-reuse-cached-emitters");
+            model.append_log("--- Bulk release dispatch ---");
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
+    }
+    if (bulk_btn("Install & push CI")) {
+        auto paths = selected_paths();
+        if (paths.empty()) {
+            model.append_log("[FAIL] No repos selected");
+        } else {
+            model.append_log("--- Bulk install CI ---");
+            retcomm::studio::run_project_studio_async(
+                model, {"git", "bulk-install-ci", "--select", select_csv()}, nullptr);
+        }
+    }
+    end_wrapped_line();
+    ImGui::TextColored(th.text_muted,
+                       "Dispatch runs release.yml via gh on each selected game repo.");
+
+    ImGui::Separator();
+    field_row("##bulk_msg", "Message", model.bulk_msg, sizeof(model.bulk_msg), kLabelW);
 
     auto run_bulk = [&](const char* sub) {
         auto paths = selected_paths();
@@ -1212,12 +1469,7 @@ void draw_bulk(StudioModel& model, const Theme& th) {
             model.append_log("[FAIL] No repos selected");
             return;
         }
-        std::string select;
-        for (size_t i = 0; i < paths.size(); ++i) {
-            if (i) select += ",";
-            select += paths[i];
-        }
-        std::vector<std::string> args = {"git", sub, "--select", select};
+        std::vector<std::string> args = {"git", sub, "--select", select_csv()};
         if (std::strcmp(sub, "bulk-commit") == 0) {
             args.push_back("--message");
             args.push_back(model.bulk_msg);
@@ -1263,7 +1515,7 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     ImGui::EndDisabled();
 }
 
-void draw_build(StudioModel& model, const Theme& th) {
+void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 100.f;
     const std::string root = model.selected_root();
     ImGui::BeginChild("##build_scroll", ImVec2(0, 0));
@@ -1323,6 +1575,14 @@ void draw_build(StudioModel& model, const Theme& th) {
     if (cfg) {
         retcomm::studio::run_project_studio_async(model, base("configure"), nullptr);
     }
+    if (build_btn("Generate ROM + BIOS C")) {
+        model.gen_popup_open = true;
+        ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
+    }
+    if (build_btn("Generate emitters")) {
+        retcomm::studio::run_project_studio_async(
+            model, {"build", "ensure-emitters", "--root", root, "--force"}, nullptr);
+    }
     if (build_btn("Ensure BIOS")) {
         retcomm::studio::run_project_studio_async(
             model, {"build", "ensure-bios", "--root", root}, nullptr);
@@ -1365,8 +1625,126 @@ void draw_build(StudioModel& model, const Theme& th) {
     }
     end_wrapped_line();
     ImGui::EndDisabled();
+
+    if (model.gen_popup_open) ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
+    if (ImGui::BeginPopupModal("Generate ROM + BIOS C###gen_rom_bios", &model.gen_popup_open,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Regenerate BIOS backends and game C from the disc (psxrecomp_cli generate).");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("BIOS source");
+        ImGui::RadioButton("OpenBIOS (bundled, MIT)", &model.gen_bios_mode, 0);
+        ImGui::RadioButton("Retail SCPH1001.BIN", &model.gen_bios_mode, 1);
+        if (model.gen_bios_mode == 1) {
+            ImGui::SetNextItemWidth(360.f);
+            ImGui::InputText("##gen_scph", model.gen_scph_path, sizeof(model.gen_scph_path));
+            ImGui::SameLine();
+            ImGui::BeginDisabled(model.file_pick_busy);
+            if (ImGui::Button("Browse…##gen_scph_browse")) {
+                pick_file(model, window, "build_scph", "BIOS dump", "bin;BIN;rom");
+            }
+            ImGui::EndDisabled();
+            ImGui::TextColored(th.text_muted, "Select your SCPH1001.bin dump.");
+        } else {
+            ImGui::TextColored(th.text_muted, "No retail dump needed — uses bundled OpenBIOS.");
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        const bool can_run =
+            !root.empty() &&
+            (model.gen_bios_mode == 0 || model.gen_scph_path[0] != '\0') && !model.busy.load();
+        ImGui::BeginDisabled(!can_run);
+        accent_button(th);
+        if (ImGui::Button("Generate", ImVec2(120.f, 0))) {
+            std::vector<std::string> args = {"build", "generate", "--root", root};
+            if (model.disc_cue[0]) {
+                args.push_back("--disc");
+                args.push_back(model.disc_cue);
+            }
+            if (model.gen_bios_mode == 1 && model.gen_scph_path[0]) {
+                args.push_back("--bios");
+                args.push_back(model.gen_scph_path);
+            }
+            model.gen_popup_open = false;
+            ImGui::CloseCurrentPopup();
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
+        accent_button_pop();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120.f, 0))) {
+            model.gen_popup_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    } else if (!ImGui::IsPopupOpen("Generate ROM + BIOS C###gen_rom_bios")) {
+        // Closed via X / Escape — keep flag in sync.
+        model.gen_popup_open = false;
+    }
+
     ImGui::EndChild();
-    (void)th;
+}
+
+// Draw one activity line; http(s) URLs become ImGui::TextLinkOpenURL (SDL_OpenURL).
+void draw_log_line_with_links(const std::string& line, const ImVec4& col) {
+    if (line.empty()) {
+        ImGui::TextUnformatted("");
+        return;
+    }
+    auto url_start_at = [&](size_t from) -> size_t {
+        const size_t a = line.find("https://", from);
+        const size_t b = line.find("http://", from);
+        if (a == std::string::npos) return b;
+        if (b == std::string::npos) return a;
+        return std::min(a, b);
+    };
+    auto url_end_at = [&](size_t start) -> size_t {
+        size_t end = start;
+        while (end < line.size()) {
+            const unsigned char c = static_cast<unsigned char>(line[end]);
+            if (c <= 32 || c == '"' || c == '\'' || c == '<' || c == '>' || c == '`') break;
+            ++end;
+        }
+        while (end > start) {
+            const char t = line[end - 1];
+            if (t == '.' || t == ',' || t == ';' || t == ':' || t == '!' || t == '?' || t == ')' ||
+                t == ']' || t == '}')
+                --end;
+            else
+                break;
+        }
+        return end;
+    };
+
+    size_t i = 0;
+    bool first = true;
+    auto emit_text = [&](size_t from, size_t to) {
+        if (to <= from) return;
+        if (!first) ImGui::SameLine(0.f, 0.f);
+        const std::string piece = line.substr(from, to - from);
+        ImGui::TextColored(col, "%s", piece.c_str());
+        first = false;
+    };
+    while (i < line.size()) {
+        const size_t start = url_start_at(i);
+        if (start == std::string::npos) {
+            emit_text(i, line.size());
+            break;
+        }
+        emit_text(i, start);
+        const size_t end = url_end_at(start);
+        if (end <= start) {
+            emit_text(start, start + 1);
+            i = start + 1;
+            continue;
+        }
+        const std::string url = line.substr(start, end - start);
+        if (!first) ImGui::SameLine(0.f, 0.f);
+        ImGui::TextLinkOpenURL(url.c_str(), url.c_str());
+        first = false;
+        i = end;
+    }
+    if (first) ImGui::TextColored(col, "%s", line.c_str());
 }
 
 void draw_log_collapsed_bar(StudioModel& model, const Theme& th) {
@@ -1402,9 +1780,12 @@ void draw_log(StudioModel& model, const Theme& th, float height, SDL_Window* win
     ImGui::PopStyleColor();
 
     std::vector<std::string> lines;
+    bool stick = false;
     {
         std::lock_guard<std::mutex> lock(model.mu);
         lines = model.log_lines;
+        stick = model.log_scroll_bottom;
+        if (stick) model.log_scroll_bottom = false;
     }
 
     ImGui::SameLine();
@@ -1454,31 +1835,23 @@ void draw_log(StudioModel& model, const Theme& th, float height, SDL_Window* win
 
     ImGui::BeginChild("activity_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 2));
-    bool stick = false;
-    {
-        std::lock_guard<std::mutex> lock(model.mu);
-        stick = model.log_scroll_bottom;
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(model.log_lines.size()));
-        while (clipper.Step()) {
-            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                const std::string& line = model.log_lines[static_cast<size_t>(i)];
-                ImVec4 col = th.text;
-                if (line.find("[FAIL]") != std::string::npos ||
-                    line.find("error:") != std::string::npos)
-                    col = th.bad;
-                else if (line.find("[OK]") != std::string::npos)
-                    col = th.good;
-                else if (!line.empty() && line[0] == '$')
-                    col = th.text_muted;
-                ImGui::TextColored(col, "%s", line.c_str());
-            }
-        }
-        if (stick) {
-            ImGui::SetScrollHereY(1.0f);
-            model.log_scroll_bottom = false;
+    ImGuiListClipper clipper;
+    clipper.Begin(static_cast<int>(lines.size()));
+    while (clipper.Step()) {
+        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+            const std::string& line = lines[static_cast<size_t>(i)];
+            ImVec4 col = th.text;
+            if (line.find("[FAIL]") != std::string::npos ||
+                line.find("error:") != std::string::npos)
+                col = th.bad;
+            else if (line.find("[OK]") != std::string::npos)
+                col = th.good;
+            else if (!line.empty() && line[0] == '$')
+                col = th.text_muted;
+            draw_log_line_with_links(line, col);
         }
     }
+    if (stick) ImGui::SetScrollHereY(1.0f);
     ImGui::PopStyleVar();
     ImGui::EndChild();
     ImGui::EndChild();
@@ -1552,7 +1925,14 @@ int main(int argc, char** argv) {
         } else {
             model.append_log("Toolkit: " + model.toolkit_dir.string());
             model.append_log("Python: " + model.python_exe);
-            {
+            if (!model.toolchain_root.empty())
+                model.append_log("Toolchain: " + model.toolchain_root.string());
+            if (!model.toolchain_ready) {
+                model.toolchain_gate_open = true;
+                model.append_log(
+                    "[WARN] Portable toolchain Python missing — install required before using Studio.");
+                model.set_status("Toolchain required");
+            } else {
 #if defined(_WIN32)
                 const char* home = std::getenv("USERPROFILE");
 #else
@@ -1562,8 +1942,46 @@ int main(int argc, char** argv) {
                     (home && *home) ? fs::path(home) / "Documents" / "GitHub" : fs::path(".");
                 std::snprintf(model.np_parent, sizeof(model.np_parent), "%s",
                               parent.string().c_str());
+                refresh_repos(model);
+                // Startup update check uses github.com tag redirects + a local TTL
+                // cache (not api.github.com listing) to avoid rate limits.
+                if (!model.startup_update_started) {
+                    model.startup_update_started = true;
+                    retcomm::studio::run_project_studio_async(
+                        model, {"updates", "check", "--json", "--startup"},
+                        [&model](RunResult r) {
+                            try {
+                                auto j = nlohmann::json::parse(r.stdout_text);
+                                if (j.value("skipped", false)) {
+                                    model.append_log(
+                                        j.value("message", "Startup update check skipped."));
+                                    return;
+                                }
+                                const auto studio = j.value("studio", nlohmann::json::object());
+                                const auto tc = j.value("toolchain", nlohmann::json::object());
+                                model.update_studio_avail = studio.value("available", false);
+                                model.update_toolchain_avail = tc.value("available", false);
+                                std::string msg = j.value("message", "");
+                                if (msg.empty()) {
+                                    msg = studio.value("message", "");
+                                    const auto tm = tc.value("message", "");
+                                    if (!tm.empty()) {
+                                        if (!msg.empty()) msg += " · ";
+                                        msg += tm;
+                                    }
+                                }
+                                model.append_log(msg.empty() ? "Update check complete." : msg);
+                                if (model.update_studio_avail || model.update_toolchain_avail) {
+                                    model.update_prompt_msg = msg;
+                                    model.update_prompt_open = true;
+                                }
+                            } catch (const std::exception& ex) {
+                                model.append_log(std::string("Update check: ") + ex.what());
+                            }
+                        },
+                        false);
+                }
             }
-            refresh_repos(model);
         }
     }
 
@@ -1617,7 +2035,71 @@ int main(int argc, char** argv) {
         }
 
         ImGui::BeginChild("body", ImVec2(0, body_h), ImGuiChildFlags_None);
-        if (ImGui::BeginTabBar("##tabs")) {
+        if (model.toolchain_gate_open) {
+            ImGui::TextColored(th.warn, "Portable toolchain required");
+            ImGui::TextWrapped(
+                "RetComM Studio uses the shared cmake-clang-v1 toolchain (portable Python + "
+                "cmake/ninja/clang). It is not installed yet. Install once to continue — "
+                "downloads use github.com release files (not the GitHub API).");
+            ImGui::Spacing();
+            accent_button(th);
+            ImGui::BeginDisabled(model.busy.load());
+            if (ImGui::Button("Install toolchain", ImVec2(180.f, 0))) {
+                retcomm::studio::run_project_studio_async(
+                    model, {"updates", "ensure-toolchain"},
+                    [&model](RunResult r) {
+                        std::string err;
+                        retcomm::studio::resolve_runtime(model, &err);
+                        if (model.toolchain_ready) {
+                            model.toolchain_gate_open = false;
+                            model.append_log("[OK] Toolchain ready — " + model.python_exe);
+                            model.set_status("Toolchain ready");
+#if defined(_WIN32)
+                            const char* home = std::getenv("USERPROFILE");
+#else
+                            const char* home = std::getenv("HOME");
+#endif
+                            const fs::path parent =
+                                (home && *home) ? fs::path(home) / "Documents" / "GitHub"
+                                                : fs::path(".");
+                            std::snprintf(model.np_parent, sizeof(model.np_parent), "%s",
+                                          parent.string().c_str());
+                            refresh_repos(model);
+                            if (!model.startup_update_started) {
+                                model.startup_update_started = true;
+                                retcomm::studio::run_project_studio_async(
+                                    model, {"updates", "check", "--json", "--startup"},
+                                    [&model](RunResult ur) {
+                                        try {
+                                            auto j = nlohmann::json::parse(ur.stdout_text);
+                                            if (j.value("skipped", false)) return;
+                                            model.update_studio_avail =
+                                                j.value("studio", nlohmann::json::object())
+                                                    .value("available", false);
+                                            model.update_toolchain_avail =
+                                                j.value("toolchain", nlohmann::json::object())
+                                                    .value("available", false);
+                                            model.update_prompt_msg = j.value("message", "");
+                                            if (model.update_studio_avail ||
+                                                model.update_toolchain_avail)
+                                                model.update_prompt_open = true;
+                                        } catch (...) {
+                                        }
+                                    },
+                                    false);
+                            }
+                        } else {
+                            model.append_log("[FAIL] Toolchain still missing after install.");
+                            if (!r.stdout_text.empty()) model.append_log(r.stdout_text);
+                            if (!r.stderr_text.empty()) model.append_log(r.stderr_text);
+                        }
+                    });
+            }
+            ImGui::EndDisabled();
+            accent_button_pop();
+            ImGui::SameLine();
+            if (ImGui::Button("Quit", ImVec2(100.f, 0))) model.request_exit.store(true);
+        } else if (ImGui::BeginTabBar("##tabs")) {
             if (ImGui::BeginTabItem("Migrate")) {
                 draw_migrate(model, th, window);
                 ImGui::EndTabItem();
@@ -1635,7 +2117,7 @@ int main(int argc, char** argv) {
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Build")) {
-                draw_build(model, th);
+                draw_build(model, th, window);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -1657,6 +2139,41 @@ int main(int argc, char** argv) {
         } else {
             draw_log_collapsed_bar(model, th);
         }
+
+        if (model.update_prompt_open) ImGui::OpenPopup("Updates available###studio_updates");
+        if (ImGui::BeginPopupModal("Updates available###studio_updates", &model.update_prompt_open,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped("%s", model.update_prompt_msg.empty()
+                                         ? "Updates are available."
+                                         : model.update_prompt_msg.c_str());
+            ImGui::Spacing();
+            accent_button(th);
+            ImGui::BeginDisabled(model.busy.load());
+            if (ImGui::Button("Update now", ImVec2(140.f, 0))) {
+                std::vector<std::string> args = {"updates", "apply"};
+                if (model.update_toolchain_avail && !model.update_studio_avail)
+                    args.push_back("--toolchain-only");
+                if (model.update_studio_avail && !model.update_toolchain_avail)
+                    args.push_back("--studio-only");
+                model.update_prompt_open = false;
+                ImGui::CloseCurrentPopup();
+                retcomm::studio::run_project_studio_async(
+                    model, std::move(args),
+                    [&model](RunResult) {
+                        std::string err;
+                        retcomm::studio::resolve_runtime(model, &err);
+                    });
+            }
+            ImGui::EndDisabled();
+            accent_button_pop();
+            ImGui::SameLine();
+            if (ImGui::Button("Later", ImVec2(100.f, 0))) {
+                model.update_prompt_open = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
 
         ImGui::Render();

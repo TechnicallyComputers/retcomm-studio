@@ -36,7 +36,15 @@ TOOLCHAIN_GLOBS = {
     "windows": "*cmake-clang-v1*windows*",
     "macos": "*cmake-clang-v1*macos*",
 }
+# Stable asset names (no api.github.com listing required).
+TOOLCHAIN_ASSETS = {
+    "linux": "cmake-clang-v1-linux-x64.zip",
+    "windows": "cmake-clang-v1-windows-x64.zip",
+    "macos": "cmake-clang-v1-macos-universal.zip",
+}
 USER_AGENT = "RetComM-Studio-Updater/1.0 (+https://github.com/TechnicallyComputers/retcomm-studio)"
+# Soft TTL for github.com /releases/latest tag lookups (avoid hammering).
+TAG_CACHE_TTL_SEC = 6 * 60 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +273,87 @@ def _http_json(url: str) -> object:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _tag_cache_path(paths: RetcommPaths | None = None) -> Path:
+    p = paths or default_paths()
+    return p.cache_dir / "studio-release-tags.json"
+
+
+def _load_tag_cache(paths: RetcommPaths | None = None) -> dict:
+    path = _tag_cache_path(paths)
+    try:
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_tag_cache(cache: dict, paths: RetcommPaths | None = None) -> None:
+    path = _tag_cache_path(paths)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def github_release_asset_url(slug: str, tag: str, asset_name: str) -> str:
+    """Non-API download URL (github.com CDN redirect)."""
+    t = (tag or "").strip()
+    if t and not t.lower().startswith("v"):
+        # Releases usually keep the leading v in the path when tagged v1.0.10
+        pass
+    return f"https://github.com/{slug}/releases/download/{t}/{asset_name}"
+
+
+def github_latest_release_tag_web(slug: str) -> str:
+    """Resolve latest *stable* tag via github.com /releases/latest redirect (no API)."""
+    url = f"https://github.com/{slug}/releases/latest"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        final = str(resp.geturl() or "")
+    m = re.search(r"/releases/tag/([^/?#]+)", final)
+    if not m:
+        raise RuntimeError(f"Could not parse release tag from redirect: {final}")
+    return m.group(1)
+
+
+def cached_latest_tag(
+    slug: str,
+    *,
+    paths: RetcommPaths | None = None,
+    force: bool = False,
+) -> str:
+    """Cached github.com latest-tag lookup (TTL). Does not use api.github.com."""
+    import time
+
+    cache = _load_tag_cache(paths)
+    key = slug.strip().lower()
+    now = time.time()
+    entry = cache.get(key) if isinstance(cache.get(key), dict) else None
+    if not force and entry:
+        try:
+            age = now - float(entry.get("checked_at") or 0)
+            tag = str(entry.get("tag") or "").strip()
+            if tag and age >= 0 and age < TAG_CACHE_TTL_SEC:
+                return tag
+        except (TypeError, ValueError):
+            pass
+    tag = github_latest_release_tag_web(slug)
+    cache[key] = {"tag": tag, "checked_at": now}
+    _save_tag_cache(cache, paths)
+    return tag
+
+
+def toolchain_asset_name() -> str:
+    return TOOLCHAIN_ASSETS.get(host_os_key(), TOOLCHAIN_ASSETS["linux"])
+
+
 def _parse_release(obj: dict) -> GhRelease:
     assets = []
     for a in obj.get("assets") or []:
@@ -281,7 +370,38 @@ def _parse_release(obj: dict) -> GhRelease:
     )
 
 
-def fetch_latest_release(slug: str, *, allow_prerelease: bool = True) -> GhRelease:
+def fetch_latest_release(
+    slug: str,
+    *,
+    allow_prerelease: bool = False,
+    asset_names: list[str] | None = None,
+    paths: RetcommPaths | None = None,
+    prefer_web: bool = True,
+) -> GhRelease:
+    """Prefer github.com tag redirect + known asset names (avoids API rate limits).
+
+    Falls back to api.github.com only when the web path fails or ``allow_prerelease``
+    needs the releases list.
+    """
+    # Stable releases: web redirect + constructed download URLs.
+    if prefer_web and not allow_prerelease:
+        try:
+            tag = cached_latest_tag(slug, paths=paths)
+            assets: list[GhAsset] = []
+            for name in asset_names or []:
+                if not name:
+                    continue
+                assets.append(
+                    GhAsset(
+                        name=name,
+                        url=github_release_asset_url(slug, tag, name),
+                        size=0,
+                    )
+                )
+            return GhRelease(tag=tag, assets=assets, prerelease=False)
+        except Exception:
+            pass  # fall through to API
+
     if allow_prerelease:
         data = _http_json(f"https://api.github.com/repos/{slug}/releases?per_page=15")
         if isinstance(data, list):
@@ -309,6 +429,11 @@ def pick_asset(rel: GhRelease, patterns: list[str]) -> GhAsset | None:
         for asset, low in names:
             if fnmatch(low, pl.lower()) or fnmatch(asset.name, pat):
                 return asset
+    if not patterns and names:
+        return names[0][0]
+    # Exact-name assets from the web path (patterns already matched at construction).
+    if len(names) == 1:
+        return names[0][0]
     return None
 
 
@@ -455,10 +580,67 @@ def installed_toolchain_tag(paths: RetcommPaths, pack_id: str = DEFAULT_TOOLCHAI
     return ""
 
 
+def resolve_toolchain_root(
+    paths: RetcommPaths | None = None, pack_id: str = DEFAULT_TOOLCHAIN_ID
+) -> Path | None:
+    """Return the active cmake-clang-v1 root (latest pointer), or None."""
+    p = paths or default_paths()
+    base = p.toolchains_dir / pack_id
+    candidates: list[Path] = []
+    latest = base / "latest"
+    path_file = base / "latest.path"
+    if latest.exists():
+        try:
+            candidates.append(latest.resolve() if latest.is_symlink() else latest)
+        except OSError:
+            candidates.append(latest)
+    if path_file.is_file():
+        try:
+            line = path_file.read_text(encoding="utf-8").splitlines()[0].strip()
+            if line:
+                candidates.append(Path(line))
+        except OSError:
+            pass
+    for cand in candidates:
+        if cand.is_dir() and ((cand / "bin").is_dir() or (cand / "python").is_dir()):
+            return cand
+    # Newest versioned folder
+    if base.is_dir():
+        kids = [
+            c
+            for c in base.iterdir()
+            if c.is_dir() and c.name not in ("latest", ".staging") and not c.name.startswith(".")
+        ]
+        kids.sort(key=lambda c: version_tuple(c.name), reverse=True)
+        for cand in kids:
+            if (cand / "bin").is_dir() or (cand / "python").is_dir():
+                return cand
+    return None
+
+
+def resolve_toolchain_python(paths: RetcommPaths | None = None) -> Path | None:
+    """Portable CPython shipped inside the toolchain pack."""
+    root = resolve_toolchain_root(paths)
+    if root is None:
+        return None
+    candidates = [
+        root / "python" / "bin" / "python3",
+        root / "python" / "bin" / "python",
+        root / "python" / "python.exe",
+        root / "python" / "bin" / "python.exe",
+    ]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return c
+        if c.is_file() and sys.platform == "win32":
+            return c
+    return None
+
+
 def check_updates(
     paths: RetcommPaths | None = None,
     *,
-    allow_prerelease: bool = True,
+    allow_prerelease: bool = False,
     on_progress: ProgressFn | None = None,
 ) -> UpdateCheckResult:
     p = ensure_dirs(paths)
@@ -487,24 +669,60 @@ def check_updates(
     )
 
     try:
-        prog(f"Checking {studio_github_slug()}…")
-        rel = fetch_latest_release(studio_github_slug(), allow_prerelease=allow_prerelease)
+        prog(f"Checking {studio_github_slug()} (github.com, no API)…")
+        # Tag-only via web redirect. Asset resolved later on apply (or API fallback).
+        rel = fetch_latest_release(
+            studio_github_slug(),
+            allow_prerelease=allow_prerelease,
+            asset_names=[],
+            paths=p,
+            prefer_web=True,
+        )
         studio.latest = normalize_tag(rel.tag)
         studio.release = rel
         if install.supported:
             patterns = _studio_asset_patterns(install.channel)
-            asset = pick_asset(rel, patterns) if patterns else None
+            # Prefer known candidates constructed for this tag (still no API).
+            candidates = _studio_asset_candidates(install.channel, rel.tag)
+            if candidates:
+                rel_with = fetch_latest_release(
+                    studio_github_slug(),
+                    allow_prerelease=False,
+                    asset_names=candidates,
+                    paths=p,
+                    prefer_web=True,
+                )
+                studio.release = rel_with
+                asset = pick_asset(rel_with, patterns) if patterns else (
+                    rel_with.assets[0] if rel_with.assets else None
+                )
+            else:
+                asset = None
+            # Last resort: one API call only when we need an exact asset for apply.
+            if asset is None and patterns:
+                try:
+                    prog("Resolving Studio asset via API (fallback)…")
+                    api_rel = fetch_latest_release(
+                        studio_github_slug(),
+                        allow_prerelease=allow_prerelease,
+                        prefer_web=False,
+                    )
+                    studio.release = api_rel
+                    asset = pick_asset(api_rel, patterns)
+                except Exception:
+                    asset = None
             studio.asset = asset
             studio.asset_name = asset.name if asset else ""
-            if not asset:
-                studio.supported = False
-                studio.message = (
-                    f"Latest Studio {studio.latest} has no asset for channel "
-                    f"'{install.channel}'."
-                )
-            elif version_newer(studio.latest, studio.current):
-                studio.available = True
-                studio.message = f"Studio update: {studio.current} → {studio.latest}"
+            if version_newer(studio.latest, studio.current):
+                if asset:
+                    studio.available = True
+                    studio.message = f"Studio update: {studio.current} → {studio.latest}"
+                else:
+                    studio.supported = False
+                    studio.message = (
+                        f"Studio {studio.latest} is available, but no asset matched "
+                        f"channel '{install.channel}'."
+                    )
             else:
                 studio.message = f"Studio is up to date ({studio.latest})."
         else:
@@ -519,22 +737,36 @@ def check_updates(
         studio.message = f"Studio check failed: {exc}"
 
     try:
-        prog(f"Checking {DEFAULT_TOOLCHAIN_SLUG}…")
-        trel = fetch_latest_release(DEFAULT_TOOLCHAIN_SLUG, allow_prerelease=True)
+        prog(f"Checking {DEFAULT_TOOLCHAIN_SLUG} (github.com, no API)…")
+        tname = toolchain_asset_name()
+        trel = fetch_latest_release(
+            DEFAULT_TOOLCHAIN_SLUG,
+            allow_prerelease=False,
+            asset_names=[tname],
+            paths=p,
+            prefer_web=True,
+        )
         toolchain.latest = normalize_tag(trel.tag)
         toolchain.release = trel
-        glob = TOOLCHAIN_GLOBS.get(host_os_key(), TOOLCHAIN_GLOBS["linux"])
-        tasset = pick_asset(trel, [glob, f"*{DEFAULT_TOOLCHAIN_ID}*"])
+        tasset = pick_asset(trel, [tname, TOOLCHAIN_GLOBS.get(host_os_key(), "*")])
+        if tasset is None and trel.assets:
+            tasset = trel.assets[0]
         toolchain.asset = tasset
-        toolchain.asset_name = tasset.name if tasset else ""
+        toolchain.asset_name = tasset.name if tasset else tname
+        if toolchain.asset is None:
+            toolchain.asset = GhAsset(
+                name=tname,
+                url=github_release_asset_url(DEFAULT_TOOLCHAIN_SLUG, trel.tag, tname),
+            )
+            toolchain.asset_name = tname
         cur = installed_toolchain_tag(p)
         toolchain.current = cur or "(none)"
-        if not tasset:
-            toolchain.message = f"No toolchain asset matching {glob} on {trel.tag}"
-        elif not cur or version_newer(toolchain.latest, cur):
+        if not cur or version_newer(toolchain.latest, cur):
             toolchain.available = True
             toolchain.message = (
                 f"Toolchain update: {toolchain.current} → {toolchain.latest}"
+                if cur
+                else f"Toolchain not installed — latest {toolchain.latest}"
             )
         else:
             toolchain.message = f"Toolchain is up to date ({toolchain.latest})."
@@ -549,6 +781,51 @@ def check_updates(
         toolchain=toolchain,
         message=("Updates available. " if any_avail else "") + " · ".join(bits),
     )
+
+
+def _studio_asset_candidates(channel: str, tag: str) -> list[str]:
+    """Likely asset filenames for a channel (used with /releases/download/{tag}/)."""
+    t = (tag or "").strip()
+    bare = normalize_tag(t)
+    names: list[str] = []
+    if channel == "appimage":
+        for ver in (t, bare, ""):
+            mid = f"-{ver}" if ver else ""
+            names += [
+                f"RetComM-Studio{mid}-linux-x86_64.AppImage",
+                f"RetComM-Studio{mid}-linux.AppImage",
+            ]
+    elif channel == "macos-app":
+        machine = platform.machine().lower()
+        arch = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+        for ver in (t, bare, ""):
+            mid = f"-{ver}" if ver else ""
+            names += [
+                f"RetComM-Studio{mid}-macos-{arch}.dmg",
+                f"RetComM-Studio{mid}-macos.dmg",
+            ]
+    elif channel == "windows-installer":
+        for ver in (t, bare, ""):
+            mid = f"-{ver}" if ver else ""
+            names += [
+                f"RetComM-Studio{mid}-windows-setup.exe",
+                f"RetComM-Studio{mid}-windows-x64-setup.exe",
+            ]
+    elif channel == "windows-portable":
+        for ver in (t, bare, ""):
+            mid = f"-{ver}" if ver else ""
+            names += [
+                f"RetComM-Studio{mid}-portable-windows.zip",
+                f"RetComM-Studio{mid}-windows.zip",
+            ]
+    # Dedupe preserving order
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +901,26 @@ def apply_toolchain_update(
         return True, f"Installed toolchain {pack_id} {tag} → {dest}"
     except Exception as exc:
         return False, f"Toolchain update failed: {exc}"
+
+
+def ensure_toolchain(
+    paths: RetcommPaths | None = None,
+    *,
+    on_progress: ProgressFn | None = None,
+) -> tuple[bool, str]:
+    """Install cmake-clang-v1 when missing, or update when newer is available."""
+    p = ensure_dirs(paths)
+    result = check_updates(p, allow_prerelease=False, on_progress=on_progress)
+    if not result.toolchain.available:
+        root = resolve_toolchain_root(p)
+        py = resolve_toolchain_python(p)
+        if root is not None and py is not None:
+            return True, result.toolchain.message
+        # Force install path even if check couldn't mark available.
+        if not result.toolchain.release or not result.toolchain.asset:
+            return False, result.toolchain.message or "Cannot resolve toolchain release."
+        result.toolchain.available = True
+    return apply_toolchain_update(result.toolchain, p, on_progress=on_progress)
 
 
 def _schedule_unix_replace(src: Path, dest: Path, relaunch: list[str]) -> Path:

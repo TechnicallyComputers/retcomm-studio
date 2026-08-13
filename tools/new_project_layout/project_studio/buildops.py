@@ -15,6 +15,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -837,3 +838,108 @@ def launch_status() -> str:
         if code is None:
             return f"running pid={h.pid} ({h.exe.name})"
         return f"exited code={code} ({h.exe.name})"
+
+
+def find_psxrecomp_cli(root: Path) -> Path | None:
+    """Locate ``psxrecomp_cli.py`` next to the game's framework checkout."""
+    root = root.expanduser().resolve()
+    fw = resolve_framework_root(root)
+    candidates: list[Path] = []
+    if fw is not None:
+        candidates.append(fw / "psxrecomp_cli.py")
+    candidates.append(root / "psxrecomp" / "psxrecomp_cli.py")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def generate_rom_and_bios(
+    root: Path,
+    *,
+    disc: str = "",
+    bios: str = "",
+    force_bios: bool = True,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Run ``psxrecomp_cli.py generate`` (BIOS backends + disc prepare + game C).
+
+    ``bios`` empty → OpenBIOS (bundled MIT). Non-empty path → stage as
+    ``bios/SCPH1001.BIN`` and regenerate the retail backend, then game C.
+    """
+    root = root.expanduser().resolve()
+    cli = find_psxrecomp_cli(root)
+    if cli is None:
+        return CmdResult(False, "psxrecomp_cli.py not found (is psxrecomp checked out?)")
+    config = root / "game.toml"
+    if not config.is_file():
+        return CmdResult(False, f"Missing game.toml in {root}")
+
+    py = sys.executable or shutil.which("python3") or shutil.which("python")
+    if not py:
+        return CmdResult(False, "No Python interpreter for generate")
+
+    cmd = [
+        str(py),
+        str(cli),
+        "generate",
+        "--config",
+        str(config),
+        "--project-root",
+        str(root),
+    ]
+    disc_s = (disc or "").strip()
+    if disc_s:
+        cmd.extend(["--disc", disc_s])
+    bios_s = (bios or "").strip()
+    if bios_s:
+        bp = Path(bios_s).expanduser()
+        if not bp.is_file():
+            return CmdResult(False, f"BIOS dump not found: {bios_s}")
+        cmd.extend(["--bios", str(bp.resolve())])
+    if force_bios:
+        cmd.append("--force-bios")
+
+    if dry_run:
+        return CmdResult(True, "dry-run: " + " ".join(cmd))
+
+    if log:
+        mode = f"SCPH1001 ({bios_s})" if bios_s else "OpenBIOS"
+        log(f"Generate ROM + BIOS C ({mode})")
+    return _run_stream(cmd, root, log=log)
+
+
+def ensure_emitters(
+    root: Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Build ``psxrecomp-game`` + ``psxrecomp-bios`` via ``psxrecomp_cli ensure-emitters``."""
+    root = root.expanduser().resolve()
+    cli = find_psxrecomp_cli(root)
+    if cli is None:
+        return CmdResult(False, "psxrecomp_cli.py not found (is psxrecomp checked out?)")
+
+    py = sys.executable or shutil.which("python3") or shutil.which("python")
+    if not py:
+        return CmdResult(False, "No Python interpreter for ensure-emitters")
+
+    cmd = [
+        str(py),
+        str(cli),
+        "ensure-emitters",
+        "--project-root",
+        str(root),
+    ]
+    if force:
+        cmd.append("--force")
+
+    if dry_run:
+        return CmdResult(True, "dry-run: " + " ".join(cmd))
+
+    if log:
+        log("Generate emitters (psxrecomp-game + psxrecomp-bios)" + (" [force]" if force else ""))
+    return _run_stream(cmd, root, log=log)

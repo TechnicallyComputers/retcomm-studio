@@ -17,6 +17,8 @@ struct RepoEntry {
     std::string name;
     std::string cue;
     std::string label;
+    bool in_catalog = false;
+    int players = 2; // from game.toml / CMakeLists MAX_PLAYERS
 };
 
 struct AuditCheck {
@@ -39,7 +41,15 @@ struct StudioModel {
 
     fs::path exe_dir;
     fs::path toolkit_dir;
+    fs::path toolchain_root;
     std::string python_exe;
+    bool toolchain_ready = false;
+    bool toolchain_gate_open = false;
+    bool update_prompt_open = false;
+    bool startup_update_started = false;
+    std::string update_prompt_msg;
+    bool update_studio_avail = false;
+    bool update_toolchain_avail = false;
     std::string status = "Ready";
     std::string version;
 
@@ -101,6 +111,10 @@ struct StudioModel {
     char git_sub_msg[256] = "chore: update submodule";
     bool git_remote_update = false;
     bool git_create_branch = false;
+    // Scope filters for Switch / Pull / Commit / Push (like Bulk targets).
+    bool git_tgt_game = true;
+    bool git_tgt_modules = false;
+    bool git_tgt_nested = false;
     // Populated by `git branches --json` (game + modules / defaults).
     std::vector<std::string> branches_game;
     std::vector<std::string> branches_psx;
@@ -109,7 +123,7 @@ struct StudioModel {
     std::vector<std::string> branches_rb;
     std::string branches_root; // root these lists were fetched for
     bool branches_loading = false;
-    int git_pull_mode = 0; // 0=ff-only 1=rebase 2=merge
+    int git_pull_mode = 0; // 0=ff-only 1=rebase 2=merge 3=reset
     char release_version[64] = {};
     int release_bump = 0; // 0=patch 1=minor 2=major
     bool release_publish = true;
@@ -126,6 +140,9 @@ struct StudioModel {
     char bulk_ui_branch[128] = "(default)";
     char bulk_net_branch[128] = "(default)";
     char bulk_rb_branch[128] = "(default)";
+    bool bulk_create_branch = false;
+    bool bulk_set_tracking = true;
+    bool bulk_reuse_emitters = true;
 
     // Build
     char build_dir[256] = "build-release";
@@ -141,6 +158,11 @@ struct StudioModel {
         "# Example:\n"
         "# RBE_CROSS_OS_PACING_DIAG=1 PSX_RB_ZERO_DELAY=0\n";
 
+    // Generate ROM + BIOS C dialog (Build tab)
+    bool gen_popup_open = false;
+    int gen_bios_mode = 0; // 0=OpenBIOS 1=SCPH1001 dump
+    char gen_scph_path[1024] = {};
+
     // Log (ring)
     static constexpr size_t kMaxLogLines = 4000;
     std::vector<std::string> log_lines;
@@ -155,13 +177,15 @@ struct StudioModel {
     std::mutex pick_mu;
     std::string pending_folder;
     std::string pending_file;
-    std::string pending_pick_target; // disc|np_parent|np_disc|np_bios|repo_add|build_exe|export_log
+    std::string pending_pick_target; // disc|np_parent|np_disc|np_bios|repo_add|build_exe|export_log|build_scph
     bool file_pick_busy = false;
 
     void append_log(std::string line);
     void set_status(std::string s);
     std::string selected_root() const;
     void select_repo_by_path(const std::string& path);
+    // Apply detected player count from the selected repo to the Migrate UI.
+    void apply_selected_players();
 };
 
 } // namespace retcomm::studio

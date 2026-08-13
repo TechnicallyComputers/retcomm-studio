@@ -197,16 +197,27 @@ def cmd_gui(args: argparse.Namespace) -> int:
 def _index_to_json_dict(index) -> dict:
     from project_studio.repo_index import labels_for_repos
 
+    from project_studio.bulkops import filter_indexed_catalog
+    from project_studio.naming import configured_players
+
     data = index.to_dict()
     labels = labels_for_repos(index.repos)
+    catalog_hits, _note = filter_indexed_catalog(index)
+    catalog_paths = {e.path for e in catalog_hits}
     repos_out = []
     for entry, label in zip(index.repos, labels):
+        try:
+            players = configured_players(entry.resolved())
+        except OSError:
+            players = 2
         repos_out.append(
             {
                 "path": entry.path,
                 "name": entry.name,
                 "cue": entry.cue,
                 "label": label,
+                "in_catalog": entry.path in catalog_paths,
+                "players": players,
             }
         )
     data["repos"] = repos_out
@@ -335,7 +346,25 @@ def cmd_repos_filter_catalog_contributors(_: argparse.Namespace) -> int:
 
 
 def cmd_updates_check(args: argparse.Namespace) -> int:
-    from project_studio.updater import check_updates
+    from project_studio.updater import check_updates, check_updates_on_startup_enabled
+
+    if getattr(args, "startup", False) and not check_updates_on_startup_enabled():
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "message": "Startup update check disabled in config.",
+                        "studio": {"available": False},
+                        "toolchain": {"available": False},
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print("Startup update check disabled in config.")
+        return 0
 
     def prog(msg: str) -> None:
         print(msg, file=sys.stderr)
@@ -389,6 +418,20 @@ def cmd_updates_apply(args: argparse.Namespace) -> int:
     if should_exit:
         return 0
     return 0
+
+
+def cmd_updates_ensure_toolchain(args: argparse.Namespace) -> int:
+    from project_studio.updater import ensure_toolchain, resolve_toolchain_python
+
+    def prog(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    ok, msg = ensure_toolchain(on_progress=prog)
+    print(f"[{'OK' if ok else 'FAIL'}] {msg}")
+    py = resolve_toolchain_python()
+    if py:
+        print(f"python: {py}")
+    return 0 if ok else 1
 
 
 def cmd_new_project(args: argparse.Namespace) -> int:
@@ -693,8 +736,29 @@ def cmd_git_set_branch(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+def _git_target_flags(args: argparse.Namespace) -> dict[str, bool]:
+    """Resolve Game / Modules / Nested / psxrecomp targets for a single-root op.
+
+    When no target flags are set, default to the game root (legacy ``git pull`` /
+    ``git switch --branch``).
+    """
+    game = bool(getattr(args, "game", False))
+    modules = bool(getattr(args, "modules", False))
+    nested = bool(getattr(args, "nested", False))
+    psx = bool(getattr(args, "psxrecomp", False))
+    if not (game or modules or nested or psx):
+        game = True
+    return {
+        "game": game,
+        "modules": modules,
+        "nested": nested,
+        "psxrecomp": psx,
+    }
+
+
 def cmd_git_switch(args: argparse.Namespace) -> int:
     from project_studio.gitops import (
+        CmdResult,
         default_module_paths,
         switch_branch,
         switch_modules,
@@ -707,32 +771,31 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
     branch = (getattr(args, "branch", None) or "").strip()
     create = bool(getattr(args, "create", False))
     set_tracking = not bool(getattr(args, "no_track", False))
-    nested = bool(getattr(args, "nested", False))
     submodule = (getattr(args, "submodule", None) or "").strip()
+    psx_branch = (getattr(args, "psxrecomp_branch", None) or "").strip()
+    ui_branch = (getattr(args, "ui_branch", None) or "").strip()
+    net_branch = (getattr(args, "net_branch", None) or "").strip()
+    rb_branch = (getattr(args, "rb_branch", None) or "").strip()
+    per_module = bool(psx_branch or ui_branch or net_branch or rb_branch)
+    multi = bool(getattr(args, "game", False)) or (
+        sum(
+            bool(x)
+            for x in (
+                getattr(args, "modules", False),
+                getattr(args, "nested", False),
+                getattr(args, "psxrecomp", False),
+            )
+        )
+        > 1
+    )
 
-    if getattr(args, "psxrecomp", False):
-        if not branch:
-            print("error: --psxrecomp requires --branch NAME", file=sys.stderr)
-            return 2
-        r = switch_psxrecomp(root, branch, create=create, dry_run=args.dry_run)
-        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-        if r.detail:
-            print(r.detail)
-        return 0 if r.ok else 1
-
-    if getattr(args, "modules", False) or nested or submodule:
-        if submodule:
-            paths = [submodule]
-        else:
-            paths = _module_paths_from_args(args)
+    # Single-path legacy: --submodule PATH [--nested] [--branch]
+    if submodule and not multi and not per_module and not getattr(args, "game", False):
+        nested = bool(getattr(args, "nested", False))
+        paths = [submodule]
         branch_by_path = None
         if branch:
-            if paths:
-                branch_by_path = {p.strip().replace("\\", "/"): branch for p in paths}
-            else:
-                branch_by_path = {
-                    p: branch for p in default_module_paths(nested=nested)
-                }
+            branch_by_path = {submodule.strip().replace("\\", "/"): branch}
         results = switch_modules(
             root,
             paths=paths,
@@ -744,14 +807,85 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
         )
         return _print_module_results(results)
 
-    if not branch:
-        print("error: --branch NAME required (or use --modules / --nested)", file=sys.stderr)
+    t = _git_target_flags(args)
+    results: list[CmdResult] = []
+
+    if t["game"]:
+        if not branch:
+            print("error: --game / game root requires --branch NAME", file=sys.stderr)
+            return 2
+        r = switch_branch(root, branch, create=create, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+
+    if t["modules"]:
+        branch_by_path: dict[str, str] | None = None
+        paths = _module_paths_from_args(args)
+        if psx_branch or ui_branch:
+            branch_by_path = {}
+            if psx_branch:
+                branch_by_path["psxrecomp"] = psx_branch
+            if ui_branch:
+                branch_by_path["recomp-ui"] = ui_branch
+            paths = list(branch_by_path.keys())
+        elif branch and not t["game"]:
+            # Legacy: ``git switch --modules --branch X`` applies X to all modules.
+            want = paths or list(default_module_paths(nested=False))
+            branch_by_path = {p.strip().replace("\\", "/"): branch for p in want}
+        results.extend(
+            switch_modules(
+                root,
+                paths=paths,
+                nested=False,
+                branch_by_path=branch_by_path,
+                create=create,
+                set_tracking=set_tracking,
+                dry_run=args.dry_run,
+            )
+        )
+    elif t["psxrecomp"]:
+        use = psx_branch or branch
+        if not use:
+            print(
+                "error: --psxrecomp requires --branch or --psxrecomp-branch",
+                file=sys.stderr,
+            )
+            return 2
+        r = switch_psxrecomp(root, use, create=create, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+
+    if t["nested"]:
+        branch_by_path = None
+        paths = _module_paths_from_args(args)
+        if net_branch or rb_branch:
+            branch_by_path = {}
+            if net_branch:
+                branch_by_path["lib/recomp-net"] = net_branch
+            if rb_branch:
+                branch_by_path["lib/retcomm-rbengine"] = rb_branch
+            paths = list(branch_by_path.keys())
+        elif branch and not t["modules"] and not t["game"]:
+            # Legacy: ``git switch --nested --branch X`` applies X to all nested.
+            want = paths or list(default_module_paths(nested=True))
+            branch_by_path = {p.strip().replace("\\", "/"): branch for p in want}
+        results.extend(
+            switch_modules(
+                root,
+                paths=paths,
+                nested=True,
+                branch_by_path=branch_by_path,
+                create=create,
+                set_tracking=set_tracking,
+                dry_run=args.dry_run,
+            )
+        )
+
+    if not results:
+        print(
+            "error: nothing to switch (pass --game / --modules / --nested)",
+            file=sys.stderr,
+        )
         return 2
-    r = switch_branch(root, branch, create=create, dry_run=args.dry_run)
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-    if r.detail:
-        print(r.detail)
-    return 0 if r.ok else 1
+    return _print_module_results(results)
 
 
 def cmd_git_update_submodules(args: argparse.Namespace) -> int:
@@ -955,96 +1089,149 @@ def cmd_git_bulk_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_git_pull(args: argparse.Namespace) -> int:
-    from project_studio.gitops import pull, pull_modules, pull_psxrecomp
+    from project_studio.gitops import CmdResult, pull, pull_modules, pull_psxrecomp
 
     root = _root_or_die(args)
     if root is None:
         return 2
     mode = getattr(args, "mode", None) or "ff-only"
     dirty = getattr(args, "dirty", None) or "fail"
-    if getattr(args, "psxrecomp", False):
-        r = pull_psxrecomp(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
-        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-        if r.detail:
-            print(r.detail)
-        return 0 if r.ok else 1
-    if getattr(args, "modules", False) or getattr(args, "nested", False):
-        results = pull_modules(
-            root,
-            paths=_module_paths_from_args(args),
-            nested=bool(getattr(args, "nested", False)),
-            mode=mode,
-            dirty=dirty,
-            dry_run=args.dry_run,
+    t = _git_target_flags(args)
+    results: list[CmdResult] = []
+    if t["game"]:
+        r = pull(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+    if t["modules"]:
+        results.extend(
+            pull_modules(
+                root,
+                paths=_module_paths_from_args(args),
+                nested=False,
+                mode=mode,
+                dirty=dirty,
+                dry_run=args.dry_run,
+            )
         )
-        return _print_module_results(results)
-    r = pull(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-    if r.detail:
-        print(r.detail)
-    return 0 if r.ok else 1
+    elif t["psxrecomp"]:
+        r = pull_psxrecomp(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+    if t["nested"]:
+        results.extend(
+            pull_modules(
+                root,
+                paths=_module_paths_from_args(args),
+                nested=True,
+                mode=mode,
+                dirty=dirty,
+                dry_run=args.dry_run,
+            )
+        )
+    if not results:
+        print("error: nothing to pull (pass --game / --modules / --nested)", file=sys.stderr)
+        return 2
+    return _print_module_results(results)
 
 
 def cmd_git_commit(args: argparse.Namespace) -> int:
-    from project_studio.gitops import commit_all, commit_modules
+    from project_studio.gitops import CmdResult, commit_all, commit_modules
 
     root = _root_or_die(args)
     if root is None:
         return 2
-    if getattr(args, "modules", False) or getattr(args, "nested", False):
-        results = commit_modules(
-            root,
-            args.message,
-            paths=_module_paths_from_args(args),
-            nested=bool(getattr(args, "nested", False)),
-            dry_run=args.dry_run,
+    t = _git_target_flags(args)
+    results: list[CmdResult] = []
+    if t["game"]:
+        r = commit_all(root, args.message, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+    if t["modules"]:
+        results.extend(
+            commit_modules(
+                root,
+                args.message,
+                paths=_module_paths_from_args(args),
+                nested=False,
+                dry_run=args.dry_run,
+            )
         )
-        return _print_module_results(results)
-    r = commit_all(root, args.message, dry_run=args.dry_run)
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-    if r.detail:
-        print(r.detail)
-    return 0 if r.ok else 1
+    if t["nested"]:
+        results.extend(
+            commit_modules(
+                root,
+                args.message,
+                paths=_module_paths_from_args(args),
+                nested=True,
+                dry_run=args.dry_run,
+            )
+        )
+    if not results:
+        print(
+            "error: nothing to commit (pass --game / --modules / --nested)",
+            file=sys.stderr,
+        )
+        return 2
+    return _print_module_results(results)
 
 
 def cmd_git_push(args: argparse.Namespace) -> int:
-    from project_studio.gitops import push, push_modules, push_psxrecomp
+    from project_studio.gitops import (
+        CmdResult,
+        default_module_paths,
+        push,
+        push_modules,
+        push_psxrecomp,
+    )
 
     root = _root_or_die(args)
     if root is None:
         return 2
     branch = (getattr(args, "branch", None) or "").strip()
-    if getattr(args, "psxrecomp", False):
-        r = push_psxrecomp(root, branch=branch, dry_run=args.dry_run)
-        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-        if r.detail:
-            print(r.detail)
-        return 0 if r.ok else 1
-    if getattr(args, "modules", False) or getattr(args, "nested", False):
+    t = _git_target_flags(args)
+    results: list[CmdResult] = []
+    if t["game"]:
+        r = push(root, branch=branch, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+    if t["modules"]:
         paths = _module_paths_from_args(args)
         branch_by_path = None
         if branch and paths and len(paths) == 1:
             branch_by_path = {paths[0]: branch}
         elif branch and not paths:
-            # Apply same branch hint to all default paths (detached rescue).
-            nested = bool(getattr(args, "nested", False))
-            from project_studio.gitops import default_module_paths
-
-            branch_by_path = {p: branch for p in default_module_paths(nested=nested)}
-        results = push_modules(
-            root,
-            paths=paths,
-            nested=bool(getattr(args, "nested", False)),
-            branch_by_path=branch_by_path,
-            dry_run=args.dry_run,
+            branch_by_path = {p: branch for p in default_module_paths(nested=False)}
+        results.extend(
+            push_modules(
+                root,
+                paths=paths,
+                nested=False,
+                branch_by_path=branch_by_path,
+                dry_run=args.dry_run,
+            )
         )
-        return _print_module_results(results)
-    r = push(root, branch=branch, dry_run=args.dry_run)
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
-    if r.detail:
-        print(r.detail)
-    return 0 if r.ok else 1
-
+    elif t["psxrecomp"]:
+        r = push_psxrecomp(root, branch=branch, dry_run=args.dry_run)
+        results.append(CmdResult(r.ok, r.message, r.detail))
+    if t["nested"]:
+        paths = _module_paths_from_args(args)
+        branch_by_path = None
+        if branch and paths and len(paths) == 1:
+            branch_by_path = {paths[0]: branch}
+        elif branch and not paths and not t["modules"] and not t["game"]:
+            branch_by_path = {p: branch for p in default_module_paths(nested=True)}
+        results.extend(
+            push_modules(
+                root,
+                paths=paths,
+                nested=True,
+                branch_by_path=branch_by_path,
+                dry_run=args.dry_run,
+            )
+        )
+    if not results:
+        print(
+            "error: nothing to push (pass --game / --modules / --nested)",
+            file=sys.stderr,
+        )
+        return 2
+    return _print_module_results(results)
 
 
 def cmd_git_bulk_release(args: argparse.Namespace) -> int:
@@ -1158,6 +1345,44 @@ def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
         log=print,
     )
     print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    return 0 if r.ok else 1
+
+
+def cmd_build_generate(args: argparse.Namespace) -> int:
+    from project_studio.buildops import generate_rom_and_bios
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = generate_rom_and_bios(
+        root,
+        disc=getattr(args, "disc", "") or "",
+        bios=getattr(args, "bios", "") or "",
+        force_bios=not bool(getattr(args, "no_force_bios", False)),
+        dry_run=args.dry_run,
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    if r.detail and not r.ok:
+        print(r.detail)
+    return 0 if r.ok else 1
+
+
+def cmd_build_ensure_emitters(args: argparse.Namespace) -> int:
+    from project_studio.buildops import ensure_emitters
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = ensure_emitters(
+        root,
+        force=bool(getattr(args, "force", False)),
+        dry_run=args.dry_run,
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    if r.detail and not r.ok:
+        print(r.detail)
     return 0 if r.ok else 1
 
 
@@ -1351,11 +1576,21 @@ def build_parser() -> argparse.ArgumentParser:
     upd_sub = p_upd.add_subparsers(dest="updates_cmd", required=True)
     p_uc = upd_sub.add_parser("check", help="Check for updates")
     p_uc.add_argument("--json", action="store_true")
+    p_uc.add_argument(
+        "--startup",
+        action="store_true",
+        help="Honor check_updates_on_startup from studio/hub config (skip when false)",
+    )
     p_uc.set_defaults(func=cmd_updates_check)
     p_ua = upd_sub.add_parser("apply", help="Apply available updates")
     p_ua.add_argument("--studio-only", action="store_true")
     p_ua.add_argument("--toolchain-only", action="store_true")
     p_ua.set_defaults(func=cmd_updates_apply)
+    p_uet = upd_sub.add_parser(
+        "ensure-toolchain",
+        help="Install cmake-clang-v1 if missing (github.com downloads, no API listing)",
+    )
+    p_uet.set_defaults(func=cmd_updates_ensure_toolchain)
 
     p_np = sub.add_parser(
         "new-project",
@@ -1485,14 +1720,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gsw = git_sub.add_parser(
         "switch",
-        help="git switch on the game repo, --modules, --nested, or --psxrecomp",
+        help="git switch on game / --modules / --nested (combinable)",
     )
     add_git_root(p_gsw)
     p_gsw.add_argument(
         "--branch",
         default="",
-        help="Branch name (any name; not limited to Studio menus). "
-        "With --modules/--nested, omit to use each .gitmodules tracking branch.",
+        help="Game-root branch (with --game / default). "
+        "With --modules/--nested alone, omit to use each .gitmodules tracking branch.",
+    )
+    p_gsw.add_argument(
+        "--game",
+        action="store_true",
+        help="Switch the game repo root (default when no other target flags)",
     )
     p_gsw.add_argument(
         "--modules",
@@ -1508,6 +1748,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--psxrecomp",
         action="store_true",
         help="Switch the psxrecomp checkout itself",
+    )
+    p_gsw.add_argument(
+        "--psxrecomp-branch",
+        default="",
+        help="psxrecomp branch (with --modules or --psxrecomp)",
+    )
+    p_gsw.add_argument(
+        "--ui-branch",
+        default="",
+        help="recomp-ui branch (with --modules)",
+    )
+    p_gsw.add_argument(
+        "--net-branch",
+        default="",
+        help="lib/recomp-net branch (with --nested)",
+    )
+    p_gsw.add_argument(
+        "--rb-branch",
+        default="",
+        help="lib/retcomm-rbengine branch (with --nested)",
     )
     p_gsw.add_argument(
         "--submodule",
@@ -1564,9 +1824,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gpull = git_sub.add_parser(
         "pull",
-        help="git pull (game root, --modules, --nested, or --psxrecomp)",
+        help="git pull (game / --modules / --nested; combinable)",
     )
     add_git_root(p_gpull)
+    p_gpull.add_argument(
+        "--game",
+        action="store_true",
+        help="Pull the game repo root (default when no other target flags)",
+    )
     p_gpull.add_argument(
         "--modules",
         action="store_true",
@@ -1604,10 +1869,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gc = git_sub.add_parser(
         "commit",
-        help="git add -A && git commit (game root, --modules, or --nested)",
+        help="git add -A && git commit (game / --modules / --nested; combinable)",
     )
     add_git_root(p_gc)
     p_gc.add_argument("-m", "--message", required=True)
+    p_gc.add_argument(
+        "--game",
+        action="store_true",
+        help="Commit the game repo root (default when no other target flags)",
+    )
     p_gc.add_argument(
         "--modules",
         action="store_true",
@@ -1626,9 +1896,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gpush = git_sub.add_parser(
         "push",
-        help="git push -u origin HEAD (game root, --modules, --nested, or --psxrecomp)",
+        help="git push -u origin HEAD (game / --modules / --nested; combinable)",
     )
     add_git_root(p_gpush)
+    p_gpush.add_argument(
+        "--game",
+        action="store_true",
+        help="Push the game repo root (default when no other target flags)",
+    )
     p_gpush.add_argument(
         "--modules",
         action="store_true",
@@ -1871,6 +2146,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip SCPH1001 even if bios/SCPH1001.BIN exists",
     )
     p_beb.set_defaults(func=cmd_build_ensure_bios)
+
+    p_bg = build_sub.add_parser(
+        "generate",
+        help="psxrecomp_cli generate: BIOS backends + disc prepare + game C",
+    )
+    add_build_root(p_bg)
+    p_bg.add_argument(
+        "--disc",
+        default="",
+        help="Source .cue (default: game.toml game.disc / indexed cue)",
+    )
+    p_bg.add_argument(
+        "--bios",
+        default="",
+        help="Optional retail SCPH1001.BIN (omit for OpenBIOS only)",
+    )
+    p_bg.add_argument(
+        "--no-force-bios",
+        action="store_true",
+        help="Skip BIOS regen when backends already exist",
+    )
+    p_bg.set_defaults(func=cmd_build_generate)
+
+    p_bee = build_sub.add_parser(
+        "ensure-emitters",
+        help="Build psxrecomp-game + psxrecomp-bios (psxrecomp_cli ensure-emitters)",
+    )
+    add_build_root(p_bee)
+    p_bee.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild even if emitter binaries already exist",
+    )
+    p_bee.set_defaults(func=cmd_build_ensure_emitters)
 
     p_bb = build_sub.add_parser("compile", help="cmake --build (alias: build)")
     add_build_root(p_bb)

@@ -91,16 +91,18 @@ inline void apply_imgui_style(const Theme& t) {
     c[ImGuiCol_HeaderActive] = t.accent_dim;
     c[ImGuiCol_Text] = t.text;
     c[ImGuiCol_TextDisabled] = t.text_muted;
+    c[ImGuiCol_TextLink] = t.accent;
     c[ImGuiCol_CheckMark] = t.accent;
     c[ImGuiCol_SliderGrab] = t.accent;
     c[ImGuiCol_SliderGrabActive] = t.focus;
     c[ImGuiCol_Separator] = t.border;
+    // Active tab: solid teal-tinted fill + accent overline (persistent, not hover-only).
     c[ImGuiCol_Tab] = t.background2;
     c[ImGuiCol_TabHovered] = t.panel_hovered;
-    c[ImGuiCol_TabSelected] = t.panel;
+    c[ImGuiCol_TabSelected] = t.accent_button;
     c[ImGuiCol_TabSelectedOverline] = t.accent;
     c[ImGuiCol_TabDimmed] = t.background2;
-    c[ImGuiCol_TabDimmedSelected] = t.panel;
+    c[ImGuiCol_TabDimmedSelected] = t.accent_dim;
     c[ImGuiCol_TableHeaderBg] = t.background2;
     c[ImGuiCol_TableBorderStrong] = t.border;
     c[ImGuiCol_TableBorderLight] = t.border;
