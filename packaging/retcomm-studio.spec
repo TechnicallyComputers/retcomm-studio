@@ -38,24 +38,12 @@ hiddenimports = [
     "PIL._tkinter_finder",
 ]
 
-# Bundle toolkit (scripts, templates, package) under toolkit/
+# Analysis datas must be (src, dest) 2-tuples — not Tree TOC 3-tuples
+# (Tree → datas caused ValueError: too many values to unpack in PyInstaller 6).
+# Bundle toolkit / assets; __pycache__ / .venv are skipped by PyInstaller's
+# default ignores, and build_pyinstaller.py also sidecars a clean copy.
 if TOOLKIT.is_dir():
-    # Tree is provided by PyInstaller when evaluating the spec.
-    toolkit_tree = Tree(
-        str(TOOLKIT),
-        prefix="toolkit",
-        excludes=[
-            ".venv",
-            ".venv/*",
-            "**/__pycache__",
-            "**/__pycache__/*",
-            "*.pyc",
-            "project_studio_repos.json",
-            ".cache",
-            ".cache/*",
-        ],
-    )
-    datas += toolkit_tree
+    datas.append((str(TOOLKIT), "toolkit"))
 
 if ASSETS.is_dir():
     datas.append((str(ASSETS), "assets"))
