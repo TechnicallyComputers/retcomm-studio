@@ -31,6 +31,9 @@ on:
 permissions:
   contents: write
 
+env:
+  SDL_TAG: "release-3.2.16"
+
 jobs:
   version:
     runs-on: ubuntu-latest
@@ -108,44 +111,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Install packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libgl1-mesa-dev libfreetype6-dev \
             librsvg2-bin imagemagick curl ca-certificates \
-            libtk8.6 libxcb1 libx11-6 fuse libfuse2
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxss-dev libwayland-dev \
+            libxkbcommon-dev libasound2-dev libpulse-dev \
+            libibus-1.0-dev libudev-dev fuse libfuse2
 
       - name: Build icons
         run: |
           chmod +x packaging/make-icons.sh packaging/linux/*.sh
           ./packaging/make-icons.sh
           test -f assets/retcomm-studio.png
-          test -f assets/retcomm-studio.ico
+          test -f assets/fonts/LatoLatin-Regular.ttf
 
-      - name: Install Python deps
+      - name: Build SDL3
         run: |
-          python -m pip install --upgrade pip
-          pip install -r packaging/requirements-build.txt
-          pip install -r tools/new_project_layout/requirements-gui.txt
+          git clone --depth 1 --branch "${SDL_TAG}" https://github.com/libsdl-org/SDL.git "$HOME/SDL"
+          cmake -G Ninja -S "$HOME/SDL" -B "$HOME/sdl-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/sdl3" \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF
+          cmake --build "$HOME/sdl-build" -j"$(nproc)"
+          cmake --install "$HOME/sdl-build"
 
-      - name: PyInstaller
+      - name: Configure & build Studio
         run: |
-          python packaging/build_pyinstaller.py \
-            --version "${{ needs.version.outputs.version }}" \
-            --clean
-          test -x dist/RetComM-Studio/RetComM-Studio \
-            || test -f dist/RetComM-Studio/RetComM-Studio
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/out" \
+            -DCMAKE_PREFIX_PATH="$HOME/sdl3"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+          test -f out/bin/RetComM-Studio
+          test -d out/share/retcomm-studio/toolkit/project_studio
+          test -f out/share/retcomm-studio/fonts/LatoLatin-Regular.ttf
+          mkdir -p out/lib
+          cp -a "$HOME/sdl3/lib/"*.so* out/lib/
 
       - name: Package AppImage
         run: |
-          ./packaging/linux/build-appimage.sh \
-            dist/RetComM-Studio \
-            "${{ needs.version.outputs.version }}" \
-            x86_64
+          export PATH="$HOME/sdl3/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
+          ./packaging/linux/build-appimage.sh "$PWD/out" "${{ needs.version.outputs.version }}" x86_64
           test -f dist/RetComM-Studio-linux-x86_64.AppImage
 
       - uses: actions/upload-artifact@v4
@@ -156,35 +170,57 @@ jobs:
   windows:
     needs: version
     runs-on: windows-2022
+    env:
+      RETCOMM_VCPKG: ${{ github.workspace }}/retcomm-vcpkg
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = "9d7f79f56ae1a9b4704d6a7fb8237e347a974133"
+          git clone https://github.com/microsoft/vcpkg.git $env:RETCOMM_VCPKG
+          git -C $env:RETCOMM_VCPKG checkout $baseline
+          $metaPath = Join-Path $env:RETCOMM_VCPKG "scripts\vcpkg-tool-metadata.txt"
+          $meta = ConvertFrom-StringData (Get-Content $metaPath -Raw)
+          $tag = $meta.VCPKG_TOOL_RELEASE_TAG
+          $url = "https://github.com/microsoft/vcpkg-tool/releases/download/$tag/vcpkg.exe"
+          $dest = Join-Path $env:RETCOMM_VCPKG "vcpkg.exe"
+          $ok = $false
+          for ($i = 1; $i -le 10; $i++) {
+            if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Force }
+            & curl.exe -fsSL --retry 5 --retry-all-errors --retry-delay 2 `
+              --connect-timeout 30 --max-time 300 -o $dest $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $dest) -and ((Get-Item $dest).Length -gt 1MB)) {
+              $ok = $true
+              break
+            }
+            Start-Sleep -Seconds ([Math]::Min(60, 3 * $i))
+          }
+          if (-not $ok) { throw "Failed to download vcpkg.exe" }
+          Set-Content -LiteralPath (Join-Path $env:RETCOMM_VCPKG "vcpkg.disable-metrics") -Value ""
+          & $dest version --disable-metrics
 
       - name: Build icons
         shell: bash
         run: |
           chmod +x packaging/make-icons.sh
           ./packaging/make-icons.sh
-          test -f assets/retcomm-studio.png
           test -f assets/retcomm-studio.ico
+          test -f assets/fonts/LatoLatin-Regular.ttf
 
-      - name: Install Python deps
+      - name: Configure & build
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r packaging/requirements-build.txt
-          pip install -r tools/new_project_layout/requirements-gui.txt
-
-      - name: PyInstaller
-        shell: bash
-        run: |
-          python packaging/build_pyinstaller.py \
-            --version "${{ needs.version.outputs.version }}" \
-            --clean
-          test -f dist/RetComM-Studio/RetComM-Studio.exe
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="${RETCOMM_VCPKG}/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows \
+            -DCMAKE_INSTALL_PREFIX="$PWD/out"
+          cmake --build build --config Release -j
+          cmake --install build --config Release
+          test -f out/bin/RetComM-Studio.exe
+          test -d out/share/retcomm-studio/toolkit/project_studio
 
       - name: Install Inno Setup
         shell: pwsh
@@ -197,8 +233,10 @@ jobs:
         shell: pwsh
         run: |
           ./packaging/windows/package.ps1 `
+            -Prefix "$PWD/out" `
             -Version "${{ needs.version.outputs.version }}" `
             -Arch x64 `
+            -VcpkgBin "$env:RETCOMM_VCPKG/installed/x64-windows/bin" `
             -InnoSetup "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           $need = @(
             "RetComM-Studio-portable-windows.zip",
@@ -230,34 +268,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Install deps
+        run: |
+          brew install cmake ninja sdl3 freetype librsvg || brew install cmake ninja sdl3 freetype
 
       - name: Build icons
         run: |
-          brew install librsvg || true
           chmod +x packaging/make-icons.sh packaging/macos/build-dmg.sh
           ./packaging/make-icons.sh
           test -f assets/retcomm-studio.png
+          test -f assets/fonts/LatoLatin-Regular.ttf
 
-      - name: Install Python deps
+      - name: Configure & build
         run: |
-          python -m pip install --upgrade pip
-          pip install -r packaging/requirements-build.txt
-          pip install -r tools/new_project_layout/requirements-gui.txt
-
-      - name: PyInstaller
-        run: |
-          python packaging/build_pyinstaller.py \
-            --version "${{ needs.version.outputs.version }}" \
-            --clean
-          test -f dist/RetComM-Studio/RetComM-Studio
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/out"
+          cmake --build build -j
+          cmake --install build
+          test -f out/bin/RetComM-Studio
+          test -d out/share/retcomm-studio/toolkit/project_studio
 
       - name: Package DMG
         run: |
           ./packaging/macos/build-dmg.sh \
-            dist/RetComM-Studio \
+            "$PWD/out" \
             "${{ needs.version.outputs.version }}" \
             "${{ matrix.arch }}"
           test -f "dist/RetComM-Studio-macos-${{ matrix.arch }}.dmg"

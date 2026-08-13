@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AppImage entry for RetComM Studio (PyInstaller onedir under usr/bin).
+# AppImage entry for RetComM Studio (native Dear ImGui + Python toolkit).
 set -euo pipefail
 HERE="$(dirname "$(readlink -f "$0")")"
 export APPDIR="${APPDIR:-${HERE}}"
@@ -7,14 +7,19 @@ export PATH="${HERE}/usr/bin:${PATH}"
 if [[ -d "${HERE}/usr/lib" ]]; then
   export LD_LIBRARY_PATH="${HERE}/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-export RETCOMM_STUDIO_FROZEN=1
-if [[ -f "${HERE}/usr/bin/VERSION" ]]; then
+if [[ -f "${HERE}/usr/share/retcomm-studio/VERSION" ]]; then
+  export RETCOMM_STUDIO_VERSION="$(tr -d '[:space:]' < "${HERE}/usr/share/retcomm-studio/VERSION")"
+elif [[ -f "${HERE}/usr/bin/VERSION" ]]; then
   export RETCOMM_STUDIO_VERSION="$(tr -d '[:space:]' < "${HERE}/usr/bin/VERSION")"
 fi
-if [[ -d "${HERE}/usr/bin/toolkit" ]]; then
+if [[ -d "${HERE}/usr/share/retcomm-studio/toolkit" ]]; then
+  export RETCOMM_STUDIO_TOOLKIT="${HERE}/usr/share/retcomm-studio/toolkit"
+elif [[ -d "${HERE}/usr/bin/toolkit" ]]; then
   export RETCOMM_STUDIO_TOOLKIT="${HERE}/usr/bin/toolkit"
 fi
-if [[ -d "${HERE}/usr/bin/assets" ]]; then
+if [[ -d "${HERE}/usr/share/retcomm-studio/assets" ]]; then
+  export RETCOMM_STUDIO_ASSETS="${HERE}/usr/share/retcomm-studio/assets"
+elif [[ -d "${HERE}/usr/bin/assets" ]]; then
   export RETCOMM_STUDIO_ASSETS="${HERE}/usr/bin/assets"
 fi
 exec "${HERE}/usr/bin/RetComM-Studio" "$@"

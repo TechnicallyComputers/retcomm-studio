@@ -1,9 +1,11 @@
 # Package RetComM Studio Windows portable zip + Inno Setup installer.
 #
-# Expects PyInstaller onedir at dist/RetComM-Studio/
+# Expects cmake --install prefix with bin/RetComM-Studio.exe (+ SDL3.dll) and
+# share/retcomm-studio/{toolkit,fonts,assets}.
 param(
+    [Parameter(Mandatory = $true)][string]$Prefix,
     [Parameter(Mandatory = $true)][string]$Version,
-    [string]$DistName = "RetComM-Studio",
+    [string]$VcpkgBin = "",
     [string]$Arch = "x64",
     [string]$InnoSetup = ""
 )
@@ -11,29 +13,67 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $OutDir = Join-Path $Root "dist"
-$Bundle = Join-Path $OutDir $DistName
 $Stage = Join-Path $OutDir "windows-stage"
 $PortableZipName = "RetComM-Studio-portable-windows.zip"
 $FriendlyExe = "RetComM Studio.exe"
-
-if (-not (Test-Path $Bundle)) {
-    throw "Missing PyInstaller bundle: $Bundle (run packaging/build_pyinstaller.py first)"
-}
+$MainExe = "RetComM-Studio.exe"
 
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-Copy-Item -Path (Join-Path $Bundle "*") -Destination $Stage -Recurse -Force
-
-$mainExe = Join-Path $Stage "$DistName.exe"
-if (-not (Test-Path $mainExe)) {
-    throw "Missing $mainExe in staged bundle"
+$PrefixBin = Join-Path $Prefix "bin"
+$srcExe = Join-Path $PrefixBin $MainExe
+if (-not (Test-Path $srcExe)) {
+    throw "Missing $srcExe (cmake --install first)"
 }
-# Friendly portable name alongside the canonical exe (installer uses RetComM-Studio.exe).
-Copy-Item $mainExe (Join-Path $Stage $FriendlyExe) -Force
+Copy-Item $srcExe (Join-Path $Stage $MainExe) -Force
+Copy-Item $srcExe (Join-Path $Stage $FriendlyExe) -Force
 
-# channel.json — portable vs installer
+Get-ChildItem -Path $PrefixBin -Filter "*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+    Copy-Item $_.FullName $Stage -Force
+}
+
+function Copy-Dlls([string]$Dir) {
+    if (-not $Dir -or -not (Test-Path $Dir)) { return }
+    foreach ($pat in @("SDL3.dll", "freetype.dll", "zlib1.dll", "brotlicommon.dll", "brotlidec.dll")) {
+        Get-ChildItem -Path $Dir -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName $Stage -Force
+        }
+    }
+}
+@(
+    $VcpkgBin,
+    (Join-Path $Root "build\Release"),
+    (Join-Path $Root "vcpkg_installed\x64-windows\bin"),
+    (Join-Path $Root "retcomm-vcpkg\installed\x64-windows\bin"),
+    (Join-Path $env:RETCOMM_VCPKG "installed\x64-windows\bin")
+) | ForEach-Object { Copy-Dlls $_ }
+
+if (-not (Test-Path (Join-Path $Stage "SDL3.dll"))) {
+    throw "SDL3.dll missing from stage — pass -VcpkgBin or ensure cmake copies runtime DLLs"
+}
+
+# Toolkit + assets beside the exe (runtime resolves toolkit/ next to binary).
+$share = Join-Path $Prefix "share\retcomm-studio"
+if (-not (Test-Path (Join-Path $share "toolkit\project_studio"))) {
+    throw "Missing toolkit under $share"
+}
+Copy-Item (Join-Path $share "toolkit") (Join-Path $Stage "toolkit") -Recurse -Force
+if (Test-Path (Join-Path $share "fonts")) {
+    Copy-Item (Join-Path $share "fonts") (Join-Path $Stage "fonts") -Recurse -Force
+}
+if (Test-Path (Join-Path $share "assets")) {
+    Copy-Item (Join-Path $share "assets") (Join-Path $Stage "assets") -Recurse -Force
+} elseif (Test-Path (Join-Path $Root "assets\retcomm-studio.ico")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $Stage "assets") | Out-Null
+    Copy-Item (Join-Path $Root "assets\retcomm-studio.ico") (Join-Path $Stage "assets\") -Force
+    if (Test-Path (Join-Path $Root "assets\retcomm-studio.png")) {
+        Copy-Item (Join-Path $Root "assets\retcomm-studio.png") (Join-Path $Stage "assets\") -Force
+    }
+}
+Copy-Item (Join-Path $Root "VERSION") (Join-Path $Stage "VERSION") -Force
+
 $channelPortable = @{
     app = "retcomm-studio"
     version = $Version
@@ -42,25 +82,11 @@ $channelPortable = @{
 } | ConvertTo-Json
 Set-Content -Path (Join-Path $Stage "channel.json") -Value $channelPortable -Encoding UTF8
 
-# Ensure icon is present for Inno SetupIconFile.
-$ico = Join-Path $Stage "assets\retcomm-studio.ico"
-if (-not (Test-Path $ico)) {
-    $srcIco = Join-Path $Root "assets\retcomm-studio.ico"
-    if (Test-Path $srcIco) {
-        New-Item -ItemType Directory -Force -Path (Join-Path $Stage "assets") | Out-Null
-        Copy-Item $srcIco $ico -Force
-    } else {
-        throw "Missing retcomm-studio.ico (run packaging/make-icons.sh)"
-    }
-}
-
-# Portable zip
 $zipPath = Join-Path $OutDir $PortableZipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $zipPath -CompressionLevel Optimal
 Write-Host "Wrote $zipPath"
 
-# Installer channel marker (same stage tree)
 $channelInstaller = @{
     app = "retcomm-studio"
     version = $Version
@@ -68,7 +94,6 @@ $channelInstaller = @{
 } | ConvertTo-Json
 Set-Content -Path (Join-Path $Stage "channel.json") -Value $channelInstaller -Encoding UTF8
 
-# Inno Setup
 if (-not $InnoSetup) {
     $InnoSetup = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
 }
@@ -82,9 +107,5 @@ $iss = Join-Path $Root "packaging\windows\setup.iss"
     "/DOutputDir=$OutDir" `
     "/DArch=$Arch" `
     $iss
-if ($LASTEXITCODE -ne 0) { throw "ISCC failed: $LASTEXITCODE" }
-
-$setup = Join-Path $OutDir "RetComM-Studio-windows-$Arch-setup.exe"
-if (-not (Test-Path $setup)) { throw "Missing installer: $setup" }
-Write-Host "Wrote $setup"
-Get-ChildItem $OutDir | Format-Table Name, Length
+if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+Write-Host "Wrote installer under $OutDir"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Wrap PyInstaller onedir into RetComM Studio.app + DMG.
+# Wrap a CMake install prefix into RetComM Studio.app + DMG.
 #
 # Usage:
-#   packaging/macos/build-dmg.sh <pyinstaller-onedir> <version> [arch]
+#   packaging/macos/build-dmg.sh <install-prefix> <version> [arch]
 set -euo pipefail
 
-BUNDLE="${1:?pyinstaller onedir}"
+PREFIX="${1:?install prefix}"
 VERSION="${2:?version}"
 ARCH="${3:-$(uname -m)}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -18,20 +18,41 @@ BIN_NAME="RetComM-Studio"
 rm -rf "${APP}"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 
-if [[ ! -d "${BUNDLE}" ]]; then
-  echo "error: missing ${BUNDLE}" >&2
+if [[ ! -f "${PREFIX}/bin/${BIN_NAME}" ]]; then
+  echo "error: missing ${PREFIX}/bin/${BIN_NAME}" >&2
   exit 1
 fi
 
-# Place the whole onedir under MacOS/ so relative _internal / toolkit resolve.
-cp -a "${BUNDLE}/." "${APP}/Contents/MacOS/"
-chmod +x "${APP}/Contents/MacOS/${BIN_NAME}" || true
+cp -a "${PREFIX}/bin/${BIN_NAME}" "${APP}/Contents/MacOS/"
+chmod +x "${APP}/Contents/MacOS/${BIN_NAME}"
 
-# Thin launcher so CFBundleExecutable is a small wrapper.
+# Bundle toolkit / fonts / assets next to the binary.
+SHARE="${PREFIX}/share/retcomm-studio"
+if [[ -d "${SHARE}/toolkit" ]]; then
+  cp -a "${SHARE}/toolkit" "${APP}/Contents/MacOS/toolkit"
+fi
+if [[ -d "${SHARE}/fonts" ]]; then
+  cp -a "${SHARE}/fonts" "${APP}/Contents/MacOS/fonts"
+fi
+if [[ -d "${SHARE}/assets" ]]; then
+  cp -a "${SHARE}/assets" "${APP}/Contents/MacOS/assets"
+fi
+cp -f "${ROOT}/VERSION" "${APP}/Contents/MacOS/VERSION" || true
+
+# Copy dylibs from prefix lib / brew SDL if present.
+if [[ -d "${PREFIX}/lib" ]]; then
+  mkdir -p "${APP}/Contents/Frameworks"
+  shopt -s nullglob
+  for lib in "${PREFIX}/lib/"*.dylib; do
+    cp -a "${lib}" "${APP}/Contents/Frameworks/"
+  done
+  shopt -u nullglob
+fi
+
 cat > "${APP}/Contents/MacOS/RetComM-Studio-launch" <<'EOF'
 #!/bin/bash
 HERE="$(cd "$(dirname "$0")" && pwd)"
-export RETCOMM_STUDIO_FROZEN=1
+export DYLD_LIBRARY_PATH="${HERE}/../Frameworks:${DYLD_LIBRARY_PATH:-}"
 if [[ -f "${HERE}/VERSION" ]]; then
   export RETCOMM_STUDIO_VERSION="$(tr -d '[:space:]' < "${HERE}/VERSION")"
 fi
@@ -48,7 +69,6 @@ chmod +x "${APP}/Contents/MacOS/RetComM-Studio-launch"
 sed "s|@VERSION@|${VERSION}|g" "${ROOT}/packaging/macos/Info.plist.in" \
   > "${APP}/Contents/Info.plist"
 
-# Icon
 if [[ -f "${ROOT}/assets/retcomm-studio.icns" ]]; then
   install -m 644 "${ROOT}/assets/retcomm-studio.icns" \
     "${APP}/Contents/Resources/AppIcon.icns"

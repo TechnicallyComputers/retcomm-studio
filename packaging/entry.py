@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Frozen / source entry point for RetComM Studio GUI."""
+"""Thin launcher used by some packaging layouts — prefers the native binary."""
 
 from __future__ import annotations
 
@@ -8,51 +7,27 @@ import sys
 from pathlib import Path
 
 
-def _configure_paths() -> None:
-    """Make ``project_studio`` importable and point toolkit at bundled files."""
-    if getattr(sys, "frozen", False):
-        os.environ["RETCOMM_STUDIO_FROZEN"] = "1"
-        exe_dir = Path(sys.executable).resolve().parent
-        meipass = Path(getattr(sys, "_MEIPASS", exe_dir))
-        candidates = [
-            exe_dir / "toolkit",
-            meipass / "toolkit",
-            meipass / "tools" / "new_project_layout",
-        ]
-        for cand in candidates:
-            if cand.is_dir() and (cand / "project_studio").is_dir():
-                os.environ["RETCOMM_STUDIO_TOOLKIT"] = str(cand.resolve())
-                if str(cand) not in sys.path:
-                    sys.path.insert(0, str(cand))
-                break
-        assets = exe_dir / "assets"
-        if not assets.is_dir():
-            assets = meipass / "assets"
-        if assets.is_dir():
-            os.environ["RETCOMM_STUDIO_ASSETS"] = str(assets.resolve())
-        return
+def main() -> int:
+    # Prefer sibling RetComM-Studio binary (onedir / AppImage / install prefix).
+    here = Path(__file__).resolve().parent
+    for cand in (
+        here / "RetComM-Studio",
+        here / "RetComM-Studio.exe",
+        here.parent / "bin" / "RetComM-Studio",
+        here.parent / "bin" / "RetComM-Studio.exe",
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            os.execv(str(cand), [str(cand), *sys.argv[1:]])
 
-    # Source tree: packaging/entry.py → repo root
-    root = Path(__file__).resolve().parents[1]
+    # Fall back to Python CLI gui command (locates binary or prints build help).
+    root = here.parent if (here.parent / "tools" / "new_project_layout").is_dir() else here
     toolkit = root / "tools" / "new_project_layout"
-    if toolkit.is_dir() and str(toolkit) not in sys.path:
+    if toolkit.is_dir():
         sys.path.insert(0, str(toolkit))
-    assets = root / "assets"
-    if assets.is_dir():
-        os.environ["RETCOMM_STUDIO_ASSETS"] = str(assets.resolve())
-
-
-def main(argv: list[str] | None = None) -> int:
-    _configure_paths()
+        os.environ.setdefault("RETCOMM_STUDIO_TOOLKIT", str(toolkit.resolve()))
     from project_studio.gui import run_gui
 
-    initial = None
-    args = list(argv if argv is not None else sys.argv[1:])
-    if "--root" in args:
-        i = args.index("--root")
-        if i + 1 < len(args):
-            initial = Path(args[i + 1])
-    return run_gui(initial_root=initial)
+    return run_gui()
 
 
 if __name__ == "__main__":

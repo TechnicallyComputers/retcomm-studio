@@ -14,12 +14,13 @@ See [`docs/GAME_PROJECT_SETUP.md`](../../docs/GAME_PROJECT_SETUP.md).
 
 ## Project Studio (migrate / update)
 
-Shared Python library under `project_studio/` with CLI + CustomTkinter GUI.
-CLI stays stdlib-only. First GUI launch auto-creates
-`tools/new_project_layout/.venv` and installs `requirements-gui.txt`
-(network once); later launches are silent.
+Shared Python library under `project_studio/` (CLI + engine for the Dear ImGui
+GUI). CLI stays stdlib-only. The GUI is built from the repo root:
 
 ```bash
+cmake -S ../.. -B ../../build && cmake --build ../../build
+../../build/RetComM-Studio
+# or
 python3 tools/new_project_layout/project_studio_gui.py
 ```
 
@@ -41,7 +42,7 @@ python3 tools/new_project_layout/migrate_project.py apply \
   --root /path/to/ApeEscapeRecomp \
   --disc /path/to/game.cue
 
-# GUI (auto-bootstraps .venv + customtkinter on first run)
+# GUI (Dear ImGui native binary)
 python3 tools/new_project_layout/migrate_project.py gui
 # or
 python3 tools/new_project_layout/project_studio_gui.py

@@ -152,10 +152,243 @@ def cmd_ops(_: argparse.Namespace) -> int:
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
-    from project_studio.gui import run_gui
+    """Launch the native Dear ImGui Studio binary when available."""
+    import os
+    import shutil
+    import subprocess
 
     root = Path(args.root).expanduser().resolve() if args.root else None
-    return run_gui(initial_root=root)
+    candidates: list[Path] = []
+    env_bin = (os.environ.get("RETCOMM_STUDIO_BIN") or "").strip()
+    if env_bin:
+        candidates.append(Path(env_bin))
+    here = Path(__file__).resolve()
+    # tools/new_project_layout/project_studio/cli.py → repo root
+    repo = here.parents[3] if len(here.parents) > 3 else here.parents[2]
+    for rel in (
+        Path("build") / "RetComM-Studio",
+        Path("build") / "retcomm-studio",
+        Path("build-release") / "RetComM-Studio",
+        Path("out") / "bin" / "RetComM-Studio",
+    ):
+        candidates.append(repo / rel)
+    which = shutil.which("RetComM-Studio") or shutil.which("retcomm-studio")
+    if which:
+        candidates.append(Path(which))
+
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            cmd = [str(cand)]
+            if root is not None:
+                os.environ["RETCOMM_STUDIO_INITIAL_ROOT"] = str(root)
+            return int(subprocess.call(cmd))
+
+    print(
+        "RetComM Studio GUI is Dear ImGui (native).\n"
+        "Build it first:\n"
+        "  cmake -S . -B build && cmake --build build\n"
+        "  ./build/RetComM-Studio\n"
+        "Or set RETCOMM_STUDIO_BIN to the executable path.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _index_to_json_dict(index) -> dict:
+    from project_studio.repo_index import labels_for_repos
+
+    data = index.to_dict()
+    labels = labels_for_repos(index.repos)
+    repos_out = []
+    for entry, label in zip(index.repos, labels):
+        repos_out.append(
+            {
+                "path": entry.path,
+                "name": entry.name,
+                "cue": entry.cue,
+                "label": label,
+            }
+        )
+    data["repos"] = repos_out
+    return data
+
+
+def _print_index_json(index) -> int:
+    print(json.dumps(_index_to_json_dict(index), indent=2))
+    return 0
+
+
+def cmd_repos_list(_: argparse.Namespace) -> int:
+    from project_studio.repo_index import load_index
+
+    return _print_index_json(load_index())
+
+
+def cmd_repos_add(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import add_repo, load_index, looks_like_game_repo
+
+    root = Path(args.path).expanduser().resolve()
+    if not root.is_dir():
+        print(f"error: not a directory: {root}", file=sys.stderr)
+        return 2
+    if not looks_like_game_repo(root) and not args.force:
+        print(
+            f"error: does not look like a game repo (pass --force): {root}",
+            file=sys.stderr,
+        )
+        return 2
+    idx = load_index()
+    add_repo(idx, root, name=args.name or "", cue=args.cue or "")
+    return _print_index_json(idx)
+
+
+def cmd_repos_remove(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import load_index, remove_repo
+
+    idx = load_index()
+    if not remove_repo(idx, args.path):
+        print(f"error: not in index: {args.path}", file=sys.stderr)
+        return 2
+    return _print_index_json(idx)
+
+
+def cmd_repos_set_cue(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import load_index, set_repo_cue
+
+    idx = load_index()
+    entry = set_repo_cue(idx, args.path, args.cue)
+    if entry is None:
+        print(f"error: not in index: {args.path}", file=sys.stderr)
+        return 2
+    return _print_index_json(idx)
+
+
+def cmd_repos_set_last(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import load_index, set_last
+
+    idx = load_index()
+    set_last(idx, args.path)
+    return _print_index_json(idx)
+
+
+def cmd_repos_set_flags(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import load_index, save_index
+
+    idx = load_index()
+    if args.catalog_only is not None:
+        idx.catalog_only = str(args.catalog_only).strip() in ("1", "true", "yes", "on")
+    if args.bulk_jobs is not None:
+        try:
+            jobs = int(args.bulk_jobs)
+        except (TypeError, ValueError):
+            jobs = idx.bulk_jobs
+        idx.bulk_jobs = max(1, min(4, jobs))
+    if args.log_height is not None:
+        try:
+            h = int(args.log_height)
+        except (TypeError, ValueError):
+            h = idx.log_height
+        idx.log_height = max(100, min(800, h))
+    save_index(idx)
+    return _print_index_json(idx)
+
+
+def cmd_repos_filter_catalog(_: argparse.Namespace) -> int:
+    """JSON paths for indexed repos that map to retcomm-catalog titles."""
+    from project_studio.bulkops import filter_indexed_catalog
+    from project_studio.repo_index import load_index
+
+    hits, note = filter_indexed_catalog(load_index())
+    print(
+        json.dumps(
+            {
+                "note": note,
+                "paths": [e.path for e in hits],
+                "labels": [e.label() for e in hits],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_repos_filter_catalog_contributors(_: argparse.Namespace) -> int:
+    """JSON paths for catalog repos where the viewer has WRITE+ (gh)."""
+    from project_studio.bulkops import filter_indexed_catalog_contributors
+    from project_studio.repo_index import load_index
+
+    hits, note, logs = filter_indexed_catalog_contributors(load_index())
+    for line in logs:
+        print(line, file=sys.stderr)
+    print(
+        json.dumps(
+            {
+                "note": note,
+                "paths": [e.path for e in hits],
+                "labels": [e.label() for e in hits],
+                "logs": logs,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_updates_check(args: argparse.Namespace) -> int:
+    from project_studio.updater import check_updates
+
+    def prog(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    result = check_updates(on_progress=prog)
+    if args.json:
+        def comp(c) -> dict:
+            return {
+                "kind": c.kind,
+                "current": c.current,
+                "latest": c.latest,
+                "available": c.available,
+                "supported": c.supported,
+                "message": c.message,
+                "asset_name": c.asset_name,
+            }
+
+        print(
+            json.dumps(
+                {
+                    "ok": result.ok,
+                    "message": result.message,
+                    "studio": comp(result.studio),
+                    "toolchain": comp(result.toolchain),
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(result.studio.message)
+        print(result.toolchain.message)
+        if result.message:
+            print(result.message)
+    return 0 if result.ok else 1
+
+
+def cmd_updates_apply(args: argparse.Namespace) -> int:
+    from project_studio.updater import apply_updates, check_updates
+
+    def prog(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    result = check_updates(on_progress=prog)
+    summary, should_exit = apply_updates(
+        result,
+        update_studio=not args.toolchain_only,
+        update_toolchain=not args.studio_only,
+        on_progress=prog,
+    )
+    print(summary)
+    if should_exit:
+        return 0
+    return 0
 
 
 def cmd_new_project(args: argparse.Namespace) -> int:
@@ -270,6 +503,73 @@ def _root_or_die(args: argparse.Namespace) -> Path | None:
         print(f"error: not a directory: {root}", file=sys.stderr)
         return None
     return root
+
+
+def cmd_git_branches(args: argparse.Namespace) -> int:
+    """List game + module branch names as JSON for Studio dropdowns."""
+    from project_studio.gitops import (
+        DEFAULT_PSXRECOMP_URL,
+        DEFAULT_RBENGINE_URL,
+        DEFAULT_RECOMP_NET_URL,
+        DEFAULT_RECOMP_UI_URL,
+        list_branches,
+        list_module_branches,
+        list_remote_head_branches,
+    )
+
+    fetch = bool(getattr(args, "fetch", False))
+    root_s = (getattr(args, "root", None) or "").strip()
+    out: dict = {
+        "game": [],
+        "psxrecomp": [],
+        "recomp-ui": [],
+        "recomp-net": [],
+        "rbengine": [],
+    }
+    if root_s:
+        root = Path(root_s).expanduser().resolve()
+        if not root.is_dir():
+            print(f"error: not a directory: {root}", file=sys.stderr)
+            return 2
+        out["game"] = list_branches(root, remotes=True, fetch=fetch)
+        out["psxrecomp"] = list_module_branches(
+            root, "psxrecomp", remotes=True, fetch=fetch, url_fallback=DEFAULT_PSXRECOMP_URL
+        )
+        out["recomp-ui"] = list_module_branches(
+            root, "recomp-ui", remotes=True, fetch=fetch, url_fallback=DEFAULT_RECOMP_UI_URL
+        )
+        out["recomp-net"] = list_module_branches(
+            root,
+            "lib/recomp-net",
+            nested=True,
+            remotes=True,
+            fetch=fetch,
+            url_fallback=DEFAULT_RECOMP_NET_URL,
+        )
+        out["rbengine"] = list_module_branches(
+            root,
+            "lib/retcomm-rbengine",
+            nested=True,
+            remotes=True,
+            fetch=fetch,
+            url_fallback=DEFAULT_RBENGINE_URL,
+        )
+    else:
+        # New-project / no checkout: ls-remote default module URLs.
+        out["psxrecomp"] = list_remote_head_branches(DEFAULT_PSXRECOMP_URL)
+        out["recomp-ui"] = list_remote_head_branches(DEFAULT_RECOMP_UI_URL)
+        out["recomp-net"] = list_remote_head_branches(DEFAULT_RECOMP_NET_URL)
+        out["rbengine"] = list_remote_head_branches(DEFAULT_RBENGINE_URL)
+        # Sensible game-branch placeholders when scaffolding.
+        out["game"] = ["main", "master"]
+
+    # Always offer (default) for nested/ref menus that support it.
+    for key in ("recomp-net", "rbengine"):
+        if "(default)" not in out[key]:
+            out[key] = ["(default)", *out[key]]
+
+    print(json.dumps(out, indent=2))
+    return 0
 
 
 def cmd_git_status(args: argparse.Namespace) -> int:
@@ -996,9 +1296,66 @@ def build_parser() -> argparse.ArgumentParser:
     p_ops = sub.add_parser("ops", help="List op ids")
     p_ops.set_defaults(func=cmd_ops)
 
-    p_gui = sub.add_parser("gui", help="Open Project Studio GUI")
+    p_gui = sub.add_parser("gui", help="Open Project Studio GUI (Dear ImGui)")
     p_gui.add_argument("--root", default=None, help="Optional initial game root")
     p_gui.set_defaults(func=cmd_gui)
+
+    p_repos = sub.add_parser("repos", help="Manage local game-repo index")
+    repos_sub = p_repos.add_subparsers(dest="repos_cmd", required=True)
+    p_rl = repos_sub.add_parser("list", help="Print index as JSON")
+    p_rl.add_argument("--json", action="store_true", default=True,
+                      help="Always JSON (accepted for ImGui runner symmetry)")
+    p_rl.set_defaults(func=cmd_repos_list)
+    p_ra = repos_sub.add_parser("add", help="Add a game repo")
+    p_ra.add_argument("--path", required=True)
+    p_ra.add_argument("--name", default="")
+    p_ra.add_argument("--cue", default="")
+    p_ra.add_argument("--force", action="store_true")
+    p_ra.add_argument("--json", action="store_true", default=True)
+    p_ra.set_defaults(func=cmd_repos_add)
+    p_rr = repos_sub.add_parser("remove", help="Remove a game repo")
+    p_rr.add_argument("--path", required=True)
+    p_rr.add_argument("--json", action="store_true", default=True)
+    p_rr.set_defaults(func=cmd_repos_remove)
+    p_rsc = repos_sub.add_parser("set-cue", help="Set .cue for an indexed repo")
+    p_rsc.add_argument("--path", required=True)
+    p_rsc.add_argument("--cue", required=True)
+    p_rsc.add_argument("--json", action="store_true", default=True)
+    p_rsc.set_defaults(func=cmd_repos_set_cue)
+    p_rsl = repos_sub.add_parser("set-last", help="Remember last-selected repo")
+    p_rsl.add_argument("--path", required=True)
+    p_rsl.add_argument("--json", action="store_true", default=True)
+    p_rsl.set_defaults(func=cmd_repos_set_last)
+    p_rsf = repos_sub.add_parser("set-flags", help="Update catalog_only / bulk_jobs / log_height")
+    p_rsf.add_argument("--catalog-only", default=None)
+    p_rsf.add_argument("--bulk-jobs", default=None)
+    p_rsf.add_argument("--log-height", default=None)
+    p_rsf.add_argument("--json", action="store_true", default=True)
+    p_rsf.set_defaults(func=cmd_repos_set_flags)
+
+    p_rfc = repos_sub.add_parser(
+        "filter-catalog",
+        help="List indexed repos that have a retcomm-catalog entry (JSON paths)",
+    )
+    p_rfc.add_argument("--json", action="store_true", default=True)
+    p_rfc.set_defaults(func=cmd_repos_filter_catalog)
+
+    p_rfcc = repos_sub.add_parser(
+        "filter-catalog-contributors",
+        help="Catalog-backed indexed repos with WRITE+ for the current gh user",
+    )
+    p_rfcc.add_argument("--json", action="store_true", default=True)
+    p_rfcc.set_defaults(func=cmd_repos_filter_catalog_contributors)
+
+    p_upd = sub.add_parser("updates", help="Studio + toolchain updates")
+    upd_sub = p_upd.add_subparsers(dest="updates_cmd", required=True)
+    p_uc = upd_sub.add_parser("check", help="Check for updates")
+    p_uc.add_argument("--json", action="store_true")
+    p_uc.set_defaults(func=cmd_updates_check)
+    p_ua = upd_sub.add_parser("apply", help="Apply available updates")
+    p_ua.add_argument("--studio-only", action="store_true")
+    p_ua.add_argument("--toolchain-only", action="store_true")
+    p_ua.set_defaults(func=cmd_updates_apply)
 
     p_np = sub.add_parser(
         "new-project",
@@ -1071,6 +1428,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_git_root(p_gs)
     p_gs.add_argument("--json", action="store_true")
     p_gs.set_defaults(func=cmd_git_status)
+
+    p_gbrs = git_sub.add_parser(
+        "branches",
+        help="List game/module branch names (JSON) for Studio dropdowns",
+    )
+    p_gbrs.add_argument(
+        "--root",
+        default="",
+        help="Game repo root (omit to ls-remote default module URLs)",
+    )
+    p_gbrs.add_argument(
+        "--fetch",
+        action="store_true",
+        help="git fetch --prune before listing local checkouts",
+    )
+    p_gbrs.add_argument("--json", action="store_true", default=True)
+    p_gbrs.set_defaults(func=cmd_git_branches)
 
     p_ge = git_sub.add_parser("ensure-submodules", help="Add psxrecomp + recomp-ui")
     add_git_root(p_ge)

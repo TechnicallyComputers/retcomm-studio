@@ -11,13 +11,17 @@ cp studio.toml.example studio.toml
 # edit catalog / checkout_roots / [titles] as needed
 ```
 
-Requires Python 3.11+, `git`, and `gh` (for release dispatch).  
-GUI: first launch bootstraps `tools/new_project_layout/.venv` (customtkinter).
+Requires Python 3.11+ (toolkit engine), `git`, and `gh` (for release dispatch).  
+GUI is a native **Dear ImGui** app (SDL3 + OpenGL3), same stack as RetComM Hub.
 
 ```bash
+# Build + run GUI
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/RetComM-Studio
+
+# Or via Python entry (locates the binary / prints build help)
 python3 project_studio_gui.py
-# or
-python3 tools/new_project_layout/project_studio_gui.py
 ```
 
 ## Updates (Studio + shared toolchain)
@@ -65,14 +69,16 @@ retcomm-studio/
   studio.toml.example
   retcomm_studio_cli.py
   migrate_project.py
-  project_studio_gui.py
+  project_studio_gui.py      # launches native ImGui binary
+  CMakeLists.txt             # RetComM-Studio (Dear ImGui)
+  src/studio/                # ImGui shell + Python runner
   VERSION
-  assets/
+  assets/                    # icons + fonts/
   packaging/
   .github/workflows/release.yml
-  retcomm_studio/
+  retcomm_studio/            # catalog bulk CLI
   tools/new_project_layout/
-    project_studio/     # GUI + updater + migrate
+    project_studio/          # Python engine (migrate / git / build / …)
     templates/
     ci_templates/
 ```

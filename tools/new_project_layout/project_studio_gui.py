@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the Project Studio GUI (CustomTkinter).
-
-First run auto-bootstraps ``.venv`` from ``requirements-gui.txt``.
-"""
+"""Launch the Project Studio GUI (Dear ImGui native binary)."""
 
 from __future__ import annotations
 
