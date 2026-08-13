@@ -21,7 +21,7 @@ from .naming import (
     window_title_from_cmake,
     window_title_from_name,
 )
-from .paths import ci_setup_release_template, templates_dir, toolkit_dir
+from .paths import ci_setup_release_template, psxrecomp_root_from_toolkit, templates_dir, toolkit_dir
 
 
 def _run(cmd: list[str], cwd: Path, dry_run: bool) -> tuple[bool, str]:
@@ -606,6 +606,13 @@ def op_emit_codegen_setup(root: Path, options: MigrateOptions) -> ApplyResult:
 
 
 def op_emit_version(root: Path, options: MigrateOptions) -> ApplyResult:
+    """Write starter VERSION only when missing.
+
+    Never bump VERSION here — a newer VERSION without a rebuild leaves
+    PSX_GAME_VERSION sticky in CMakeCache / an old binary, which breaks
+    netplay lobby list filters. Releases must pin VERSION then rebuild with
+    -DPSX_GAME_VERSION=<pin> (CI / package_setup_host enforce the stamp).
+    """
     dst = root / "VERSION"
     if dst.is_file() and not options.force:
         return ApplyResult("emit_version", True, "VERSION already exists", [])
@@ -779,6 +786,58 @@ def op_emit_boxart_stub(root: Path, options: MigrateOptions) -> ApplyResult:
         True,
         "Created launcher_assets/img (add boxart.tga later)",
         ["launcher_assets/img/.gitkeep"],
+    )
+
+
+def _app_icon_source_dir(root: Path) -> Path | None:
+    """Prefer game submodule assets, then toolkit-adjacent psxrecomp checkout."""
+    for cand in (
+        root / "psxrecomp" / "assets",
+        root / "psxrecomp-v4" / "assets",
+    ):
+        if (cand / "psxrecomp.ico").is_file() or (cand / "psxrecomp.svg").is_file():
+            return cand
+    pr = psxrecomp_root_from_toolkit()
+    if pr is not None:
+        cand = pr / "assets"
+        if (cand / "psxrecomp.ico").is_file() or (cand / "psxrecomp.svg").is_file():
+            return cand
+    return None
+
+
+def op_ensure_app_icon(root: Path, options: MigrateOptions) -> ApplyResult:
+    dest_dir = root / "assets"
+    dest_ico = dest_dir / "psxrecomp.ico"
+    if dest_ico.is_file() and not options.force:
+        return ApplyResult("ensure_app_icon", True, "assets/psxrecomp.ico already present", [])
+    src_dir = _app_icon_source_dir(root)
+    if src_dir is None:
+        return ApplyResult(
+            "ensure_app_icon",
+            False,
+            "No psxrecomp/assets icon source (add psxrecomp submodule or update toolkit)",
+            [],
+        )
+    names = [n for n in ("psxrecomp.svg", "psxrecomp.png", "psxrecomp.ico") if (src_dir / n).is_file()]
+    if not names:
+        return ApplyResult("ensure_app_icon", False, f"Empty icon source: {src_dir}", [])
+    if options.dry_run:
+        return ApplyResult(
+            "ensure_app_icon",
+            True,
+            f"dry-run: copy {', '.join(names)} → assets/",
+            [f"assets/{n}" for n in names],
+        )
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    changed: list[str] = []
+    for name in names:
+        shutil.copy2(src_dir / name, dest_dir / name)
+        changed.append(f"assets/{name}")
+    return ApplyResult(
+        "ensure_app_icon",
+        True,
+        f"Installed app icon from {src_dir.name}/ ({', '.join(names)})",
+        changed,
     )
 
 
@@ -1034,6 +1093,7 @@ _OPS = {
     "emit_mods_preloaded": op_emit_mods_preloaded,
     "relocate_boxart": op_relocate_boxart,
     "emit_boxart_stub": op_emit_boxart_stub,
+    "ensure_app_icon": op_ensure_app_icon,
     "rewrite_cmake_setup_host": op_rewrite_cmake_setup_host,
     "emit_packager": op_emit_packager,
     "emit_ci_workflow": op_emit_ci_workflow,

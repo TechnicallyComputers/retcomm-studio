@@ -450,14 +450,16 @@ def audit_project(root: Path) -> AuditReport:
         )
 
     # VERSION
+    ver_text = ""
     if (root / "VERSION").is_file():
+        ver_text = _read(root / "VERSION").strip()
         checks.append(
             CheckResult(
                 id="version_file",
                 title="VERSION",
                 status=CheckStatus.PASS,
                 severity=Severity.RECOMMENDED,
-                detail=_read(root / "VERSION").strip() or "(empty)",
+                detail=ver_text or "(empty)",
             )
         )
     else:
@@ -471,6 +473,48 @@ def audit_project(root: Path) -> AuditReport:
                 fix_op="emit_version",
             )
         )
+
+    # Lobby pin stamp vs VERSION (build tree) — drift breaks netplay lists.
+    stamp_hits: list[tuple[str, str]] = []
+    for build in sorted(root.glob("build*")):
+        if not build.is_dir():
+            continue
+        for stamp in (
+            build / "psx_game_version.txt",
+            build / "Release" / "psx_game_version.txt",
+        ):
+            if stamp.is_file():
+                stamp_hits.append(
+                    (str(stamp.relative_to(root)).replace("\\", "/"),
+                     _read(stamp).strip())
+                )
+    if ver_text and stamp_hits:
+        bad = [(p, s) for p, s in stamp_hits if s and s.lstrip("vV") != ver_text.lstrip("vV")]
+        if bad:
+            detail = "; ".join(f"{p}={s} (VERSION={ver_text})" for p, s in bad[:3])
+            checks.append(
+                CheckResult(
+                    id="version_stamp_match",
+                    title="Lobby pin stamp",
+                    status=CheckStatus.FAIL,
+                    severity=Severity.REQUIRED,
+                    detail=(
+                        "psx_game_version.txt disagrees with VERSION — "
+                        "rebuild with -DPSX_GAME_VERSION matching VERSION before "
+                        "packaging/releasing. " + detail
+                    ),
+                )
+            )
+        else:
+            checks.append(
+                CheckResult(
+                    id="version_stamp_match",
+                    title="Lobby pin stamp",
+                    status=CheckStatus.PASS,
+                    severity=Severity.RECOMMENDED,
+                    detail="Build stamp matches VERSION.",
+                )
+            )
 
     # symbols
     if (root / "symbols.toml").is_file():
@@ -592,6 +636,30 @@ def audit_project(root: Path) -> AuditReport:
                 severity=Severity.OPTIONAL,
                 detail="No boxart found (optional).",
                 fix_op="emit_boxart_stub",
+            )
+        )
+
+    # Default RetComM-themed app icon (Windows .ico + PNG)
+    app_ico = root / "assets" / "psxrecomp.ico"
+    if app_ico.is_file():
+        checks.append(
+            CheckResult(
+                id="app_icon",
+                title="assets/psxrecomp app icon",
+                status=CheckStatus.PASS,
+                severity=Severity.OPTIONAL,
+                detail="assets/psxrecomp.ico present.",
+            )
+        )
+    else:
+        checks.append(
+            CheckResult(
+                id="app_icon",
+                title="assets/psxrecomp app icon",
+                status=CheckStatus.WARN,
+                severity=Severity.RECOMMENDED,
+                detail="Missing assets/psxrecomp.ico (RetComM-themed default pad icon).",
+                fix_op="ensure_app_icon",
             )
         )
 
