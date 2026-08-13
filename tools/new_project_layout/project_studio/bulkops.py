@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .gitops import (
     CmdResult,
     commit_all,
     commit_modules,
+    install_and_push_release_ci,
     pull,
     pull_modules,
     pull_psxrecomp,
@@ -17,6 +21,7 @@ from .gitops import (
     push_modules,
     push_psxrecomp,
     repo_status,
+    run_release_workflow,
     switch_branch,
     switch_modules,
     switch_psxrecomp,
@@ -25,6 +30,71 @@ from .repo_index import RepoEntry, RepoIndex, load_index
 
 # GitHub viewerPermission values that can push / manage the repo.
 _CONTRIBUTOR_PERMS = frozenset({"ADMIN", "MAINTAIN", "WRITE"})
+
+# Cap for Project Studio Bulk parallel workers (dropdown 1–4).
+BULK_JOBS_MAX = 4
+
+RepoItem = tuple[str, Path]
+OnRepoResults = Callable[[list[CmdResult]], None]
+
+
+def clamp_bulk_jobs(jobs: int | str | None) -> int:
+    """Clamp parallel bulk workers to 1..BULK_JOBS_MAX."""
+    try:
+        n = int(jobs)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    if n > BULK_JOBS_MAX:
+        n = BULK_JOBS_MAX
+    return n
+
+
+def map_repos(
+    repos: list[RepoItem],
+    worker: Callable[[str, Path], list[CmdResult]],
+    *,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
+) -> list[CmdResult]:
+    """Run ``worker(label, root)`` over repos with up to ``BULK_JOBS_MAX`` workers.
+
+    ``on_repo`` is invoked with each repo's result list as it finishes (may run
+    on a worker thread — UI callers must marshal onto the main thread).
+    """
+    jobs = clamp_bulk_jobs(jobs)
+    if not repos:
+        return []
+
+    def run_one(label: str, root: Path) -> list[CmdResult]:
+        try:
+            out = worker(label, root)
+        except Exception as exc:  # noqa: BLE001 — keep other repos going
+            out = [CmdResult(False, f"{label}: {exc}")]
+        if not isinstance(out, list):
+            out = [out]
+        if on_repo is not None:
+            on_repo(out)
+        return out
+
+    if jobs <= 1 or len(repos) <= 1:
+        all_results: list[CmdResult] = []
+        for label, root in repos:
+            all_results.extend(run_one(label, root))
+        return all_results
+
+    all_results: list[CmdResult] = []
+    lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {
+            pool.submit(run_one, label, root): (label, root) for label, root in repos
+        }
+        for fut in as_completed(futures):
+            batch = fut.result()
+            with lock:
+                all_results.extend(batch)
+    return all_results
 
 
 def _compact(s: str) -> str:
@@ -115,12 +185,15 @@ def format_status_brief(root: Path) -> str:
 
 def bulk_status(
     repos: list[tuple[str, Path]],
+    *,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
 ) -> list[CmdResult]:
-    results: list[CmdResult] = []
-    for label, root in repos:
+    def one(label: str, root: Path) -> list[CmdResult]:
         brief = format_status_brief(root)
-        results.append(CmdResult(True, f"{label}: {brief}", str(root)))
-    return results
+        return [CmdResult(True, f"{label}: {brief}", str(root))]
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
 def bulk_pull(
@@ -133,29 +206,34 @@ def bulk_pull(
     mode: str = "ff-only",
     dirty: str = "fail",
     dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
 ) -> list[CmdResult]:
     """Pull selected targets for each repo. At least one target should be True."""
     if not (game or modules or psxrecomp or nested):
         return [CmdResult(False, "No pull targets (game/modules/psxrecomp/nested)")]
-    results: list[CmdResult] = []
-    for label, root in repos:
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        out: list[CmdResult] = []
         if game:
             r = pull(root, mode=mode, dirty=dirty, dry_run=dry_run)
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if modules:
             for r in pull_modules(
                 root, nested=False, mode=mode, dirty=dirty, dry_run=dry_run
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if psxrecomp:
             r = pull_psxrecomp(root, mode=mode, dirty=dirty, dry_run=dry_run)
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if nested:
             for r in pull_modules(
                 root, nested=True, mode=mode, dirty=dirty, dry_run=dry_run
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
-    return results
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+        return out
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
 def bulk_push(
@@ -166,24 +244,29 @@ def bulk_push(
     psxrecomp: bool = False,
     nested: bool = False,
     dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
 ) -> list[CmdResult]:
     if not (game or modules or psxrecomp or nested):
         return [CmdResult(False, "No push targets (game/modules/psxrecomp/nested)")]
-    results: list[CmdResult] = []
-    for label, root in repos:
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        out: list[CmdResult] = []
         if game:
             r = push(root, dry_run=dry_run)
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if modules:
             for r in push_modules(root, nested=False, dry_run=dry_run):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if psxrecomp:
             r = push_psxrecomp(root, dry_run=dry_run)
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if nested:
             for r in push_modules(root, nested=True, dry_run=dry_run):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
-    return results
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+        return out
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
 def bulk_commit(
@@ -194,28 +277,33 @@ def bulk_commit(
     modules: bool = False,
     nested: bool = False,
     dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
 ) -> list[CmdResult]:
     message = (message or "").strip()
     if not message:
         return [CmdResult(False, "Commit message required")]
     if not (game or modules or nested):
         return [CmdResult(False, "No commit targets (game/modules/nested)")]
-    results: list[CmdResult] = []
-    for label, root in repos:
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        out: list[CmdResult] = []
         if game:
             r = commit_all(root, message, dry_run=dry_run)
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if modules:
             for r in commit_modules(
                 root, message, nested=False, dry_run=dry_run
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if nested:
             for r in commit_modules(
                 root, message, nested=True, dry_run=dry_run
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
-    return results
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+        return out
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
 def bulk_switch(
@@ -233,6 +321,8 @@ def bulk_switch(
     create: bool = False,
     set_tracking: bool = True,
     dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
 ) -> list[CmdResult]:
     """``git switch`` (+ optional .gitmodules tracking) across selected repos.
 
@@ -253,33 +343,25 @@ def bulk_switch(
     recomp_net_branch = (recomp_net_branch or "").strip()
     rbengine_branch = (rbengine_branch or "").strip()
 
+    # Empty / (default) → each checkout's own default branch (resolved in switch_branch).
     if game and not game_branch:
-        return [CmdResult(False, "Game root switch needs a game branch name")]
+        game_branch = "(default)"
     if psxrecomp and not psxrecomp_branch and not modules:
-        # modules path can supply psx branch; lone --psxrecomp needs a name
-        return [CmdResult(False, "psxrecomp switch needs a branch name")]
+        psxrecomp_branch = "(default)"
     if modules and not (psxrecomp_branch or recomp_ui_branch):
-        return [
-            CmdResult(
-                False,
-                "Modules switch needs psxrecomp and/or recomp-ui branch",
-            )
-        ]
+        psxrecomp_branch = psxrecomp_branch or "(default)"
+        recomp_ui_branch = recomp_ui_branch or "(default)"
     if nested and not (recomp_net_branch or rbengine_branch):
-        return [
-            CmdResult(
-                False,
-                "Nested switch needs recomp-net and/or rbengine branch",
-            )
-        ]
+        recomp_net_branch = recomp_net_branch or "(default)"
+        rbengine_branch = rbengine_branch or "(default)"
 
-    results: list[CmdResult] = []
-    for label, root in repos:
+    def one(label: str, root: Path) -> list[CmdResult]:
+        out: list[CmdResult] = []
         if game:
             r = switch_branch(
                 root, game_branch, create=create, dry_run=dry_run
             )
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if modules:
             branch_by_path: dict[str, str] = {}
             if psxrecomp_branch:
@@ -296,21 +378,31 @@ def bulk_switch(
                 set_tracking=set_tracking,
                 dry_run=dry_run,
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         elif psxrecomp:
             r = switch_psxrecomp(
                 root, psxrecomp_branch, create=create, dry_run=dry_run
             )
-            results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
-            if set_tracking and r.ok and psxrecomp_branch:
-                from .gitops import set_submodule_branch
+            out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+            if set_tracking and r.ok:
+                from .gitops import (
+                    current_branch,
+                    is_default_branch_token,
+                    resolve_default_branch,
+                    resolve_psxrecomp_dir,
+                    set_submodule_branch,
+                )
 
+                actual = psxrecomp_branch
+                psx = resolve_psxrecomp_dir(root)
+                if psx is not None and not dry_run:
+                    actual = current_branch(psx) or actual
+                if is_default_branch_token(actual) and psx is not None:
+                    actual = resolve_default_branch(psx) or "master"
                 tr = set_submodule_branch(
-                    root, "psxrecomp", psxrecomp_branch, dry_run=dry_run
+                    root, "psxrecomp", actual, dry_run=dry_run
                 )
-                results.append(
-                    CmdResult(tr.ok, f"{label}: {tr.message}", tr.detail)
-                )
+                out.append(CmdResult(tr.ok, f"{label}: {tr.message}", tr.detail))
         if nested:
             branch_by_path = {}
             if recomp_net_branch:
@@ -327,8 +419,10 @@ def bulk_switch(
                 set_tracking=set_tracking,
                 dry_run=dry_run,
             ):
-                results.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
-    return results
+                out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
+        return out
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
 
 
 # ---------------------------------------------------------------------------
@@ -589,3 +683,69 @@ def filter_indexed_catalog_contributors(
         if ok:
             hits.append(entry)
     return hits, note, logs
+
+
+def bulk_release(
+    repos: list[tuple[str, Path]],
+    *,
+    version: str = "",
+    bump: str = "patch",
+    publish: bool = True,
+    reuse_cached_emitters: bool = True,
+    dry_run: bool = False,
+    skip_missing_workflow: bool = True,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
+) -> list[CmdResult]:
+    """Dispatch ``release.yml`` via ``gh workflow run`` on each selected game repo.
+
+    Empty ``version`` auto-bumps per repo (each title keeps its own tag line).
+    An explicit version is applied to every repo (may fail if that tag exists).
+    """
+    bump = (bump or "patch").strip()
+    version = (version or "").strip()
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        wf = root / ".github" / "workflows" / "release.yml"
+        if not wf.is_file() and not dry_run:
+            msg = f"{label}: missing .github/workflows/release.yml"
+            if skip_missing_workflow:
+                return [CmdResult(False, msg + " (skipped)")]
+            return [CmdResult(False, msg)]
+        r = run_release_workflow(
+            root,
+            version=version,
+            bump=bump,
+            publish=publish,
+            reuse_cached_emitters=reuse_cached_emitters,
+            dry_run=dry_run,
+        )
+        return [CmdResult(r.ok, f"{label}: {r.message}", r.detail)]
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)
+
+
+def bulk_install_ci(
+    repos: list[tuple[str, Path]],
+    *,
+    force: bool = False,
+    push_remote: bool = True,
+    dry_run: bool = False,
+    jobs: int = 1,
+    on_repo: OnRepoResults | None = None,
+) -> list[CmdResult]:
+    """Install/push setup-host ``release.yml`` on each selected game repo."""
+    from fill_tokens import derive_zip_prefix
+
+    def one(label: str, root: Path) -> list[CmdResult]:
+        zip_prefix = derive_zip_prefix(root.name)
+        r = install_and_push_release_ci(
+            root,
+            zip_prefix=zip_prefix,
+            force=force,
+            push_remote=push_remote,
+            dry_run=dry_run,
+        )
+        return [CmdResult(r.ok, f"{label}: {r.message}", r.detail)]
+
+    return map_repos(repos, one, jobs=jobs, on_repo=on_repo)

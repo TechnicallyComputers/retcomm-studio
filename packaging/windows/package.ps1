@@ -33,6 +33,15 @@ if (-not (Test-Path $mainExe)) {
 # Friendly portable name alongside the canonical exe (installer uses RetComM-Studio.exe).
 Copy-Item $mainExe (Join-Path $Stage $FriendlyExe) -Force
 
+# channel.json — portable vs installer
+$channelPortable = @{
+    app = "retcomm-studio"
+    version = $Version
+    channel = "portable"
+    portable_exe = $FriendlyExe
+} | ConvertTo-Json
+Set-Content -Path (Join-Path $Stage "channel.json") -Value $channelPortable -Encoding UTF8
+
 # Ensure icon is present for Inno SetupIconFile.
 $ico = Join-Path $Stage "assets\retcomm-studio.ico"
 if (-not (Test-Path $ico)) {
@@ -50,6 +59,14 @@ $zipPath = Join-Path $OutDir $PortableZipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $zipPath -CompressionLevel Optimal
 Write-Host "Wrote $zipPath"
+
+# Installer channel marker (same stage tree)
+$channelInstaller = @{
+    app = "retcomm-studio"
+    version = $Version
+    channel = "installer"
+} | ConvertTo-Json
+Set-Content -Path (Join-Path $Stage "channel.json") -Value $channelInstaller -Encoding UTF8
 
 # Inno Setup
 if (-not $InnoSetup) {

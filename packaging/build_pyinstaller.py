@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -77,8 +78,31 @@ def main() -> int:
             shutil.rmtree(assets_dst)
         shutil.copytree(assets_src, assets_dst)
 
+    # Version + install channel metadata for the self-updater.
+    (out / "VERSION").write_text(version.strip() + "\n", encoding="utf-8")
+    channel = {
+        "app": "retcomm-studio",
+        "version": version.strip(),
+        "channel": _default_channel(),
+    }
+    if sys.platform == "win32":
+        # Installer packaging overwrites channel to "installer"; portable zip keeps this.
+        channel["channel"] = "portable"
+        channel["portable_exe"] = "RetComM Studio.exe"
+    (out / "channel.json").write_text(
+        json.dumps(channel, indent=2) + "\n", encoding="utf-8"
+    )
+
     print(f"Built {out} (version {version})")
     return 0
+
+
+def _default_channel() -> str:
+    if sys.platform == "darwin":
+        return "macos-app"
+    if sys.platform == "win32":
+        return "portable"
+    return "appimage"
 
 
 if __name__ == "__main__":

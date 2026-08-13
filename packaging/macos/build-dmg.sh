@@ -27,18 +27,21 @@ fi
 cp -a "${BUNDLE}/." "${APP}/Contents/MacOS/"
 chmod +x "${APP}/Contents/MacOS/${BIN_NAME}" || true
 
-# Thin launcher so CFBundleExecutable is a small wrapper (optional: point at binary).
-cat > "${APP}/Contents/MacOS/RetComM-Studio-launch" <<EOF
+# Thin launcher so CFBundleExecutable is a small wrapper.
+cat > "${APP}/Contents/MacOS/RetComM-Studio-launch" <<'EOF'
 #!/bin/bash
-HERE="\$(cd "\$(dirname "\$0")" && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 export RETCOMM_STUDIO_FROZEN=1
-if [[ -d "\${HERE}/toolkit" ]]; then
-  export RETCOMM_STUDIO_TOOLKIT="\${HERE}/toolkit"
+if [[ -f "${HERE}/VERSION" ]]; then
+  export RETCOMM_STUDIO_VERSION="$(tr -d '[:space:]' < "${HERE}/VERSION")"
 fi
-if [[ -d "\${HERE}/assets" ]]; then
-  export RETCOMM_STUDIO_ASSETS="\${HERE}/assets"
+if [[ -d "${HERE}/toolkit" ]]; then
+  export RETCOMM_STUDIO_TOOLKIT="${HERE}/toolkit"
 fi
-exec "\${HERE}/${BIN_NAME}" "\$@"
+if [[ -d "${HERE}/assets" ]]; then
+  export RETCOMM_STUDIO_ASSETS="${HERE}/assets"
+fi
+exec "${HERE}/RetComM-Studio" "$@"
 EOF
 chmod +x "${APP}/Contents/MacOS/RetComM-Studio-launch"
 

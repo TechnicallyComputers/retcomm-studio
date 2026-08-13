@@ -746,6 +746,42 @@ def cmd_git_push(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+
+def cmd_git_bulk_release(args: argparse.Namespace) -> int:
+    from project_studio.bulkops import bulk_release
+
+    repos = _bulk_repos_or_die(args)
+    if repos is None:
+        return 2
+    results = bulk_release(
+        repos,
+        version=getattr(args, "version", "") or "",
+        bump=getattr(args, "bump", "patch") or "patch",
+        publish=not bool(getattr(args, "no_publish", False)),
+        reuse_cached_emitters=not bool(
+            getattr(args, "no_reuse_cached_emitters", False)
+        ),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        skip_missing_workflow=not bool(getattr(args, "strict", False)),
+    )
+    return _print_module_results(results)
+
+
+def cmd_git_bulk_install_ci(args: argparse.Namespace) -> int:
+    from project_studio.bulkops import bulk_install_ci
+
+    repos = _bulk_repos_or_die(args)
+    if repos is None:
+        return 2
+    results = bulk_install_ci(
+        repos,
+        force=bool(getattr(args, "force", False)),
+        push_remote=not bool(getattr(args, "no_push", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    return _print_module_results(results)
+
+
 def cmd_git_release(args: argparse.Namespace) -> int:
     from project_studio.gitops import run_release_workflow
 
@@ -1359,6 +1395,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not update .gitmodules branch= tracking",
     )
     p_gbsw.set_defaults(func=cmd_git_bulk_switch)
+
+
+    p_gbr = git_sub.add_parser(
+        "bulk-release",
+        help="Dispatch release.yml on selected indexed repos (gh workflow run)",
+    )
+    add_bulk_select(p_gbr)
+    p_gbr.add_argument("--version", default="", help="Empty = auto-bump per repo")
+    p_gbr.add_argument(
+        "--bump", choices=("patch", "minor", "major"), default="patch"
+    )
+    p_gbr.add_argument("--no-publish", action="store_true")
+    p_gbr.add_argument("--no-reuse-cached-emitters", action="store_true")
+    p_gbr.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail hard when release.yml is missing (default: skip)",
+    )
+    p_gbr.set_defaults(func=cmd_git_bulk_release)
+
+    p_gbci = git_sub.add_parser(
+        "bulk-install-ci",
+        help="Install/push setup-host release.yml on selected indexed repos",
+    )
+    add_bulk_select(p_gbci)
+    p_gbci.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an already-filled release.yml",
+    )
+    p_gbci.add_argument(
+        "--no-push",
+        action="store_true",
+        help="Commit locally only (do not push)",
+    )
+    p_gbci.set_defaults(func=cmd_git_bulk_install_ci)
 
     p_gr = git_sub.add_parser("release", help="gh workflow run release.yml")
     add_git_root(p_gr)

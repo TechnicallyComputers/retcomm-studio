@@ -597,6 +597,54 @@ def set_submodule_branch(
     return CmdResult(True, f"Set {path} tracking branch → {branch}")
 
 
+def resolve_default_branch(root: Path, *, remote: str = "origin") -> str | None:
+    """Best-effort default branch for a checkout (``origin/HEAD``, else main/master)."""
+    root = root.expanduser().resolve()
+    if not _is_git_repo(root):
+        return None
+    code, out, _err = _git(
+        root,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        f"refs/remotes/{remote}/HEAD",
+    )
+    if code == 0:
+        ref = (out or "").strip()
+        if ref:
+            # origin/main → main
+            if "/" in ref:
+                return ref.split("/", 1)[-1]
+            return ref
+    for name in ("main", "master"):
+        code, _o, _e = _git(
+            root, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{name}"
+        )
+        if code == 0:
+            return name
+        code, _o, _e = _git(
+            root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"
+        )
+        if code == 0:
+            return name
+    code, out, _err = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if code == 0:
+        head = (out or "").strip()
+        if head and head != "HEAD":
+            return head
+    return None
+
+
+def is_default_branch_token(branch: str | None) -> bool:
+    """True for empty / ``(default)`` / similar UI sentinels."""
+    s = (branch or "").strip().lower()
+    if not s:
+        return True
+    if s.startswith("(") and "default" in s:
+        return True
+    return s in ("default", "auto")
+
+
 def _git_switch(
     cwd: Path,
     *args: str,
@@ -639,39 +687,100 @@ def switch_branch(
     *,
     create: bool = False,
     dry_run: bool = False,
+    prefer_default: bool = True,
 ) -> CmdResult:
     """``git switch`` onto ``branch`` (guess remote-tracking; optional ``-c``).
 
-    Unlike ``set-branch`` on a submodule path, this moves the working tree
-    HEAD. Type any name — it does not have to already be in a Studio menu.
+    Empty / ``(default)`` resolves each repo's default branch (``origin/HEAD``,
+    else main/master). When ``prefer_default`` is set and a named branch is
+    missing, falls back to that default instead of failing.
     """
     root = root.expanduser().resolve()
-    branch = branch.strip()
-    if not branch or branch.startswith("("):
-        return CmdResult(False, "Branch name required")
     if not _is_git_repo(root):
         return CmdResult(False, "Not a git repository")
+
+    requested = (branch or "").strip()
+    used_default_token = is_default_branch_token(requested)
+    if used_default_token:
+        resolved = resolve_default_branch(root)
+        if not resolved:
+            return CmdResult(
+                False,
+                "Could not resolve default branch (fetch remotes / set origin/HEAD)",
+            )
+        target = resolved
+        note = "default"
+    else:
+        target = requested
+        note = ""
+
     current = current_branch(root)
-    if current == branch:
-        return CmdResult(True, f"Already on {branch}")
+    if current == target:
+        suffix = f" ({note})" if note else ""
+        return CmdResult(True, f"Already on {target}{suffix}")
 
     verb = "Would switch" if dry_run else "Switched"
-    code, out, err = _git_switch(root, "--guess", branch, dry_run=dry_run)
-    if code == 0:
-        return CmdResult(True, f"{verb} to {branch}", out)
+    if dry_run:
+        # Validate the ref exists so dry-run matches real switch + default fallback.
+        code_v, _, _ = _git(
+            root, "rev-parse", "--verify", "--quiet", f"refs/heads/{target}"
+        )
+        if code_v != 0:
+            code_v, _, _ = _git(
+                root,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/remotes/origin/{target}",
+            )
+        if code_v == 0:
+            suffix = f" ({note})" if note else ""
+            return CmdResult(True, f"{verb} to {target}{suffix}")
+        # fall through to create / prefer_default handling below
+        code, out, err = 1, "", f"fatal: invalid reference: {target}"
+    else:
+        code, out, err = _git_switch(root, "--guess", target, dry_run=False)
+        if code == 0:
+            suffix = f" ({note})" if note else ""
+            return CmdResult(True, f"{verb} to {target}{suffix}", out)
 
-    if create:
-        code2, out2, err2 = _git_switch(root, "-c", branch, dry_run=dry_run)
+    if create and not used_default_token:
+        code2, out2, err2 = _git_switch(root, "-c", target, dry_run=dry_run)
         if code2 == 0:
-            return CmdResult(True, f"{verb} to new branch {branch}", out2)
+            return CmdResult(True, f"{verb} to new branch {target}", out2)
         return CmdResult(
             False,
-            f"Could not create/switch to {branch}",
+            f"Could not create/switch to {target}",
             err2 or out2 or err or out,
         )
 
+    # Named branch missing → prefer this checkout's default branch.
+    if prefer_default and not used_default_token and not create:
+        fallback = resolve_default_branch(root)
+        if fallback and fallback != target:
+            if current == fallback:
+                return CmdResult(
+                    True,
+                    f"Already on {fallback} (default; {target} missing)",
+                )
+            if dry_run:
+                return CmdResult(
+                    True,
+                    f"{verb} to {fallback} (default; {target} missing)",
+                )
+            code_f, out_f, err_f = _git_switch(
+                root, "--guess", fallback, dry_run=False
+            )
+            if code_f == 0:
+                return CmdResult(
+                    True,
+                    f"{verb} to {fallback} (default; {target} missing)",
+                    out_f or err or out,
+                )
+            err = err_f or out_f or err
+
     hint = " (enable Create / --create to start a new branch)"
-    return CmdResult(False, f"Could not switch to {branch}{hint}", err or out)
+    return CmdResult(False, f"Could not switch to {target}{hint}", err or out)
 
 
 def set_repo_branch(
@@ -1072,8 +1181,9 @@ def switch_modules(
     """``git switch`` inside each module checkout.
 
     ``branch_by_path`` overrides .gitmodules tracking. When a path has no
-    explicit branch, tracking is used. ``set_tracking`` also writes
-    ``branch =`` in .gitmodules so ``update --remote`` stays aligned.
+    explicit branch, tracking is used, then the checkout's default branch.
+    ``(default)`` always means each module's own default. ``set_tracking``
+    also writes ``branch =`` in .gitmodules so ``update --remote`` stays aligned.
     """
     want = paths or list(default_module_paths(nested=nested))
     branches = {
@@ -1089,8 +1199,16 @@ def switch_modules(
     for path in want:
         path = _normalize_module_path(path, nested=nested)
         branch = (branches.get(path) or "").strip()
-        if not branch and owner is not None:
-            branch = _tracking_branch_for(owner, path)
+        if is_default_branch_token(branch):
+            # Blank override → prefer .gitmodules tracking, else default.
+            if not branch and owner is not None:
+                tracked = _tracking_branch_for(owner, path)
+                if tracked and not is_default_branch_token(tracked):
+                    branch = tracked
+                else:
+                    branch = "(default)"
+            else:
+                branch = "(default)"
         if not branch:
             results.append(CmdResult(False, f"{path}: no branch to switch to"))
             continue
@@ -1101,10 +1219,27 @@ def switch_modules(
         r = switch_branch(sub, branch, create=create, dry_run=dry_run)
         msg = f"{path}: {r.message}"
         if r.ok and set_tracking:
+            # Track the branch we actually landed on (may be default fallback).
+            actual = ""
+            if not dry_run:
+                actual = current_branch(sub) or ""
+            if not actual:
+                # dry-run: derive from switch message when possible
+                for token in ("Switched to ", "Would switch to ", "Already on "):
+                    if token in (r.message or ""):
+                        rest = (r.message or "").split(token, 1)[1]
+                        actual = rest.split()[0] if rest else ""
+                        break
+            if not actual:
+                actual = (
+                    resolve_default_branch(sub)
+                    if is_default_branch_token(branch)
+                    else branch
+                )
             if nested:
-                tr = set_nested_branch(root, path, branch, dry_run=dry_run)
+                tr = set_nested_branch(root, path, actual, dry_run=dry_run)
             else:
-                tr = set_submodule_branch(root, path, branch, dry_run=dry_run)
+                tr = set_submodule_branch(root, path, actual, dry_run=dry_run)
             detail = "\n".join(x for x in (r.detail, tr.message) if x)
             results.append(CmdResult(tr.ok, f"{msg}; {tr.message}", detail))
         else:

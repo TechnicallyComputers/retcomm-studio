@@ -58,6 +58,7 @@ class RepoIndex:
     path: Path = DEFAULT_INDEX_PATH
     log_height: int = 160  # Studio activity-log pane height (px)
     catalog_only: bool = False  # Filter Game-repo dropdown to catalog titles
+    bulk_jobs: int = 2  # Parallel workers for Bulk tab (1–4)
 
     def to_dict(self) -> dict:
         repos_out: list[dict] = []
@@ -74,10 +75,16 @@ class RepoIndex:
             h = 100
         if h > 800:
             h = 800
+        jobs = int(self.bulk_jobs) if self.bulk_jobs else 2
+        if jobs < 1:
+            jobs = 1
+        if jobs > 4:
+            jobs = 4
         return {
             "last": self.last,
             "log_height": h,
             "catalog_only": bool(self.catalog_only),
+            "bulk_jobs": jobs,
             "repos": repos_out,
         }
 
@@ -185,7 +192,9 @@ def looks_like_game_repo(root: Path) -> bool:
 def load_index(path: Path | None = None) -> RepoIndex:
     path = path or DEFAULT_INDEX_PATH
     if not path.is_file():
-        return RepoIndex(repos=[], last="", path=path, log_height=160, catalog_only=False)
+        return RepoIndex(
+            repos=[], last="", path=path, log_height=160, catalog_only=False, bulk_jobs=2
+        )
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -248,12 +257,22 @@ def load_index(path: Path | None = None) -> RepoIndex:
     if log_height > 800:
         log_height = 800
     catalog_only = bool(data.get("catalog_only"))
+    bulk_jobs = 2
+    try:
+        bulk_jobs = int(data.get("bulk_jobs") or 2)
+    except (TypeError, ValueError):
+        bulk_jobs = 2
+    if bulk_jobs < 1:
+        bulk_jobs = 1
+    if bulk_jobs > 4:
+        bulk_jobs = 4
     return RepoIndex(
         repos=repos,
         last=last,
         path=path,
         log_height=log_height,
         catalog_only=catalog_only,
+        bulk_jobs=bulk_jobs,
     )
 
 
