@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 from .models import (
@@ -52,6 +53,57 @@ def _is_real_psxrecomp_tree(path: Path) -> bool:
     return (path / "runtime" / "runtime.cmake").is_file()
 
 
+def _git_checkout_ok(path: Path) -> bool:
+    """True when ``git -C path rev-parse`` sees a live work tree."""
+    if not path.is_dir():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def diagnose_psxrecomp_checkout(root: Path) -> str | None:
+    """Return a human reason when ``psxrecomp/`` is present but not a usable git checkout.
+
+    Common after consolidating away ``psxrecomp-v4``: ``psxrecomp/.git`` still
+    points at ``../.git/modules/psxrecomp-v4`` (deleted), so Studio module ops
+    report ``checkout missing`` even though ``runtime.cmake`` is on disk.
+    """
+    dest = root / "psxrecomp"
+    if not dest.is_dir():
+        return None
+    if not _is_real_psxrecomp_tree(dest):
+        return None
+    if _git_checkout_ok(dest):
+        return None
+
+    git_file = dest / ".git"
+    if git_file.is_file():
+        text = _read(git_file).strip()
+        if text.lower().startswith("gitdir:"):
+            rel = text.split(":", 1)[1].strip()
+            target = (dest / rel).resolve() if rel else None
+            if target is not None and not target.exists():
+                return (
+                    f"psxrecomp/.git points at missing gitdir ({rel}) — "
+                    "broken submodule metadata (often leftover psxrecomp-v4)."
+                )
+            return f"psxrecomp/.git gitdir is unusable ({rel or text})."
+    if git_file.is_dir():
+        return "psxrecomp/.git exists but git rev-parse fails."
+    return (
+        "psxrecomp/ has runtime.cmake but is not a git checkout "
+        "(absorbed into the parent tree or missing .git)."
+    )
+
+
 def _cmake_has(text: str, needle: str) -> bool:
     return needle in text
 
@@ -91,7 +143,10 @@ def audit_project(root: Path) -> AuditReport:
                 title="Root psxrecomp/ submodule",
                 status=CheckStatus.WARN,
                 severity=Severity.REQUIRED,
-                detail="Both psxrecomp/ and psxrecomp-v4 present — consolidate to psxrecomp/.",
+                detail=(
+                    "Both psxrecomp/ and psxrecomp-v4 present — keep psxrecomp/ "
+                    "and delete the legacy psxrecomp-v4 tree."
+                ),
                 fix_op="rename_psxrecomp_submodule",
             )
         )
@@ -107,15 +162,28 @@ def audit_project(root: Path) -> AuditReport:
             )
         )
     elif has_psx:
-        checks.append(
-            CheckResult(
-                id="submodule_psxrecomp",
-                title="Root psxrecomp/ submodule",
-                status=CheckStatus.PASS,
-                severity=Severity.REQUIRED,
-                detail="psxrecomp/ present with runtime.cmake.",
+        broken = diagnose_psxrecomp_checkout(root)
+        if broken:
+            checks.append(
+                CheckResult(
+                    id="submodule_psxrecomp",
+                    title="Root psxrecomp/ submodule",
+                    status=CheckStatus.FAIL,
+                    severity=Severity.REQUIRED,
+                    detail=broken + " Repair re-clones as a real submodule.",
+                    fix_op="repair_psxrecomp_submodule",
+                )
             )
-        )
+        else:
+            checks.append(
+                CheckResult(
+                    id="submodule_psxrecomp",
+                    title="Root psxrecomp/ submodule",
+                    status=CheckStatus.PASS,
+                    severity=Severity.REQUIRED,
+                    detail="psxrecomp/ present with runtime.cmake.",
+                )
+            )
     else:
         checks.append(
             CheckResult(

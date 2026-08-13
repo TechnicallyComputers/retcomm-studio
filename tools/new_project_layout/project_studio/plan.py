@@ -11,6 +11,7 @@ from .models import AuditReport, LayoutClass, MigrateOptions, Plan, PlanStep
 # Topological order for apply. Ops not listed are appended at the end.
 _OP_ORDER = [
     "rename_psxrecomp_submodule",
+    "repair_psxrecomp_submodule",
     "ensure_psxrecomp_submodule",
     "ensure_recomp_ui_submodule",
     "emit_codegen_setup",
@@ -30,7 +31,8 @@ _OP_ORDER = [
 ]
 
 _OP_TITLES = {
-    "rename_psxrecomp_submodule": "Rename psxrecomp-v4 → psxrecomp",
+    "rename_psxrecomp_submodule": "Consolidate on psxrecomp/ (remove psxrecomp-v4)",
+    "repair_psxrecomp_submodule": "Repair broken psxrecomp/ git checkout",
     "ensure_psxrecomp_submodule": "Add psxrecomp submodule",
     "ensure_recomp_ui_submodule": "Add recomp-ui submodule",
     "emit_codegen_setup": "Emit codegen_setup.c / .h",

@@ -172,6 +172,95 @@ def resolve_framework_root(root: Path) -> Path | None:
     return None
 
 
+_MAX_PLAYERS_CMAKE_RE = re.compile(
+    r"^\s*MAX_PLAYERS\s+(\d+)\s*$", re.MULTILINE | re.IGNORECASE
+)
+_MAX_PLAYERS_RANGE_RE = re.compile(
+    r"MAX_PLAYERS must be in\s+(\d+)\.\.(\d+)", re.IGNORECASE
+)
+
+
+def project_max_players(root: Path) -> int | None:
+    """``MAX_PLAYERS N`` from the game ``CMakeLists.txt``, if present."""
+    cmake = root / "CMakeLists.txt"
+    if not cmake.is_file():
+        return None
+    try:
+        text = cmake.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _MAX_PLAYERS_CMAKE_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def framework_max_players_range(fw: Path) -> tuple[int, int] | None:
+    """``(lo, hi)`` from runtime.cmake's FATAL_ERROR range check, if found."""
+    cmake = fw / "runtime" / "runtime.cmake"
+    if not cmake.is_file():
+        return None
+    try:
+        text = cmake.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _MAX_PLAYERS_RANGE_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def preflight_max_players(root: Path) -> CmdResult | None:
+    """Fail fast when the game asks for MAX_PLAYERS the nested framework rejects.
+
+    Single-player titles (Ape Escape, Tomba, …) use ``MAX_PLAYERS 1``. Older
+    psxrecomp pins only allowed 2..5 and abort configure with a cryptic
+    FATAL_ERROR. Detect that before running cmake.
+    """
+    players = project_max_players(root)
+    if players is None:
+        return None
+    fw = resolve_framework_root(root)
+    if fw is None:
+        return None
+    rng = framework_max_players_range(fw)
+    if rng is None:
+        return None
+    lo, hi = rng
+    if lo <= players <= hi:
+        return None
+    pins = root / "framework_pins.txt"
+    pin_hint = ""
+    if pins.is_file():
+        pin_hint = f" Check {pins.name} vs the checked-out psxrecomp commit."
+    return CmdResult(
+        False,
+        f"MAX_PLAYERS {players} is outside nested psxrecomp range {lo}..{hi}. "
+        f"Update the psxrecomp submodule to a pin that allows 1..8 "
+        f"(runtime.cmake after single-player / rewind support).{pin_hint}",
+    )
+
+
+def diagnose_configure_failure(detail: str, root: Path) -> str | None:
+    """Extra hint appended to a failed cmake configure message."""
+    blob = detail or ""
+    if "MAX_PLAYERS must be in" in blob and "got" in blob:
+        pre = preflight_max_players(root)
+        if pre is not None:
+            return pre.message
+        return (
+            "MAX_PLAYERS rejected by nested psxrecomp. Single-player titles need "
+            "a framework pin whose runtime.cmake allows 1..8 — update the "
+            "psxrecomp submodule (and framework_pins.txt)."
+        )
+    if "generated" in blob.lower() and (
+        "GEN_MARKER" in blob or "dispatch.c" in blob or "missing" in blob.lower()
+    ):
+        return (
+            "Game generated C may be missing — run Generate (disc→C) before "
+            "Configure, or ensure generated/<boot>_dispatch.c exists."
+        )
+    return None
+
+
 def bios_backend_present(fw: Path, stem: str) -> bool:
     """True when generated/<stem>_{full,dispatch}.c look linkable."""
     dispatch = fw / "generated" / f"{stem}_dispatch.c"
@@ -496,6 +585,12 @@ def configure(
         if log and bios_r.message:
             log(bios_r.message)
 
+    pre = preflight_max_players(root)
+    if pre is not None:
+        if log:
+            log(pre.message)
+        return pre
+
     bdir = Path(build_dir)
     if not bdir.is_absolute():
         bdir = root / bdir
@@ -515,7 +610,18 @@ def configure(
 
     r = _run_stream(cmd, root, log=log)
     if r.ok:
-        r = CmdResult(True, f"Configured {bdir.name} ({build_type}" + (f", {gen}" if gen else "") + ")", r.detail)
+        r = CmdResult(
+            True,
+            f"Configured {bdir.name} ({build_type}" + (f", {gen}" if gen else "") + ")",
+            r.detail,
+        )
+        return r
+    hint = diagnose_configure_failure(r.detail or "", root)
+    if hint:
+        msg = f"{r.message}\n{hint}"
+        if log:
+            log(hint)
+        return CmdResult(False, msg, r.detail)
     return r
 
 
