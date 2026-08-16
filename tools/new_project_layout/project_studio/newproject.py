@@ -26,6 +26,8 @@ class NewProjectOptions:
     boot_exe: str = ""
     players: int = 2
     zip_prefix: str = ""
+    github_owner: str = ""
+    github_repo: str = ""
     description: str = ""
     publisher: str = ""
     year: str = ""
@@ -151,6 +153,10 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
             cmd.extend(["-BootExe", opts.boot_exe.strip()])
         if opts.zip_prefix:
             cmd.extend(["-ZipPrefix", opts.zip_prefix.strip()])
+        if opts.github_owner:
+            cmd.extend(["-GithubOwner", opts.github_owner.strip()])
+        if opts.github_repo:
+            cmd.extend(["-GithubRepo", opts.github_repo.strip()])
         if opts.description:
             cmd.extend(["-Description", opts.description.strip()])
         if opts.publisher:
@@ -204,6 +210,10 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
         cmd.extend(["--boot-exe", opts.boot_exe.strip()])
     if opts.zip_prefix:
         cmd.extend(["--zip-prefix", opts.zip_prefix.strip()])
+    if opts.github_owner:
+        cmd.extend(["--github-owner", opts.github_owner.strip()])
+    if opts.github_repo:
+        cmd.extend(["--github-repo", opts.github_repo.strip()])
     if opts.description:
         cmd.extend(["--description", opts.description.strip()])
     if opts.publisher:

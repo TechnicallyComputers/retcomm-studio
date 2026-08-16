@@ -62,6 +62,8 @@ def _options_from_args(args: argparse.Namespace) -> MigrateOptions:
         boot_exe=args.boot_exe,
         players=args.players,
         zip_prefix=args.zip_prefix,
+        github_owner=getattr(args, "github_owner", None) or None,
+        github_repo=getattr(args, "github_repo", None) or None,
         window_title=args.window_title,
         enable_recomp_ui=not args.no_recomp_ui,
         enable_wizard=not args.no_wizard,
@@ -451,6 +453,8 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         boot_exe=(getattr(args, "boot_exe", None) or "").strip(),
         players=int(getattr(args, "players", 2) or 2),
         zip_prefix=(getattr(args, "zip_prefix", None) or "").strip(),
+        github_owner=(getattr(args, "github_owner", None) or "").strip(),
+        github_repo=(getattr(args, "github_repo", None) or "").strip(),
         description=(getattr(args, "description", None) or "").strip(),
         publisher=(getattr(args, "publisher", None) or "").strip(),
         year=(getattr(args, "year", None) or "").strip(),
@@ -555,10 +559,19 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
         DEFAULT_RBENGINE_URL,
         DEFAULT_RECOMP_NET_URL,
         DEFAULT_RECOMP_UI_URL,
+        current_branch,
         list_branches,
         list_module_branches,
         list_remote_head_branches,
+        resolve_module_dir,
     )
+
+    def prefer_current(names: list[str], cur: str) -> list[str]:
+        cur = (cur or "").strip()
+        if not cur:
+            return names
+        rest = [n for n in names if n != cur]
+        return [cur, *rest]
 
     fetch = bool(getattr(args, "fetch", False))
     root_s = (getattr(args, "root", None) or "").strip()
@@ -568,6 +581,13 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
         "recomp-ui": [],
         "recomp-net": [],
         "rbengine": [],
+        "current": {
+            "game": "",
+            "psxrecomp": "",
+            "recomp-ui": "",
+            "recomp-net": "",
+            "rbengine": "",
+        },
     }
     if root_s:
         root = Path(root_s).expanduser().resolve()
@@ -597,6 +617,22 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
             fetch=fetch,
             url_fallback=DEFAULT_RBENGINE_URL,
         )
+        cur = out["current"]
+        cur["game"] = current_branch(root) or ""
+        for key, path, nested in (
+            ("psxrecomp", "psxrecomp", False),
+            ("recomp-ui", "recomp-ui", False),
+            ("recomp-net", "lib/recomp-net", True),
+            ("rbengine", "lib/retcomm-rbengine", True),
+        ):
+            sub = resolve_module_dir(root, path, nested=nested)
+            cur[key] = (current_branch(sub) or "") if sub is not None else ""
+        # Put live checkouts first so dropdowns open on the active branch.
+        out["game"] = prefer_current(out["game"], cur["game"])
+        out["psxrecomp"] = prefer_current(out["psxrecomp"], cur["psxrecomp"])
+        out["recomp-ui"] = prefer_current(out["recomp-ui"], cur["recomp-ui"])
+        out["recomp-net"] = prefer_current(out["recomp-net"], cur["recomp-net"])
+        out["rbengine"] = prefer_current(out["rbengine"], cur["rbengine"])
     else:
         # New-project / no checkout: ls-remote default module URLs.
         out["psxrecomp"] = list_remote_head_branches(DEFAULT_PSXRECOMP_URL)
@@ -1308,6 +1344,77 @@ def cmd_git_install_ci(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+def cmd_build_mingw(args: argparse.Namespace) -> int:
+    """Linux → Windows MinGW cross-build via scripts/build_windows_mingw.sh."""
+    import json
+    import shutil
+    import subprocess
+
+    script = _TOOLKIT / "scripts" / "build_windows_mingw.sh"
+    if not script.is_file():
+        print(f"error: missing {script}", file=sys.stderr)
+        return 2
+
+    bash = shutil.which("bash")
+    if not bash:
+        print("error: bash not found (required for MinGW cross script)", file=sys.stderr)
+        return 2
+
+    cmd: list[str] = [bash, str(script)]
+    if getattr(args, "root", None):
+        cmd += ["--root", str(Path(args.root).expanduser().resolve())]
+    if getattr(args, "name", None):
+        cmd += ["--name", args.name]
+    if getattr(args, "last", False) or (
+        not getattr(args, "root", None) and not getattr(args, "name", None)
+    ):
+        cmd.append("--last")
+    if args.build_dir and args.build_dir != "build-mingw":
+        cmd += ["--build-dir", args.build_dir]
+    if getattr(args, "package_only", False):
+        cmd.append("--package-only")
+    if getattr(args, "setup_host", False):
+        cmd.append("--setup-host")
+    if getattr(args, "package", False) and not getattr(args, "package_only", False):
+        cmd.append("--package")
+    if getattr(args, "dynamic", False):
+        cmd.append("--dynamic")
+    if getattr(args, "ensure", False) and not getattr(args, "package_only", False):
+        cmd.append("--ensure")
+    if getattr(args, "jobs", 0):
+        cmd += ["--jobs", str(args.jobs)]
+    if getattr(args, "dry_run", False):
+        cmd.append("--dry-run")
+    if getattr(args, "extra", ""):
+        cmd += ["--extra", args.extra]
+
+    print("+", " ".join(cmd), flush=True)
+    r = subprocess.run(cmd, check=False)
+    # Studio Bundle+Export parses the JSON trailer / MINGW_ZIP line.
+    root = ""
+    if getattr(args, "root", None):
+        root = str(Path(args.root).expanduser().resolve())
+    zip_path = ""
+    if root:
+        dist = Path(root) / "dist"
+        if dist.is_dir():
+            zips = sorted(
+                dist.glob("*-windows-x64-mingw.zip"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not zips:
+                zips = sorted(dist.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if zips:
+                zip_path = str(zips[0].resolve())
+    if zip_path and r.returncode == 0:
+        print(f"MINGW_ZIP={zip_path}", flush=True)
+        print(json.dumps({"ok": True, "zip": zip_path}), flush=True)
+    elif getattr(args, "package_only", False) or getattr(args, "package", False):
+        print(json.dumps({"ok": False, "zip": "", "error": "no zip produced"}), flush=True)
+    return int(r.returncode)
+
+
 def cmd_build_configure(args: argparse.Namespace) -> int:
     import shlex
 
@@ -1414,6 +1521,11 @@ def cmd_build_run(args: argparse.Namespace) -> int:
     if root is None:
         return 2
     extra = shlex.split(args.args, posix=os.name != "nt") if args.args else []
+
+    def _log(line: str) -> None:
+        # Piped into Studio — must flush or activity log stalls until buffer fill.
+        print(line, flush=True)
+
     r = launch(
         root,
         build_dir=args.build_dir,
@@ -1421,9 +1533,10 @@ def cmd_build_run(args: argparse.Namespace) -> int:
         env_text=args.env or "",
         extra_args=extra,
         dry_run=args.dry_run,
-        log=print,
+        log=_log,
+        wait=True,
     )
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
     return 0 if r.ok else 1
 
 
@@ -1431,7 +1544,7 @@ def cmd_build_stop(args: argparse.Namespace) -> int:
     from project_studio.buildops import stop_launch
 
     r = stop_launch()
-    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
     return 0 if r.ok else 1
 
 
@@ -1483,6 +1596,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--boot-exe", help="Boot EXE basename (e.g. SCUS_944.23)")
         p.add_argument("--players", type=int, default=2)
         p.add_argument("--zip-prefix", help="CI/zip prefix")
+        p.add_argument("--github-owner", help="GitHub owner/org for README download badges")
+        p.add_argument("--github-repo", help="GitHub repo name for README download badges")
         p.add_argument("--window-title", help="WINDOW_TITLE override")
         p.add_argument("--enable-netplay", action="store_true")
         p.add_argument("--lobby-url", default="ws://netplay.retcomm.net:8765")
@@ -1607,6 +1722,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument("--boot-exe", default="")
     p_np.add_argument("--players", type=int, default=2)
     p_np.add_argument("--zip-prefix", default="")
+    p_np.add_argument("--github-owner", default="")
+    p_np.add_argument("--github-repo", default="")
     p_np.add_argument("--description", default="")
     p_np.add_argument("--publisher", default="")
     p_np.add_argument("--year", default="")
@@ -2117,6 +2234,56 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--root", required=True, help="Game repository root")
         p.add_argument("--dry-run", action="store_true")
         p.add_argument("--build-dir", default="build-release")
+
+    p_bm = build_sub.add_parser(
+        "mingw",
+        help="Linux→Windows MinGW cross-build (local testing; no GitHub CI)",
+    )
+    p_bm.add_argument(
+        "--root",
+        default="",
+        help="Game repository root (default: Studio index --last / --name)",
+    )
+    p_bm.add_argument(
+        "--name",
+        default="",
+        help="Match a Studio-indexed title by name (substring)",
+    )
+    p_bm.add_argument(
+        "--last",
+        action="store_true",
+        help="Use Studio index 'last' project (default when --root/--name omitted)",
+    )
+    p_bm.add_argument("--build-dir", default="build-mingw")
+    p_bm.add_argument(
+        "--setup-host",
+        action="store_true",
+        help="CI-parity setup-host configure (FORCE_SETUP_HOST + wizard)",
+    )
+    p_bm.add_argument(
+        "--package",
+        action="store_true",
+        help="Run scripts/package_setup_release.sh after build",
+    )
+    p_bm.add_argument(
+        "--package-only",
+        action="store_true",
+        help="Skip configure/build; package existing MinGW build dir into dist/*.zip",
+    )
+    p_bm.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="PSX_STATIC_RUNTIME=OFF (ship SDL2/libgcc DLLs)",
+    )
+    p_bm.add_argument(
+        "--ensure",
+        action="store_true",
+        help="Host ensure-emitters / ensure-bios / generate before cross-build",
+    )
+    p_bm.add_argument("--jobs", type=int, default=0)
+    p_bm.add_argument("--extra", default="", help="Extra cmake -D args (one shell string)")
+    p_bm.add_argument("--dry-run", action="store_true")
+    p_bm.set_defaults(func=cmd_build_mingw)
 
     p_bc = build_sub.add_parser("configure", help="cmake -S . -B <dir>")
     add_build_root(p_bc)

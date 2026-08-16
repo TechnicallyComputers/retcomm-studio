@@ -28,7 +28,7 @@ RunResult run_project_studio(StudioModel& model, const std::vector<std::string>&
 using DoneFn = std::function<void(RunResult)>;
 
 void run_project_studio_async(StudioModel& model, std::vector<std::string> args, DoneFn on_done,
-                              bool log_stdout = true);
+                              bool log_stdout = true, bool allow_when_busy = false);
 
 // Drain completed async jobs (call once per frame on UI thread).
 void pump_async_jobs(StudioModel& model);

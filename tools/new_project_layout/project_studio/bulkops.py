@@ -128,8 +128,13 @@ def _match_select(entry_label: str, entry_path: str, select: list[str]) -> bool:
     if not select:
         return True
     name = Path(entry_path).name
+    try:
+        entry_resolved = str(Path(entry_path).expanduser().resolve())
+    except OSError:
+        entry_resolved = entry_path
     # Prefer short names (basename / label), not full path — path subsequence
-    # is too fuzzy (e.g. Tomba ⊂ …/Documents/…/Bomberman…).
+    # is too fuzzy (e.g. Tomba ⊂ …/Documents/…/Bomberman…). Absolute paths
+    # from Studio Bulk checkboxes are matched by exact resolved path / basename.
     text_cands = (entry_label, name)
     compact_cands = tuple(_compact(c) for c in text_cands)
     initial_cands = tuple(_initials(c) for c in (entry_label, name, name.replace("-", " ")))
@@ -137,6 +142,23 @@ def _match_select(entry_label: str, entry_path: str, select: list[str]) -> bool:
         s = raw.strip()
         if not s:
             continue
+        # Studio passes absolute repo paths in --select CSV.
+        looks_like_path = (
+            s.startswith("/")
+            or s.startswith("~")
+            or (len(s) >= 3 and s[1] == ":" and (s[2] == "\\" or s[2] == "/"))
+            or "\\" in s
+            or s.count("/") >= 2
+        )
+        if looks_like_path:
+            try:
+                want = str(Path(s).expanduser().resolve())
+            except OSError:
+                want = s
+            if want == entry_resolved or Path(want).name.lower() == name.lower():
+                return True
+            # Fall through to label/basename matching using the path's basename.
+            s = Path(s).name
         sl = s.lower()
         sc = _compact(s)
         for c in text_cands:

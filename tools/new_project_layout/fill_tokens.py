@@ -8,6 +8,12 @@ import re
 import sys
 from pathlib import Path
 
+GITHUB_ABOUT_DESCRIPTION = (
+    "Made with PSXrecomp, a Sony PlayStation game static recompiler ecosystem · "
+    "Part of the R.A.I.D. community"
+)
+GITHUB_ABOUT_HOMEPAGE = "https://discord.gg/Ad9BwSzctP"
+
 
 def derive_zip_prefix(name: str) -> str:
     base = re.sub(r"(?i)recomp(iled)?$", "", name).strip()
@@ -18,6 +24,18 @@ def derive_zip_prefix(name: str) -> str:
             return acr
     slug = re.sub(r"[^a-z0-9]+", "", base.lower())
     return (slug or "game")[:20]
+
+
+def sanitize_github_name(name: str) -> str:
+    """GitHub owner/repo slug: spaces → '-', drop illegal chars, keep [A-Za-z0-9._-]."""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"[^A-Za-z0-9._-]+", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.strip(".-")
+    return s[:100] or "repo"
 
 
 def main() -> int:

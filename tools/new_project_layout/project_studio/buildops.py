@@ -65,6 +65,126 @@ _active_launch: LaunchHandle | None = None
 _launch_lock = threading.Lock()
 
 
+def _launch_pid_path() -> Path:
+    """Cross-process launch PID file (Studio Stop vs blocked ``build run``)."""
+    try:
+        from .retcomm_paths import default_paths
+
+        base = default_paths().cache_dir
+    except Exception:
+        base = Path.home() / ".local" / "share" / "retcomm" / "cache"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "studio-launch.pid"
+
+
+def _write_launch_pid(pid: int, *, exe: Path, root: Path) -> None:
+    path = _launch_pid_path()
+    path.write_text(
+        f"pid={pid}\nexe={exe}\nroot={root}\n",
+        encoding="utf-8",
+    )
+
+
+def _read_launch_pid() -> tuple[int, str, str] | None:
+    path = _launch_pid_path()
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    pid = 0
+    exe = ""
+    root = ""
+    for line in text.splitlines():
+        if line.startswith("pid="):
+            try:
+                pid = int(line[4:].strip())
+            except ValueError:
+                pid = 0
+        elif line.startswith("exe="):
+            exe = line[4:].strip()
+        elif line.startswith("root="):
+            root = line[5:].strip()
+    if pid <= 0:
+        return None
+    return pid, exe, root
+
+
+def _clear_launch_pid() -> None:
+    try:
+        _launch_pid_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _kill_launch_pid(pid: int) -> None:
+    """Terminate a launched game (process group when possible)."""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        # Best-effort tree kill; fall back to terminate.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+            )
+            return
+        except OSError:
+            pass
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(pid, 15)
+    except ProcessLookupError:
+        return
+    except OSError:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    # Brief wait then escalate.
+    for _ in range(20):
+        if not _pid_alive(pid):
+            return
+        threading.Event().wait(0.1)
+    try:
+        os.killpg(pid, 9)
+    except OSError:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def _flush_log(log: LogFn | None, msg: str) -> None:
+    if not log:
+        return
+    try:
+        log(msg)
+    except TypeError:
+        # Plain print works; callers should prefer flush wrappers.
+        print(msg, flush=True)
+
+
 def detect_host() -> BuildHost:
     system = platform.system()
     if system == "Windows":
@@ -751,8 +871,14 @@ def launch(
     extra_args: list[str] | None = None,
     dry_run: bool = False,
     log: LogFn | None = None,
+    wait: bool = True,
 ) -> CmdResult:
-    """Start the local product build (non-blocking)."""
+    """Start the local product build.
+
+    By default ``wait=True``: stream stdout/stderr into ``log`` until the
+    process exits (Studio Launch → activity log). Pass ``wait=False`` to
+    detach immediately (legacy fire-and-forget).
+    """
     global _active_launch
     root = root.expanduser().resolve()
     bdir = resolve_build_dir(root, build_dir)
@@ -767,12 +893,14 @@ def launch(
     env.update(overlay)
     # Run from game root so relative game.toml / disc / saves resolve.
     cmd = [str(exe_path), *(extra_args or [])]
+    # Prefer line-buffered stdio so fprintf diagnostics show up live when piped.
+    if sys.platform != "win32" and shutil.which("stdbuf"):
+        cmd = ["stdbuf", "-oL", "-eL", *cmd]
 
     if dry_run:
         preview = " ".join(f"{k}={v}" for k, v in overlay.items())
         msg = "dry-run: " + (f"env {preview} " if preview else "") + " ".join(cmd)
-        if log:
-            log(msg)
+        _flush_log(log, msg)
         return CmdResult(True, msg)
 
     with _launch_lock:
@@ -781,63 +909,118 @@ def launch(
                 False,
                 f"Already running (pid {_active_launch.pid}) — Stop first",
             )
+        stale = _read_launch_pid()
+        if stale and _pid_alive(stale[0]):
+            return CmdResult(
+                False,
+                f"Already running (pid {stale[0]}) — Stop first",
+            )
         try:
             kwargs: dict = {
                 "cwd": str(root),
                 "env": env,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
             }
             host = detect_host()
             if host.label == "windows":
-                # Detach from Studio console; GUI apps don't need a console.
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                kwargs["stdout"] = subprocess.DEVNULL
-                kwargs["stderr"] = subprocess.DEVNULL
             else:
+                # New session → killpg works from a separate ``build stop`` process.
                 kwargs["start_new_session"] = True
-                kwargs["stdout"] = subprocess.DEVNULL
-                kwargs["stderr"] = subprocess.DEVNULL
             proc = subprocess.Popen(cmd, **kwargs)
         except OSError as exc:
             return CmdResult(False, "Launch failed", str(exc))
         _active_launch = LaunchHandle(
             proc=proc, exe=exe_path, cwd=root, env_overlay=overlay
         )
+        if proc.pid:
+            _write_launch_pid(proc.pid, exe=exe_path, root=root)
 
     env_note = ""
     if overlay:
         env_note = " env=[" + ", ".join(sorted(overlay)) + "]"
     msg = f"Launched {exe_path.name} (pid {proc.pid}){env_note}"
-    if log:
-        log(msg)
-    return CmdResult(True, msg)
+    _flush_log(log, msg)
+    _flush_log(log, "--- game stdout/stderr (Stop to end) ---")
+
+    if not wait:
+        # Detach: drain pipes so the child never blocks on a full pipe.
+        def _drain() -> None:
+            global _active_launch
+            try:
+                if proc.stdout:
+                    for line in proc.stdout:
+                        _flush_log(log, line.rstrip("\n\r"))
+            except Exception:
+                pass
+            code = proc.wait()
+            with _launch_lock:
+                if _active_launch and _active_launch.proc is proc:
+                    _active_launch = None
+            _clear_launch_pid()
+            _flush_log(log, f"--- game exited (code {code}) ---")
+
+        threading.Thread(target=_drain, daemon=True).start()
+        return CmdResult(True, msg)
+
+    # Stream diagnostics until exit (Studio keeps the CLI job alive → activity log).
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            _flush_log(log, line.rstrip("\n\r"))
+    except Exception as exc:
+        _flush_log(log, f"[warn] log reader: {exc}")
+    code = proc.wait()
+    with _launch_lock:
+        if _active_launch and _active_launch.proc is proc:
+            _active_launch = None
+    _clear_launch_pid()
+    _flush_log(log, f"--- game exited (code {code}) ---")
+    if code != 0:
+        return CmdResult(False, f"{exe_path.name} exited {code}", msg)
+    return CmdResult(True, f"{exe_path.name} exited 0")
 
 
 def stop_launch() -> CmdResult:
     global _active_launch
+    killed_pid: int | None = None
     with _launch_lock:
         h = _active_launch
-        if h is None or h.poll() is not None:
+        if h is not None and h.poll() is None:
+            killed_pid = h.pid
+            h.terminate()
+            try:
+                h.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                h.proc.kill()
             _active_launch = None
-            return CmdResult(False, "No running launch")
-        pid = h.pid
-        h.terminate()
-        try:
-            h.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            h.proc.kill()
-        _active_launch = None
-    return CmdResult(True, f"Stopped pid {pid}")
+    # Cross-process Stop (Studio Launch holds ``build run`` in another Python).
+    stale = _read_launch_pid()
+    if stale and _pid_alive(stale[0]):
+        _kill_launch_pid(stale[0])
+        killed_pid = stale[0]
+    _clear_launch_pid()
+    if killed_pid is None:
+        return CmdResult(False, "No running launch")
+    return CmdResult(True, f"Stopped pid {killed_pid}")
 
 
 def launch_status() -> str:
     with _launch_lock:
         h = _active_launch
-        if h is None:
-            return "not running"
-        code = h.poll()
-        if code is None:
-            return f"running pid={h.pid} ({h.exe.name})"
-        return f"exited code={code} ({h.exe.name})"
+        if h is not None:
+            code = h.poll()
+            if code is None:
+                return f"running pid={h.pid} ({h.exe.name})"
+            return f"exited code={code} ({h.exe.name})"
+    stale = _read_launch_pid()
+    if stale and _pid_alive(stale[0]):
+        name = Path(stale[1]).name if stale[1] else "?"
+        return f"running pid={stale[0]} ({name})"
+    return "not running"
 
 
 def find_psxrecomp_cli(root: Path) -> Path | None:

@@ -407,20 +407,30 @@ RunResult run_project_studio(StudioModel& model, const std::vector<std::string>&
 }
 
 void run_project_studio_async(StudioModel& model, std::vector<std::string> args, DoneFn on_done,
-                              bool log_stdout) {
-    if (model.busy.exchange(true)) {
-        model.append_log("[FAIL] Another job is already running.");
-        if (on_done) {
-            RunResult r;
-            r.exit_code = 1;
-            r.stderr_text = "busy";
-            on_done(std::move(r));
+                              bool log_stdout, bool allow_when_busy) {
+    const bool is_stop =
+        args.size() >= 2 && args[0] == "build" && args[1] == "stop";
+    const bool bypass_busy = allow_when_busy || is_stop;
+    if (!bypass_busy) {
+        if (model.busy.exchange(true)) {
+            model.append_log("[FAIL] Another job is already running.");
+            if (on_done) {
+                RunResult r;
+                r.exit_code = 1;
+                r.stderr_text = "busy";
+                on_done(std::move(r));
+            }
+            return;
         }
-        return;
+    } else if (!is_stop) {
+        // Non-stop allow_when_busy still claims busy if free.
+        model.busy.store(true);
     }
-    std::thread([&model, args = std::move(args), on_done = std::move(on_done), log_stdout]() mutable {
+    std::thread([&model, args = std::move(args), on_done = std::move(on_done), log_stdout,
+                 is_stop]() mutable {
         RunResult r = run_project_studio(model, args, log_stdout);
-        model.busy.store(false);
+        // Stop never owns busy (so it can run while Launch streams diagnostics).
+        if (!is_stop) model.busy.store(false);
         if (on_done) {
             std::lock_guard<std::mutex> lock(g_done_mu);
             g_done_queue.push_back(PendingDone{std::move(on_done), std::move(r)});

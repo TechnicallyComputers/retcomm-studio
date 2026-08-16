@@ -290,6 +290,10 @@ void load_branches_json(StudioModel& model, const std::string& json_text, const 
                 }
             }
         };
+        auto set_cur = [](char* buf, size_t n, const std::string& s) {
+            if (s.empty()) return;
+            std::snprintf(buf, n, "%s", s.c_str());
+        };
         std::lock_guard<std::mutex> lock(model.mu);
         fill(model.branches_game, j["game"]);
         fill(model.branches_psx, j["psxrecomp"]);
@@ -298,8 +302,17 @@ void load_branches_json(StudioModel& model, const std::string& json_text, const 
         fill(model.branches_rb, j["rbengine"]);
         model.branches_root = root;
         model.branches_loading = false;
-        // Seed empty git_branch from current if blank.
-        if (!model.git_branch[0] && !model.branches_game.empty()) {
+        // Pre-select live checkouts for the Git page dropdowns.
+        if (!root.empty() && j.contains("current") && j["current"].is_object()) {
+            const auto& cur = j["current"];
+            set_cur(model.git_branch, sizeof(model.git_branch), cur.value("game", ""));
+            set_cur(model.git_psx_branch, sizeof(model.git_psx_branch),
+                    cur.value("psxrecomp", ""));
+            set_cur(model.git_ui_branch, sizeof(model.git_ui_branch), cur.value("recomp-ui", ""));
+            set_cur(model.git_net_branch, sizeof(model.git_net_branch),
+                    cur.value("recomp-net", ""));
+            set_cur(model.git_rb_branch, sizeof(model.git_rb_branch), cur.value("rbengine", ""));
+        } else if (!model.git_branch[0] && !model.branches_game.empty()) {
             std::snprintf(model.git_branch, sizeof(model.git_branch), "%s",
                           model.branches_game.front().c_str());
         }
@@ -429,6 +442,61 @@ void begin_export_activity_log(StudioModel& model, SDL_Window* window) {
     SDL_ShowSaveFileDialog(file_callback, ctx, window, filters, 1, default_loc.c_str());
 }
 
+void begin_export_mingw_zip(StudioModel& model, SDL_Window* window, const std::string& src_zip) {
+    if (!window || src_zip.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(model.pick_mu);
+        if (model.file_pick_busy) return;
+        model.file_pick_busy = true;
+        model.mingw_export_src = src_zip;
+    }
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+#else
+    const char* home = std::getenv("HOME");
+#endif
+    static std::string default_loc;
+    const fs::path base = fs::path(src_zip).filename();
+    if (home && *home)
+        default_loc = (fs::path(home) / "Downloads" / base).string();
+    else
+        default_loc = base.string();
+    static SDL_DialogFileFilter filters[1];
+    filters[0].name = "Zip archives";
+    filters[0].pattern = "zip";
+    auto* ctx = new DialogCtx{&model, "export_mingw_zip"};
+    SDL_ShowSaveFileDialog(file_callback, ctx, window, filters, 1, default_loc.c_str());
+}
+
+std::string parse_mingw_zip_from_output(const std::string& text) {
+    // Prefer last MINGW_ZIP= line; fall back to last JSON object with "zip".
+    std::string best;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const std::size_t end = text.find('\n', pos);
+        const std::string line =
+            text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = (end == std::string::npos) ? text.size() : end + 1;
+        constexpr const char* kPrefix = "MINGW_ZIP=";
+        if (line.rfind(kPrefix, 0) == 0) {
+            best = line.substr(std::strlen(kPrefix));
+            while (!best.empty() && (best.back() == '\r' || best.back() == ' ')) best.pop_back();
+            continue;
+        }
+        if (!line.empty() && line.front() == '{') {
+            try {
+                auto j = nlohmann::json::parse(line);
+                if (j.contains("zip") && j["zip"].is_string()) {
+                    const std::string z = j["zip"].get<std::string>();
+                    if (!z.empty()) best = z;
+                }
+            } catch (...) {
+            }
+        }
+    }
+    return best;
+}
+
 void apply_pending_picks(StudioModel& model) {
     std::string folder, file, target;
     {
@@ -492,6 +560,30 @@ void apply_pending_picks(StudioModel& model) {
                     model.set_status("Exported activity log");
                 }
             }
+        } else if (target == "export_mingw_zip") {
+            std::string src;
+            {
+                std::lock_guard<std::mutex> lock(model.pick_mu);
+                src = model.mingw_export_src;
+            }
+            if (src.empty() || !fs::is_regular_file(src)) {
+                model.append_log("[FAIL] MinGW export: packaged zip missing: " + src);
+                model.set_status("MinGW export failed");
+            } else {
+                std::error_code ec;
+                fs::path dest(file);
+                if (dest.extension() != ".zip") dest += ".zip";
+                fs::create_directories(dest.parent_path(), ec);
+                fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    model.append_log("[FAIL] MinGW export copy: " + ec.message() + " → " +
+                                     dest.string());
+                    model.set_status("MinGW export failed");
+                } else {
+                    model.append_log("[OK] Exported MinGW zip → " + dest.string());
+                    model.set_status("Exported MinGW zip");
+                }
+            }
         }
     }
 }
@@ -522,6 +614,14 @@ std::vector<std::string> migrate_common_args(StudioModel& model) {
     if (model.zip_prefix[0]) {
         a.push_back("--zip-prefix");
         a.push_back(model.zip_prefix);
+    }
+    if (model.github_owner[0]) {
+        a.push_back("--github-owner");
+        a.push_back(model.github_owner);
+    }
+    if (model.github_repo[0]) {
+        a.push_back("--github-repo");
+        a.push_back(model.github_repo);
     }
     if (model.migrate_netplay) a.push_back("--enable-netplay");
     if (!model.migrate_ci) a.push_back("--no-ci");
@@ -723,7 +823,7 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
 }
 
 void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
-    constexpr float kLabelW = 88.f;
+    constexpr float kLabelW = 110.f;
     ImGui::BeginDisabled(model.busy.load() || model.selected_root().empty());
 
     if (path_row("##disc", "Disc .cue", model.disc_cue, sizeof(model.disc_cue), kLabelW,
@@ -747,6 +847,9 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SetNextItemWidth(zw);
         ImGui::InputText("##zip", model.zip_prefix, sizeof(model.zip_prefix));
     }
+    field_row("##gh_owner", "GitHub owner", model.github_owner, sizeof(model.github_owner),
+              kLabelW);
+    field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo), kLabelW);
 
     checkbox_wrapped("Netplay", &model.migrate_netplay);
     checkbox_wrapped("CI", &model.migrate_ci);
@@ -851,6 +954,9 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             model.np_netplay = false;
     }
     field_row("##np_zip", "Zip prefix", model.np_zip, sizeof(model.np_zip), kLabelW);
+    field_row("##np_gh_owner", "GitHub owner", model.np_gh_owner, sizeof(model.np_gh_owner),
+              kLabelW);
+    field_row("##np_gh_repo", "GitHub repo", model.np_gh_repo, sizeof(model.np_gh_repo), kLabelW);
     field_row("##np_region", "Region", model.np_region, sizeof(model.np_region), kLabelW);
     field_row("##np_desc", "Description", model.np_desc, sizeof(model.np_desc), kLabelW);
     field_row("##np_pub", "Publisher", model.np_publisher, sizeof(model.np_publisher), kLabelW);
@@ -938,6 +1044,14 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (model.np_zip[0]) {
                 args.push_back("--zip-prefix");
                 args.push_back(model.np_zip);
+            }
+            if (model.np_gh_owner[0]) {
+                args.push_back("--github-owner");
+                args.push_back(model.np_gh_owner);
+            }
+            if (model.np_gh_repo[0]) {
+                args.push_back("--github-repo");
+                args.push_back(model.np_gh_repo);
             }
             if (model.np_desc[0]) {
                 args.push_back("--description");
@@ -1114,7 +1228,11 @@ void draw_git(StudioModel& model, const Theme& th) {
                 args.push_back(model.git_rb_branch);
             }
             if (model.git_create_branch) args.push_back("--create");
-            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+            retcomm::studio::run_project_studio_async(
+                model, std::move(args),
+                [&model](RunResult r) {
+                    if (r.ok()) refresh_branches(model, false);
+                });
         }
     }
 
@@ -1462,6 +1580,22 @@ void draw_bulk(StudioModel& model, const Theme& th) {
 
     ImGui::Separator();
     field_row("##bulk_msg", "Message", model.bulk_msg, sizeof(model.bulk_msg), kLabelW);
+    {
+        left_label("Pull mode", kLabelW);
+        ImGui::SetNextItemWidth(140.f);
+        const char* modes[] = {"ff-only", "rebase", "merge", "reset"};
+        int mode = model.bulk_pull_mode;
+        if (mode < 0 || mode > 3) mode = 0;
+        if (ImGui::Combo("##bulk_pull_mode", &mode, modes, 4)) model.bulk_pull_mode = mode;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Bulk pull strategy:\n"
+                "ff-only — refuse if histories diverged\n"
+                "rebase — replay local commits on origin\n"
+                "merge — create a merge commit\n"
+                "reset — match origin (hard)");
+        }
+    }
 
     auto run_bulk = [&](const char* sub) {
         auto paths = selected_paths();
@@ -1474,10 +1608,26 @@ void draw_bulk(StudioModel& model, const Theme& th) {
             args.push_back("--message");
             args.push_back(model.bulk_msg);
         }
-        if (model.bulk_tgt_game) args.push_back("--game");
-        if (model.bulk_tgt_modules) args.push_back("--modules");
-        if (model.bulk_tgt_psx) args.push_back("--psxrecomp");
-        if (model.bulk_tgt_nested) args.push_back("--nested");
+        // bulk-status has no target flags; others need at least one.
+        if (std::strcmp(sub, "bulk-status") != 0) {
+            if (!(model.bulk_tgt_game || model.bulk_tgt_modules || model.bulk_tgt_psx ||
+                  model.bulk_tgt_nested)) {
+                model.append_log(
+                    "[FAIL] Enable at least one Target (Game / Modules / psxrecomp / Nested)");
+                return;
+            }
+            if (model.bulk_tgt_game) args.push_back("--game");
+            if (model.bulk_tgt_modules) args.push_back("--modules");
+            if (model.bulk_tgt_psx) args.push_back("--psxrecomp");
+            if (model.bulk_tgt_nested) args.push_back("--nested");
+        }
+        if (std::strcmp(sub, "bulk-pull") == 0) {
+            static const char* modes[] = {"ff-only", "rebase", "merge", "reset"};
+            const int mi =
+                (model.bulk_pull_mode < 0 || model.bulk_pull_mode > 3) ? 0 : model.bulk_pull_mode;
+            args.push_back("--mode");
+            args.push_back(modes[mi]);
+        }
         model.append_log(std::string("--- Bulk ") + sub + " ---");
         retcomm::studio::run_project_studio_async(model, args, nullptr);
     };
@@ -1620,10 +1770,102 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         }
         retcomm::studio::run_project_studio_async(model, args, nullptr);
     }
+    // Stop must stay clickable while Launch holds busy (streams game diagnostics).
+    ImGui::EndDisabled();
+    ImGui::BeginDisabled(root.empty());
     if (build_btn("Stop")) {
         retcomm::studio::run_project_studio_async(model, {"build", "stop"}, nullptr);
     }
+    ImGui::EndDisabled();
+    ImGui::BeginDisabled(model.busy.load() || root.empty());
     end_wrapped_line();
+
+#if !defined(_WIN32)
+    ImGui::Separator();
+    ImGui::TextUnformatted("Windows (MinGW)");
+    ImGui::TextColored(th.text_muted,
+                       "Cross-compile a Windows .exe from Linux (no GitHub CI). "
+                       "Needs mingw-w64-gcc + mingw-w64-sdl2. Full playable builds "
+                       "need generated game C first (Generate / --ensure). "
+                       "Netplay is ON when game.toml has [netplay] (reconfigure if "
+                       "an older MinGW cache has PSX_NETPLAY=OFF). "
+                       "Bundle + Export packages the existing MinGW build into a zip "
+                       "and opens a save dialog.");
+    field_row("##mingw_bdir", "MinGW dir", model.mingw_build_dir, sizeof(model.mingw_build_dir),
+              kLabelW);
+    checkbox_wrapped("Setup-host", &model.mingw_setup_host);
+    checkbox_wrapped("Package zip", &model.mingw_package);
+    checkbox_wrapped("Ensure first", &model.mingw_ensure);
+    checkbox_wrapped("Dynamic SDL", &model.mingw_dynamic);
+    end_wrapped_line();
+    auto mingw_build_dir_arg = [&]() -> std::string {
+        // Match script defaults: setup-host → build-mingw-setup when UI still says build-mingw.
+        if (model.mingw_setup_host &&
+            (model.mingw_build_dir[0] == '\0' ||
+             std::strcmp(model.mingw_build_dir, "build-mingw") == 0)) {
+            return "build-mingw-setup";
+        }
+        return model.mingw_build_dir[0] ? std::string(model.mingw_build_dir) : std::string();
+    };
+    accent_button(th);
+    const bool mingw_build = build_btn("MinGW Configure + Build");
+    accent_button_pop();
+    if (mingw_build) {
+        std::vector<std::string> args = {"build", "mingw", "--root", root};
+        const std::string bdir = mingw_build_dir_arg();
+        if (!bdir.empty()) {
+            args.push_back("--build-dir");
+            args.push_back(bdir);
+        }
+        if (model.mingw_setup_host) args.push_back("--setup-host");
+        if (model.mingw_package) args.push_back("--package");
+        if (model.mingw_ensure) args.push_back("--ensure");
+        if (model.mingw_dynamic) args.push_back("--dynamic");
+        if (model.build_jobs[0]) {
+            args.push_back("--jobs");
+            args.push_back(model.build_jobs);
+        }
+        if (model.build_extra[0]) {
+            args.push_back("--extra");
+            args.push_back(model.build_extra);
+        }
+        retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+    }
+    if (build_btn("Bundle + Export")) {
+        std::vector<std::string> args = {"build", "mingw", "--root", root, "--package-only"};
+        const std::string bdir = mingw_build_dir_arg();
+        if (!bdir.empty()) {
+            args.push_back("--build-dir");
+            args.push_back(bdir);
+        }
+        if (model.mingw_setup_host) args.push_back("--setup-host");
+        if (model.mingw_dynamic) args.push_back("--dynamic");
+        retcomm::studio::run_project_studio_async(
+            model, std::move(args), [&model, window](RunResult r) {
+                if (!r.ok()) {
+                    model.set_status("MinGW package failed");
+                    return;
+                }
+                const std::string zip = parse_mingw_zip_from_output(r.stdout_text);
+                if (zip.empty() || !fs::is_regular_file(zip)) {
+                    model.append_log("[FAIL] MinGW package produced no zip under dist/");
+                    model.set_status("MinGW package: no zip");
+                    return;
+                }
+                model.append_log("[OK] Packaged " + zip);
+                model.set_status("Choose export location…");
+                begin_export_mingw_zip(model, window, zip);
+            });
+    }
+    end_wrapped_line();
+#else
+    ImGui::Separator();
+    ImGui::TextUnformatted("Windows (MinGW)");
+    ImGui::TextColored(th.text_muted,
+                       "MinGW cross-build is for Linux hosts. On Windows use the "
+                       "native Configure / Build buttons above (or CI).");
+#endif
+
     ImGui::EndDisabled();
 
     if (model.gen_popup_open) ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
@@ -2126,6 +2368,9 @@ int main(int argc, char** argv) {
 
         if (model.log_expanded) {
             ImGui::InvisibleButton("##logsash", ImVec2(-1, kSplitH));
+            const ImVec2 sash_min = ImGui::GetItemRectMin();
+            const ImVec2 sash_max = ImGui::GetItemRectMax();
+            const bool sash_hot = ImGui::IsItemHovered() || ImGui::IsItemActive();
             if (ImGui::IsItemActive()) {
                 const float chrome = kSplitH + spacing * 2.f;
                 model.log_h_pref = std::clamp(model.log_h_pref - io.MouseDelta.y, kMinLog,
@@ -2133,8 +2378,19 @@ int main(int argc, char** argv) {
                 log_h = std::clamp(model.log_h_pref, kMinLog,
                                    std::max(kMinLog, avail - kMinBody - chrome));
             }
-            if (ImGui::IsItemHovered() || ImGui::IsItemActive())
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            if (sash_hot) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            {
+                // Visible grab line across the sash (brighter while hovered / dragging).
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                const float mid_y = 0.5f * (sash_min.y + sash_max.y);
+                const ImU32 line_col =
+                    sash_hot ? ImGui::GetColorU32(th.text_muted)
+                             : ImGui::GetColorU32(ImVec4(th.text_muted.x, th.text_muted.y,
+                                                         th.text_muted.z, 0.55f));
+                const float thickness = sash_hot ? 2.f : 1.f;
+                dl->AddLine(ImVec2(sash_min.x + 8.f, mid_y), ImVec2(sash_max.x - 8.f, mid_y),
+                            line_col, thickness);
+            }
             draw_log(model, th, log_h, window);
         } else {
             draw_log_collapsed_bar(model, th);

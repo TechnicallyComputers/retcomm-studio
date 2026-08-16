@@ -78,6 +78,29 @@ python3 tools/new_project_layout/migrate_project.py git release \
   --root /path/to/ApeEscapeRecomp --bump patch
 ```
 
+### Local Windows builds (MinGW cross, no CI)
+
+From Linux, cross-compile any Studio-indexed title to a Windows `.exe` for USB /
+Wine testing without dispatching GitHub Actions:
+
+```bash
+# By Studio index name (substring) or --last / --root
+python3 tools/new_project_layout/migrate_project.py build mingw \
+  --name "Twisted Metal"
+python3 tools/new_project_layout/migrate_project.py build mingw --last
+python3 tools/new_project_layout/migrate_project.py build mingw \
+  --root /path/to/TwistedMetal4Recomp --ensure
+
+# Same script directly:
+bash tools/new_project_layout/scripts/build_windows_mingw.sh --name TM4
+bash tools/new_project_layout/scripts/build_windows_mingw.sh \
+  --root /path/to/MotK --setup-host --package
+```
+
+Prereqs (Arch/CachyOS): `mingw-w64-gcc mingw-w64-sdl2 cmake ninja zip`.  
+Full playable builds need generated game C first (`build generate` / `--ensure`).  
+`--setup-host` mirrors CI setup-wizard packages.
+
 Git ops shell out to `git` / `gh` (no force-push, amend, or hook skips). **`git switch`** moves working-tree HEAD (game, `--modules`, or `--nested`); type any branch name, or omit `--branch` on modules to use `.gitmodules` tracking. Submodule **branch** in `.gitmodules` is for `update --remote`; CI builds the committed **gitlink SHAs**.
 
 For **bulk ops across many titles / platforms**, use the sibling tool

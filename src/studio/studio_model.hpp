@@ -61,6 +61,8 @@ struct StudioModel {
     int log_height = 160;
     char disc_cue[1024] = {};
     char zip_prefix[128] = {};
+    char github_owner[128] = {};
+    char github_repo[128] = {};
     int players = 2;
     bool migrate_netplay = false;
     bool migrate_ci = true;
@@ -99,6 +101,8 @@ struct StudioModel {
     bool np_build = true;
     bool np_github = false;
     char np_gh_vis[32] = "private";
+    char np_gh_owner[128] = "TechnicallyComputers";
+    char np_gh_repo[256] = {};
 
     // Git
     std::string git_summary;
@@ -143,6 +147,7 @@ struct StudioModel {
     bool bulk_create_branch = false;
     bool bulk_set_tracking = true;
     bool bulk_reuse_emitters = true;
+    int bulk_pull_mode = 0; // 0=ff-only 1=rebase 2=merge 3=reset
 
     // Build
     char build_dir[256] = "build-release";
@@ -157,6 +162,15 @@ struct StudioModel {
         "# KEY=VALUE pairs (space or newline separated)\n"
         "# Example:\n"
         "# RBE_CROSS_OS_PACING_DIAG=1 PSX_RB_ZERO_DELAY=0\n";
+
+    // Windows MinGW cross-build (Build tab — Linux host only)
+    char mingw_build_dir[256] = "build-mingw";
+    bool mingw_setup_host = false;
+    bool mingw_package = false;
+    bool mingw_ensure = false;
+    bool mingw_dynamic = false;
+    // Source zip path for Bundle+Export save dialog (set after package-only).
+    std::string mingw_export_src;
 
     // Generate ROM + BIOS C dialog (Build tab)
     bool gen_popup_open = false;
@@ -177,7 +191,7 @@ struct StudioModel {
     std::mutex pick_mu;
     std::string pending_folder;
     std::string pending_file;
-    std::string pending_pick_target; // disc|np_parent|np_disc|np_bios|repo_add|build_exe|export_log|build_scph
+    std::string pending_pick_target; // disc|np_parent|np_disc|np_bios|repo_add|build_exe|export_log|build_scph|export_mingw_zip
     bool file_pick_busy = false;
 
     void append_log(std::string line);
