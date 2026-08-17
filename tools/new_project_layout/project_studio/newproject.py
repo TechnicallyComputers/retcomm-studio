@@ -64,14 +64,26 @@ def is_windows() -> bool:
     return platform.system().lower().startswith("win") or os.name == "nt"
 
 
+def project_folder_name(opts: NewProjectOptions) -> str:
+    """Checkout folder = GitHub/catalog install_dir slug (not display name with spaces)."""
+    from fill_tokens import install_dir_name, sanitize_github_name
+
+    repo = (opts.github_repo or "").strip()
+    if repo:
+        return sanitize_github_name(repo)
+    return install_dir_name(opts.name or "")
+
+
 def project_root_for(opts: NewProjectOptions) -> Path:
     parent = Path(opts.parent_dir or ".").expanduser()
     if not parent.is_absolute():
         parent = parent.resolve()
     else:
         parent = parent.resolve()
-    name = (opts.name or "").strip()
-    return (parent / name).resolve()
+    folder = project_folder_name(opts)
+    if not folder:
+        folder = (opts.name or "").strip() or "repo"
+    return (parent / folder).resolve()
 
 
 def validate_options(opts: NewProjectOptions) -> list[str]:
@@ -343,10 +355,20 @@ def index_new_project(
     cue: str = "",
 ) -> CmdResult:
     """Add/update the Studio repo index for a freshly created project."""
+    from .bulkops import (
+        catalog_title_id_for_root,
+        upsert_studio_toml_title,
+    )
     from .repo_index import add_repo, load_index
 
     if not root.is_dir():
         return CmdResult(False, f"Project root missing: {root}")
     idx = load_index()
     entry = add_repo(idx, root, name=name or root.name, cue=cue)
-    return CmdResult(True, f"Indexed {entry.label()}", entry.path)
+    notes: list[str] = [entry.path]
+    tid = catalog_title_id_for_root(root)
+    if tid:
+        note = upsert_studio_toml_title(tid, root)
+        if note:
+            notes.append(note)
+    return CmdResult(True, f"Indexed {entry.label()}", "\n".join(notes))

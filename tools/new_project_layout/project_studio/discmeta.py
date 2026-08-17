@@ -278,8 +278,17 @@ def _load_developer(*, force: bool = False) -> _DevIndexes:
 
 
 def find_catalog_roots() -> list[Path]:
-    """Likely local checkouts of retcomm-catalog."""
+    """Likely local checkouts of retcomm-catalog + shared RetComM cache."""
     roots: list[Path] = []
+    try:
+        from project_studio.catalog_sync import catalog_cache_valid
+        from project_studio.retcomm_paths import default_paths
+
+        paths = default_paths()
+        if catalog_cache_valid(paths):
+            roots.append(paths.catalog_dir.resolve())
+    except Exception:
+        pass
     toolkit = toolkit_dir()
     for base in (
         toolkit.parent.parent,  # …/retcomm-studio

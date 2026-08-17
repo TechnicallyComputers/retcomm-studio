@@ -24,12 +24,23 @@ cmake --build build -j
 python3 project_studio_gui.py
 ```
 
-## Updates (Studio + shared toolchain)
+## Updates (Studio + shared toolchain + catalog)
 
-On startup (and via **Check for updates** in the header) Studio checks GitHub for:
+On startup (and via **Check updates** in the header) Studio checks GitHub for:
 
 1. A newer **RetComM Studio** release (`TechnicallyComputers/retcomm-studio`)
 2. A newer shared **retcomm-toolchain** pack (`TechnicallyComputers/retcomm-toolchains`)
+3. A newer **retcomm-catalog** zip (same shared cache as RetComM Hub/Launcher)
+
+Catalog sync writes into the shared data root and immediately refreshes:
+
+- Game repo dropdown **Catalog only** membership (`in_catalog`)
+- Bulk **Catalog only** selection ticks
+
+| OS | Catalog cache |
+|----|---------------|
+| Linux / macOS | `~/.local/share/retcomm/catalog/` |
+| Windows | `%LOCALAPPDATA%\retcomm\catalog\` |
 
 Toolchain packs install into the same cache as RetComM Launcher and game apps:
 
@@ -38,7 +49,8 @@ Toolchain packs install into the same cache as RetComM Launcher and game apps:
 | Linux / macOS | `~/.local/share/retcomm/toolchains/cmake-clang-v1/<tag>/` |
 | Windows | `%LOCALAPPDATA%\retcomm\toolchains\cmake-clang-v1\<tag>\` |
 
-Override roots with `RETCOMM_DATA_DIR` / `RETCOMM_TOOLCHAIN_DIR` (same as the launcher).  
+Override roots with `RETCOMM_DATA_DIR` / `RETCOMM_TOOLCHAIN_DIR` / `RETCOMM_CATALOG_DIR`
+(same as the launcher).  
 Disable startup checks via `~/.config/retcomm/studio.json`:
 
 ```json

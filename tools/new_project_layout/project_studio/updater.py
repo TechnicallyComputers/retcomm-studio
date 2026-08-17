@@ -489,7 +489,7 @@ def unwrap_single_subdir(root: Path) -> Path:
 
 @dataclass
 class ComponentUpdate:
-    kind: str  # studio | toolchain
+    kind: str  # studio | toolchain | catalog
     current: str
     latest: str
     available: bool
@@ -498,6 +498,8 @@ class ComponentUpdate:
     asset_name: str = ""
     release: GhRelease | None = None
     asset: GhAsset | None = None
+    downloaded: bool = False  # catalog: True when zip was installed this check
+    skipped: bool = False  # catalog: True when cache already matched latest
 
 
 @dataclass
@@ -505,6 +507,7 @@ class UpdateCheckResult:
     ok: bool
     studio: ComponentUpdate
     toolchain: ComponentUpdate
+    catalog: ComponentUpdate | None = None
     message: str = ""
 
 
@@ -773,12 +776,38 @@ def check_updates(
     except Exception as exc:
         toolchain.message = f"Toolchain check failed: {exc}"
 
-    bits = [studio.message, toolchain.message]
+    catalog = ComponentUpdate(
+        kind="catalog",
+        current="(none)",
+        latest="",
+        available=False,
+        supported=True,
+        message="Catalog update pending…",
+    )
+    try:
+        from .catalog_sync import maybe_auto_update_catalog, read_catalog_state
+
+        cat_sync = maybe_auto_update_catalog(p, on_progress=prog)
+        state = read_catalog_state(p)
+        catalog.current = str(state.get("release_tag") or "(none)")
+        catalog.latest = cat_sync.release_tag or catalog.current
+        catalog.downloaded = bool(cat_sync.downloaded)
+        catalog.skipped = bool(cat_sync.skipped)
+        catalog.message = cat_sync.message
+        if not cat_sync.ok:
+            catalog.supported = False
+            catalog.message = cat_sync.message
+    except Exception as exc:
+        catalog.message = f"Catalog check failed: {exc}"
+        catalog.supported = False
+
+    bits = [studio.message, toolchain.message, catalog.message]
     any_avail = studio.available or toolchain.available
     return UpdateCheckResult(
         ok=True,
         studio=studio,
         toolchain=toolchain,
+        catalog=catalog,
         message=("Updates available. " if any_avail else "") + " · ".join(bits),
     )
 
@@ -1104,6 +1133,9 @@ def check_updates_async(
                 ),
                 toolchain=ComponentUpdate(
                     "toolchain", "(unknown)", "", False, False, str(exc)
+                ),
+                catalog=ComponentUpdate(
+                    "catalog", "(unknown)", "", False, False, str(exc)
                 ),
                 message=str(exc),
             )

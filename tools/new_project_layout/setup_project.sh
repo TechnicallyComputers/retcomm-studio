@@ -476,10 +476,15 @@ if [ -z "$DESCRIPTION_MD" ]; then
     DESCRIPTION_MD="_Add a short pitch in catalog_identity.json / README._"
 fi
 
-ROOT=$(CDPATH= cd -- "$PARENT" && pwd)/"$NAME"
+# Folder = GitHub/catalog install_dir slug (hyphenated), not display $NAME with spaces.
+INSTALL_DIR_NAME="$GITHUB_REPO"
+ROOT=$(CDPATH= cd -- "$PARENT" && pwd)/"$INSTALL_DIR_NAME"
 if [ -e "$ROOT" ]; then
     echo "error: target already exists: $ROOT" >&2
     exit 1
+fi
+if [ "$INSTALL_DIR_NAME" != "$NAME" ]; then
+    echo "note: project folder is '$INSTALL_DIR_NAME' (catalog/GitHub slug; display name stays '$NAME')" >&2
 fi
 
 # --- CMake block files -----------------------------------------------------

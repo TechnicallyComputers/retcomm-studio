@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,13 @@ class Workspace:
         # Also try id as folder name
         candidates.append(title.id)
 
+        def _looks_like_game(hit: Path) -> bool:
+            return hit.is_dir() and (
+                (hit / ".git").exists()
+                or (hit / "game.toml").is_file()
+                or (hit / "CMakeLists.txt").is_file()
+            )
+
         seen: set[str] = set()
         for name in candidates:
             if not name or name in seen:
@@ -44,13 +52,30 @@ class Workspace:
             seen.add(name)
             for root in self.checkout_roots:
                 hit = root / name
-                if hit.is_dir() and (hit / ".git").exists():
+                if _looks_like_game(hit):
                     return hit.resolve()
-                # Accept non-git dirs that look like game repos
-                if hit.is_dir() and (
-                    (hit / "game.toml").is_file() or (hit / "CMakeLists.txt").is_file()
-                ):
-                    return hit.resolve()
+
+        # Soft match: spacey / trailing-Recomp folders vs install_dir / github slug.
+        try:
+            from fill_tokens import repo_match_keys
+        except ImportError:
+            return None
+        want: set[str] = set()
+        for c in candidates:
+            want.update(repo_match_keys(c))
+        want.discard("")
+        if not want:
+            return None
+        for root in self.checkout_roots:
+            if not root.is_dir():
+                continue
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if repo_match_keys(child.name) & want and _looks_like_game(child):
+                    return child.resolve()
         return None
 
 
@@ -73,6 +98,22 @@ def load_workspace(path: Path | None = None) -> Workspace:
     if not catalog:
         raise ValueError(f"{cfg}: missing required 'catalog' path")
     catalog_root = _as_path(base, str(catalog))
+    # Prefer the shared RetComM catalog cache when Studio/Hub has synced it.
+    env_cat = (os.environ.get("RETCOMM_CATALOG_DIR") or "").strip()
+    if env_cat:
+        env_path = Path(env_cat).expanduser().resolve()
+        if (env_path / "index.json").is_file():
+            catalog_root = env_path
+    else:
+        try:
+            from project_studio.catalog_sync import catalog_cache_valid
+            from project_studio.retcomm_paths import default_paths
+
+            paths = default_paths()
+            if catalog_cache_valid(paths):
+                catalog_root = paths.catalog_dir.resolve()
+        except Exception:
+            pass
 
     roots_raw = data.get("checkout_roots") or data.get("roots") or []
     if isinstance(roots_raw, dict):

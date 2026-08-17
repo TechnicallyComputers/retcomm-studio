@@ -266,8 +266,13 @@ $PublisherDisp = if ($Publisher) { $Publisher } else { "—" }
 $YearDisp = if ($Year) { $Year } else { "—" }
 $DescriptionMd = if ($Description) { $Description } else { "_Add a short pitch in catalog_identity.json / README._" }
 
-$Root = Join-Path (Resolve-Path $Dir) $Name
+# Folder = GitHub/catalog install_dir slug (hyphenated), not display $Name with spaces.
+$InstallDirName = $GithubRepo
+$Root = Join-Path (Resolve-Path $Dir) $InstallDirName
 if (Test-Path $Root) { throw "Target already exists: $Root" }
+if ($InstallDirName -ne $Name) {
+    Write-Host "note: project folder is '$InstallDirName' (catalog/GitHub slug; display name stays '$Name')"
+}
 
 $NetplayBlockFile = Join-Path $env:TEMP "psxrecomp_netplay_block.cmake"
 $WizardBlockFile = Join-Path $env:TEMP "psxrecomp_wizard_block.cmake"

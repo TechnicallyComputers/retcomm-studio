@@ -1,5 +1,7 @@
 #include "studio/studio_model.hpp"
 
+#include <cstdio>
+
 namespace retcomm::studio {
 
 void StudioModel::append_log(std::string line) {
@@ -28,6 +30,21 @@ void StudioModel::select_repo_by_path(const std::string& path) {
             selected_repo = i;
             return;
         }
+    }
+}
+
+void StudioModel::coerce_catalog_only_selection() {
+    if (!catalog_only) return;
+    const bool ok = selected_repo >= 0 && selected_repo < static_cast<int>(repos.size()) &&
+                    repos[static_cast<size_t>(selected_repo)].in_catalog;
+    if (ok) return;
+    for (int i = 0; i < static_cast<int>(repos.size()); ++i) {
+        if (!repos[static_cast<size_t>(i)].in_catalog) continue;
+        selected_repo = i;
+        const auto& e = repos[static_cast<size_t>(i)];
+        std::snprintf(disc_cue, sizeof(disc_cue), "%s", e.cue.c_str());
+        apply_selected_players();
+        return;
     }
 }
 

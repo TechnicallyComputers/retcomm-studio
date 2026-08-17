@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -476,10 +477,16 @@ bool load_repos_from_json(StudioModel& model, const std::string& json_text, std:
         }
         if (!last.empty()) model.select_repo_by_path(last);
         else if (!model.repos.empty() && model.selected_repo < 0) model.selected_repo = 0;
-        // Seed bulk selection
-        for (const auto& e : model.repos) {
-            if (!model.bulk_selected.count(e.path)) model.bulk_selected[e.path] = true;
+        // Seed bulk selection for new paths; drop orphans from removed repos.
+        {
+            std::map<std::string, bool> next;
+            for (const auto& e : model.repos) {
+                auto it = model.bulk_selected.find(e.path);
+                next[e.path] = (it != model.bulk_selected.end()) ? it->second : true;
+            }
+            model.bulk_selected.swap(next);
         }
+        model.coerce_catalog_only_selection();
         if (model.selected_repo >= 0 &&
             model.selected_repo < static_cast<int>(model.repos.size())) {
             const auto& sel = model.repos[static_cast<size_t>(model.selected_repo)];

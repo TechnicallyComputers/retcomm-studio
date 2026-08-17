@@ -11,5 +11,7 @@ checkout_roots = [
 ]
 
 # Optional explicit overrides (catalog title id → local path).
+# New-project wizard creates folders as the GitHub/install_dir slug
+# (e.g. Wipeout-3-Special-Edition-Recomp), not the display name with spaces.
 # [titles]
 # "masters-of-teras-kasi-psx" = "../MastersOfTerasKasiRecomp"

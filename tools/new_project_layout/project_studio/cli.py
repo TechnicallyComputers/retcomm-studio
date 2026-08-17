@@ -360,6 +360,8 @@ def cmd_updates_check(args: argparse.Namespace) -> int:
                         "message": "Startup update check disabled in config.",
                         "studio": {"available": False},
                         "toolchain": {"available": False},
+                        "catalog": {"available": False, "skipped": True,
+                                    "message": "Startup update check disabled."},
                     },
                     indent=2,
                 )
@@ -374,7 +376,7 @@ def cmd_updates_check(args: argparse.Namespace) -> int:
     result = check_updates(on_progress=prog)
     if args.json:
         def comp(c) -> dict:
-            return {
+            out = {
                 "kind": c.kind,
                 "current": c.current,
                 "latest": c.latest,
@@ -383,7 +385,26 @@ def cmd_updates_check(args: argparse.Namespace) -> int:
                 "message": c.message,
                 "asset_name": c.asset_name,
             }
+            if c.kind == "catalog":
+                out["downloaded"] = bool(getattr(c, "downloaded", False))
+                out["skipped"] = bool(getattr(c, "skipped", False))
+            return out
 
+        catalog_obj = result.catalog
+        catalog_json = (
+            comp(catalog_obj)
+            if catalog_obj is not None
+            else {
+                "kind": "catalog",
+                "current": "(none)",
+                "latest": "",
+                "available": False,
+                "supported": False,
+                "message": "Catalog not checked.",
+                "downloaded": False,
+                "skipped": True,
+            }
+        )
         print(
             json.dumps(
                 {
@@ -391,6 +412,7 @@ def cmd_updates_check(args: argparse.Namespace) -> int:
                     "message": result.message,
                     "studio": comp(result.studio),
                     "toolchain": comp(result.toolchain),
+                    "catalog": catalog_json,
                 },
                 indent=2,
             )
@@ -398,6 +420,8 @@ def cmd_updates_check(args: argparse.Namespace) -> int:
     else:
         print(result.studio.message)
         print(result.toolchain.message)
+        if result.catalog:
+            print(result.catalog.message)
         if result.message:
             print(result.message)
     return 0 if result.ok else 1

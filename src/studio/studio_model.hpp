@@ -198,6 +198,8 @@ struct StudioModel {
     void set_status(std::string s);
     std::string selected_root() const;
     void select_repo_by_path(const std::string& path);
+    // When Catalog only is on, ensure selected_repo is a catalog-backed entry.
+    void coerce_catalog_only_selection();
     // Apply detected player count from the selected repo to the Migrate UI.
     void apply_selected_players();
 };

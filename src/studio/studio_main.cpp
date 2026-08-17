@@ -603,6 +603,92 @@ void refresh_repos(StudioModel& model) {
         false);
 }
 
+// After catalog sync: reload in_catalog flags; optionally re-apply Bulk "Catalog only".
+void refresh_repos_and_catalog_filters(StudioModel& model, bool reapply_bulk_catalog) {
+    retcomm::studio::run_project_studio_async(
+        model, {"repos", "list", "--json"},
+        [&model, reapply_bulk_catalog](RunResult r) {
+            std::string err;
+            if (!retcomm::studio::load_repos_from_json(model, r.stdout_text, &err)) {
+                model.append_log("[FAIL] repos list: " + (err.empty() ? r.stderr_text : err));
+                model.set_status("Failed to load repo index");
+                return;
+            }
+            model.set_status("Repo index loaded");
+            if (!reapply_bulk_catalog) return;
+            retcomm::studio::run_project_studio_async(
+                model, {"repos", "filter-catalog", "--json"},
+                [&model](RunResult fr) {
+                    try {
+                        auto j = nlohmann::json::parse(fr.stdout_text);
+                        const auto note = j.value("note", "");
+                        for (auto& kv : model.bulk_selected) kv.second = false;
+                        int n = 0;
+                        if (j.contains("paths") && j["paths"].is_array()) {
+                            for (const auto& p : j["paths"]) {
+                                const std::string path = p.get<std::string>();
+                                auto it = model.bulk_selected.find(path);
+                                if (it != model.bulk_selected.end()) {
+                                    it->second = true;
+                                    ++n;
+                                }
+                            }
+                        }
+                        if (!note.empty()) model.append_log(note);
+                        model.set_status("Catalog filters applied (" + std::to_string(n) +
+                                         " bulk target(s))");
+                    } catch (const std::exception& ex) {
+                        model.append_log(std::string("[FAIL] filter-catalog: ") + ex.what());
+                    }
+                },
+                false);
+        },
+        false);
+}
+
+void handle_updates_check_result(StudioModel& model, const RunResult& r) {
+    try {
+        auto j = nlohmann::json::parse(r.stdout_text);
+        if (j.value("skipped", false)) {
+            model.append_log(j.value("message", "Startup update check skipped."));
+            // Catalog was not synced; keep the earlier repos list / bulk ticks.
+            return;
+        }
+        const auto studio = j.value("studio", nlohmann::json::object());
+        const auto tc = j.value("toolchain", nlohmann::json::object());
+        const auto cat = j.value("catalog", nlohmann::json::object());
+        model.update_studio_avail = studio.value("available", false);
+        model.update_toolchain_avail = tc.value("available", false);
+        std::string msg = j.value("message", "");
+        if (msg.empty()) {
+            msg = studio.value("message", "");
+            const auto tm = tc.value("message", "");
+            if (!tm.empty()) {
+                if (!msg.empty()) msg += " · ";
+                msg += tm;
+            }
+            const auto cm = cat.value("message", "");
+            if (!cm.empty()) {
+                if (!msg.empty()) msg += " · ";
+                msg += cm;
+            }
+        }
+        model.append_log(msg.empty() ? "Update check complete." : msg);
+        if (model.update_studio_avail || model.update_toolchain_avail) {
+            model.update_prompt_msg = msg;
+            model.update_prompt_open = true;
+        }
+        // Always refresh in_catalog for the dropdown; re-tick Bulk catalog filter
+        // when the zip was installed or the cache was first created this check.
+        const bool catalog_changed =
+            cat.value("downloaded", false) || !cat.value("skipped", true);
+        refresh_repos_and_catalog_filters(model, /*reapply_bulk_catalog=*/catalog_changed);
+    } catch (const std::exception& ex) {
+        model.append_log(std::string("Update check: ") + ex.what());
+        refresh_repos(model);
+    }
+}
+
 std::vector<std::string> migrate_common_args(StudioModel& model) {
     std::vector<std::string> a;
     if (model.disc_cue[0]) {
@@ -713,7 +799,9 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SameLine();
         ImGui::BeginDisabled(model.busy.load());
         if (ImGui::Button("Check updates")) {
-            retcomm::studio::run_project_studio_async(model, {"updates", "check"}, nullptr);
+            retcomm::studio::run_project_studio_async(
+                model, {"updates", "check", "--json"},
+                [&model](RunResult r) { handle_updates_check_result(model, r); });
         }
         ImGui::EndDisabled();
     }
@@ -779,32 +867,13 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
                 false);
         }
         ImGui::SameLine();
-        if (ImGui::Checkbox("Catalog only", &model.catalog_only)) {
+                if (ImGui::Checkbox("Catalog only", &model.catalog_only)) {
             retcomm::studio::run_project_studio_async(
                 model,
                 {"repos", "set-flags", "--catalog-only", model.catalog_only ? "1" : "0", "--json"},
                 [&model](RunResult r) {
                     std::string err;
                     retcomm::studio::load_repos_from_json(model, r.stdout_text, &err);
-                    // If the current selection is hidden by the filter, jump to the
-                    // first catalog-backed repo so the dropdown stays coherent.
-                    if (model.catalog_only) {
-                        const bool ok =
-                            model.selected_repo >= 0 &&
-                            model.selected_repo < static_cast<int>(model.repos.size()) &&
-                            model.repos[static_cast<size_t>(model.selected_repo)].in_catalog;
-                        if (!ok) {
-                            for (int i = 0; i < static_cast<int>(model.repos.size()); ++i) {
-                                if (!model.repos[static_cast<size_t>(i)].in_catalog) continue;
-                                model.selected_repo = i;
-                                const auto& e = model.repos[static_cast<size_t>(i)];
-                                std::snprintf(model.disc_cue, sizeof(model.disc_cue), "%s",
-                                              e.cue.c_str());
-                                model.apply_selected_players();
-                                break;
-                            }
-                        }
-                    }
                 },
                 false);
         }
@@ -2186,41 +2255,13 @@ int main(int argc, char** argv) {
                               parent.string().c_str());
                 refresh_repos(model);
                 // Startup update check uses github.com tag redirects + a local TTL
-                // cache (not api.github.com listing) to avoid rate limits.
+                // cache (not api.github.com listing) to avoid rate limits. Also syncs
+                // retcomm-catalog into the shared cache and refreshes filters.
                 if (!model.startup_update_started) {
                     model.startup_update_started = true;
                     retcomm::studio::run_project_studio_async(
                         model, {"updates", "check", "--json", "--startup"},
-                        [&model](RunResult r) {
-                            try {
-                                auto j = nlohmann::json::parse(r.stdout_text);
-                                if (j.value("skipped", false)) {
-                                    model.append_log(
-                                        j.value("message", "Startup update check skipped."));
-                                    return;
-                                }
-                                const auto studio = j.value("studio", nlohmann::json::object());
-                                const auto tc = j.value("toolchain", nlohmann::json::object());
-                                model.update_studio_avail = studio.value("available", false);
-                                model.update_toolchain_avail = tc.value("available", false);
-                                std::string msg = j.value("message", "");
-                                if (msg.empty()) {
-                                    msg = studio.value("message", "");
-                                    const auto tm = tc.value("message", "");
-                                    if (!tm.empty()) {
-                                        if (!msg.empty()) msg += " · ";
-                                        msg += tm;
-                                    }
-                                }
-                                model.append_log(msg.empty() ? "Update check complete." : msg);
-                                if (model.update_studio_avail || model.update_toolchain_avail) {
-                                    model.update_prompt_msg = msg;
-                                    model.update_prompt_open = true;
-                                }
-                            } catch (const std::exception& ex) {
-                                model.append_log(std::string("Update check: ") + ex.what());
-                            }
-                        },
+                        [&model](RunResult r) { handle_updates_check_result(model, r); },
                         false);
                 }
             }
@@ -2312,21 +2353,7 @@ int main(int argc, char** argv) {
                                 retcomm::studio::run_project_studio_async(
                                     model, {"updates", "check", "--json", "--startup"},
                                     [&model](RunResult ur) {
-                                        try {
-                                            auto j = nlohmann::json::parse(ur.stdout_text);
-                                            if (j.value("skipped", false)) return;
-                                            model.update_studio_avail =
-                                                j.value("studio", nlohmann::json::object())
-                                                    .value("available", false);
-                                            model.update_toolchain_avail =
-                                                j.value("toolchain", nlohmann::json::object())
-                                                    .value("available", false);
-                                            model.update_prompt_msg = j.value("message", "");
-                                            if (model.update_studio_avail ||
-                                                model.update_toolchain_avail)
-                                                model.update_prompt_open = true;
-                                        } catch (...) {
-                                        }
+                                        handle_updates_check_result(model, ur);
                                     },
                                     false);
                             }
