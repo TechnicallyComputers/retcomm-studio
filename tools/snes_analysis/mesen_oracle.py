@@ -235,10 +235,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     sysbin = system_binary()
     log(f"system mesen    {sysbin if sysbin else 'not on PATH'}")
-    log(f"install         {'present' if lay.binary.is_file() else 'not installed'}")
     log(f"pinned          Mesen2 {PIN['tag']} ({PIN['asset']})")
-    if lay.binary.is_file():
-        why = smoke(lay.binary)
+
+    # Smoke the binary `start` would actually launch, which the manifest's
+    # provider decides. Testing the unpacked release copy after the oracle has
+    # been pointed at a system build reports a failure that does not matter.
+    resolved = lay.resolved_binary()
+    log(f"resolved        {resolved if resolved else 'not installed'}")
+    if resolved is None:
+        ok = False
+    else:
+        why = smoke(resolved)
         log(f"smoke           {'ok' if why is None else 'FAILS — ' + why}")
         if why is not None:
             ok = False
@@ -283,7 +290,7 @@ def install_from_system(lay: Layout) -> int:
         raise OracleError(f"system Mesen at {sysbin} does not run: {why}")
     lay.root.mkdir(parents=True, exist_ok=True)
     write_manifest(lay, stage="install", provider="system",
-                   system_binary=str(sysbin))
+                   system_binary=str(sysbin), runnable=True)
     log(f"adopted         {sysbin} (system build)")
     return 0
 
