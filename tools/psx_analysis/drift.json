@@ -1,0 +1,38 @@
+{
+  "disasm_ram.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "0466efa8daa568d521b1401572dcd417ba3c7ca39ca326b85630f1f7cf81b74b"
+  },
+  "duckstation_oracle.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "f90ad3e335c628bbc6a8584af208edc690973934538ccf853b78bd089887c9f4"
+  },
+  "gpu_frame_capture.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "fb022a00ddb5e33045f82de493d1a707bd3f6116a764693b55de22bc96a4d5de"
+  },
+  "gpu_frame_diff.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "1a86bb7043c1472c35be67329480d22b818e81d7c62f9e4bff9cceeb05924258"
+  },
+  "gpu_frame_layers.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "66b67160c99fd4ed8742485e23d574b8f39c7fa89fd4bf1b982df340cc1ae5ac"
+  },
+  "gpu_parity.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "113bb098125dbf404b9c085d58e2dba3cea961778a790e416ba788b20c96e6d8"
+  },
+  "overlay_xref.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "e106dabe761c476534c83d4fd3842d94f59540c415b3a77f7ee3c57cbe200bce"
+  },
+  "pad_trace.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "96cace89163e39892833366191a0d65c9a3c84f36792e18052539fe40017344a"
+  },
+  "psx_gpu_frame.py": {
+    "note": "baseline recorded by tool_drift.py --accept",
+    "upstream_sha256": "df4608277cc17f7b539b6dc264eb3be62c7db93f6d08ecf4d1ae2ed88eb347e3"
+  }
+}

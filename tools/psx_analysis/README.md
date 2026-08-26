@@ -9,6 +9,10 @@ section before moving them back.
 
 ## Why Studio owns these
 
+> The rule for what lives here versus in the runtime — and why — is
+> [`../README.md`](../README.md). This section is the PSX-specific history
+> behind it.
+
 They were maintained on a psxrecomp feature branch that never merged. Two
 things followed from that, both of which cost real sessions:
 

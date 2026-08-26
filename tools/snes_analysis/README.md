@@ -1,5 +1,8 @@
 # SNES asset + attribution tools
 
+> Tools here are maintained and versioned by Studio, not by
+> `snesrecomp`. The rule and its rationale: [`../README.md`](../README.md).
+
 Dump SNES assets **as composed** and attribute what is on screen to the source
 function that drew it. The SNES sibling of `tools/psx_analysis/`, with the
 same division of labour: these tools own the debug protocol and the decode
