@@ -130,6 +130,11 @@ set(RETCOMM_STUDIO_SOURCES
     src/studio/studio_main.cpp
     src/studio/studio_model.cpp
     src/studio/studio_runner.cpp
+    src/studio/studio_functions.cpp
+    src/studio/studio_analysis.cpp
+    src/studio/studio_frames.cpp
+    src/studio/studio_frames_data.cpp
+    src/studio/studio_debug.cpp
 )
 
 # Windows .exe icon (explorer / taskbar) from assets/retcomm-studio.ico
@@ -179,7 +184,18 @@ install(DIRECTORY tools/new_project_layout/
         PATTERN "__pycache__" EXCLUDE
         PATTERN "*.pyc" EXCLUDE
         PATTERN "project_studio_repos.json" EXCLUDE
+        PATTERN "project_studio_repos_snes.json" EXCLUDE
         PATTERN ".cache" EXCLUDE)
+# The PSX analysis tools the Frames tab drives. Deliberately a SIBLING of the
+# toolkit directory, in the source tree and here: gpu_tool_path() resolves them
+# as <RETCOMM_STUDIO_TOOLKIT>/../psx_analysis, so tools/new_project_layout ->
+# tools/psx_analysis and share/retcomm-studio/toolkit -> share/retcomm-studio/
+# psx_analysis are the same lookup. Move one without the other and every tool
+# button in Frames goes quietly grey.
+install(DIRECTORY tools/psx_analysis/
+        DESTINATION share/retcomm-studio/psx_analysis
+        PATTERN "__pycache__" EXCLUDE
+        PATTERN "*.pyc" EXCLUDE)
 install(DIRECTORY assets/
         DESTINATION share/retcomm-studio/assets
         PATTERN "*.svg" EXCLUDE)
@@ -193,3 +209,88 @@ endif()
 install(FILES VERSION DESTINATION share/retcomm-studio)
 
 message(STATUS "retcomm-studio ${RETCOMM_STUDIO_VERSION}: ImGui=${RETCOMM_IMGUI_DIR}")
+
+# ---- Functions tab data-path test -------------------------------------------
+# studio_analysis.cpp is ImGui-free precisely so this can run without a GPU or
+# a window. Point it at a repo that already has an analysis/ bundle:
+#   ./build/analysis_load_test ~/Documents/GitHub/SomeRecomp
+add_executable(analysis_load_test
+    tests/analysis_load_test.cpp
+    src/studio/studio_analysis.cpp
+    src/studio/studio_frames_data.cpp
+    src/studio/studio_debug.cpp
+    src/studio/studio_model.cpp
+)
+target_include_directories(analysis_load_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(analysis_load_test PRIVATE nlohmann_json::nlohmann_json)
+
+# ---- Frames tab data-path test ----------------------------------------------
+# studio_frames_data.cpp is ImGui-free for the same reason studio_analysis.cpp
+# is. With no argument it checks embedded fixtures; with a directory it loads
+# real gpu_frame_*.py output, which is what catches schema drift between the
+# Python tools and this viewer:
+#   ./build/frames_load_test ~/Documents/GitHub/SomeRecomp/analysis/frames
+add_executable(frames_load_test
+    tests/frames_load_test.cpp
+    src/studio/studio_frames_data.cpp
+    src/studio/studio_model.cpp
+)
+target_include_directories(frames_load_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(frames_load_test PRIVATE nlohmann_json::nlohmann_json)
+
+# ---- detached-launch test ----------------------------------------------------
+# No GPU, no window, no game: spawns /bin/sh and checks the log redirection and
+# process lifetime the Frames tab's Launch button relies on.
+#   ./build/spawn_test
+if(NOT WIN32)
+    add_executable(spawn_test
+        tests/spawn_test.cpp
+        src/studio/studio_runner.cpp
+        src/studio/studio_model.cpp
+    )
+    target_include_directories(spawn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(spawn_test PRIVATE nlohmann_json::nlohmann_json)
+endif()
+
+# ---- JSON-boundary test ------------------------------------------------------
+# The toolkit's optional fields are Python `str | None`, and nlohmann's value()
+# throws on a present-but-null key rather than using the fallback. That is a
+# parse failure of the WHOLE document over one field, so it gets its own test.
+# No GPU, no repo:  ./build/json_null_test
+add_executable(json_null_test
+    tests/json_null_test.cpp
+    src/studio/studio_runner.cpp
+    src/studio/studio_model.cpp
+)
+target_include_directories(json_null_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(json_null_test PRIVATE nlohmann_json::nlohmann_json)
+
+# ---- platform-split test (Python) --------------------------------------------
+# The SNES half of Studio is decided in the toolkit, not in C++: which repo
+# index, which framework submodule, which scaffolder, and the SNES migration
+# ops themselves. It needs no GPU and no game — only git and a temp dir:
+#   python3 tests/snes_platform_test.py
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(snes_platform_test
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/snes_platform_test.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Running SNES platform-split test"
+        VERBATIM)
+endif()
+
+# ---- live debug-client test --------------------------------------------------
+# Speaks the debug protocol to a stub server on an ephemeral port, so it needs
+# neither a running game nor a GPU:  ./build/debug_client_test
+add_executable(debug_client_test
+    tests/debug_client_test.cpp
+    src/studio/studio_debug.cpp
+)
+target_include_directories(debug_client_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(debug_client_test PRIVATE nlohmann_json::nlohmann_json)
+find_package(Threads REQUIRED)
+target_link_libraries(debug_client_test PRIVATE Threads::Threads)

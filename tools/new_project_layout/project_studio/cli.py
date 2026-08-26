@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import os
 import sys
 from pathlib import Path
@@ -13,11 +14,8 @@ _TOOLKIT = Path(__file__).resolve().parent.parent
 if str(_TOOLKIT) not in sys.path:
     sys.path.insert(0, str(_TOOLKIT))
 
-from project_studio import __version__  # noqa: E402
-from project_studio.detect import audit_project  # noqa: E402
+from project_studio import __version__, platforms  # noqa: E402
 from project_studio.models import MigrateOptions  # noqa: E402
-from project_studio.ops import apply_plan, list_ops  # noqa: E402
-from project_studio.plan import build_plan  # noqa: E402
 
 
 def _print_audit(report, *, as_json: bool) -> int:
@@ -82,18 +80,42 @@ def _options_from_args(args: argparse.Namespace) -> MigrateOptions:
     )
 
 
+def _migration_backend():
+    """The audit/plan/apply implementation for this session's platform.
+
+    Two independent implementations rather than one parametrised one: the PSX
+    migration is about game.toml, disc probing, BIOS backends and a CMake
+    rewrite, none of which exists on SNES. Forcing them through one code path
+    would mean a pile of `if platform ==` inside every op.
+    """
+    if platforms.current().key == "snes":
+        from project_studio import snesops
+
+        return snesops
+    import types
+
+    from project_studio import detect, ops as psx_ops, plan as psx_plan
+
+    return types.SimpleNamespace(
+        audit_project=detect.audit_project,
+        build_plan=psx_plan.build_plan,
+        apply_plan=psx_ops.apply_plan,
+        list_ops=psx_ops.list_ops,
+    )
+
+
 def cmd_audit(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
-    return _print_audit(audit_project(root), as_json=args.json)
+    return _print_audit(_migration_backend().audit_project(root), as_json=args.json)
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser().resolve()
     opts = _options_from_args(args)
-    plan = build_plan(root, opts)
+    plan = _migration_backend().build_plan(root, opts)
     if args.json:
         print(json.dumps(plan.to_dict(), indent=2))
         return 0
@@ -122,8 +144,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if opts.players < 2:
         opts.enable_netplay = False
 
-    report = audit_project(root)
-    plan = build_plan(root, opts, report)
+    backend = _migration_backend()
+    report = backend.audit_project(root)
+    plan = backend.build_plan(root, opts, report)
     if args.json_plan:
         print(json.dumps(plan.to_dict(), indent=2))
 
@@ -133,7 +156,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     print(f"Applying {len(plan.steps)} step(s) to {root}"
           + (" [DRY-RUN]" if opts.dry_run else ""))
-    results = apply_plan(plan)
+    results = backend.apply_plan(plan)
     failed = 0
     for r in results:
         mark = "OK" if r.ok else "FAIL"
@@ -148,7 +171,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
 
 def cmd_ops(_: argparse.Namespace) -> int:
-    for op in list_ops():
+    for op in _migration_backend().list_ops():
         print(op)
     return 0
 
@@ -268,11 +291,28 @@ def cmd_repos_remove(args: argparse.Namespace) -> int:
 def cmd_repos_set_cue(args: argparse.Namespace) -> int:
     from project_studio.repo_index import load_index, set_repo_cue
 
+    cue = (getattr(args, "cue", None) or "").strip()
+    if not cue:
+        label = "ROM (--rom)" if platforms.is_snes() else "disc .cue (--cue)"
+        print(f"error: no {label} given", file=sys.stderr)
+        return 2
+    args.cue = cue
     idx = load_index()
     entry = set_repo_cue(idx, args.path, args.cue)
     if entry is None:
         print(f"error: not in index: {args.path}", file=sys.stderr)
         return 2
+    return _print_index_json(idx)
+
+
+def cmd_repos_clear_cue(args: argparse.Namespace) -> int:
+    from project_studio.repo_index import clear_repo_cue, load_index
+
+    idx = load_index()
+    if idx.find(args.path) is None:
+        print(f"error: not in index: {args.path}", file=sys.stderr)
+        return 2
+    clear_repo_cue(idx, args.path)
     return _print_index_json(idx)
 
 
@@ -482,7 +522,11 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         description=(getattr(args, "description", None) or "").strip(),
         publisher=(getattr(args, "publisher", None) or "").strip(),
         year=(getattr(args, "year", None) or "").strip(),
-        region=(getattr(args, "region", None) or "USA").strip(),
+        region=(
+            (getattr(args, "region", None) or "").strip()
+            if platforms.current().key == "snes"
+            else (getattr(args, "region", None) or "USA").strip()
+        ),
         enable_recomp_ui=not bool(getattr(args, "no_recomp_ui", False)),
         enable_wizard=not bool(getattr(args, "no_wizard", False)),
         enable_netplay=bool(getattr(args, "enable_netplay", False)),
@@ -496,6 +540,10 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         github_visibility=(
             getattr(args, "github_visibility", None) or "private"
         ).strip(),
+        platform=platforms.current().key,
+        snesrecomp_ref=(getattr(args, "snesrecomp_ref", None) or "main").strip(),
+        multitap=(getattr(args, "multitap", None) or "").strip(),
+        enable_rollback=bool(getattr(args, "enable_rollback", False)),
         psxrecomp_ref=(getattr(args, "psxrecomp_ref", None) or "master").strip(),
         recomp_ui_ref=(getattr(args, "recomp_ui_ref", None) or "master").strip(),
         recomp_net_ref=(getattr(args, "recomp_net_ref", None) or "").strip(),
@@ -503,7 +551,9 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         dry_run=bool(getattr(args, "dry_run", False)),
     )
 
-    if bool(getattr(args, "autofill_meta", False)):
+    if bool(getattr(args, "autofill_meta", False)) and platforms.current().key != "snes":
+        # Redump/libretro lookup is keyed on disc identity; a cartridge has no
+        # entry there, so on SNES this is skipped rather than failed.
         from project_studio.discmeta import apply_hit_to_options, lookup_cue
 
         print("Looking up disc metadata (Redump / libretro / catalog)…", flush=True)
@@ -535,6 +585,54 @@ def cmd_new_project(args: argparse.Namespace) -> int:
     ir = index_new_project(root, name=opts.name, cue=opts.disc)
     print(f"[{'OK' if ir.ok else 'FAIL'}] {ir.message}")
     return 0 if ir.ok else 1
+
+
+def cmd_probe_rom(args: argparse.Namespace) -> int:
+    """Cartridge identity as JSON, for the GUI's New Project defaults.
+
+    On a terminal snesrecomp's wizard prompts for name / region / description
+    with the probed identity as each default. Studio always runs it with
+    --yes, which takes every default silently — so the GUI has to show those
+    same values *before* the run, and this is where it gets them.
+    """
+    import json as _json
+    import subprocess as _sp
+    import tempfile as _tf
+
+    from project_studio import snes_paths
+
+    rom = Path((getattr(args, "rom", None) or "").strip()).expanduser()
+    if not rom.is_file():
+        print(f"error: ROM not found: {rom}", file=sys.stderr)
+        return 2
+    probe = snes_paths.probe_rom_script(getattr(args, "root", None) or None)
+    if not probe.is_file():
+        print(f"error: probe_rom.py not found ({probe})", file=sys.stderr)
+        return 2
+
+    with _tf.TemporaryDirectory() as td:
+        out = Path(td) / "probe.json"
+        # --json-out, not stdout: the probe prints a human summary to stdout
+        # and only writes machine-readable JSON to a file.
+        r = _sp.run(
+            [sys.executable, str(probe), str(rom.resolve()), "--json-out", str(out), "--quiet"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if r.returncode != 0 or not out.is_file():
+            print(r.stderr or "probe_rom failed", file=sys.stderr)
+            return 1
+        data = _json.loads(out.read_text(encoding="utf-8"))
+
+    # Zip prefix follows the scaffolder's own slug rule, so a project made from
+    # these defaults packages under the name CI will later expect.
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(data.get("display_name") or "")).strip("-").lower()
+    data["zip_prefix"] = slug or "game"
+    data["wizard"] = snes_paths.wizard_source(getattr(args, "root", None) or None)
+    print(json.dumps(data, indent=2))
+    return 0
 
 
 def cmd_lookup_disc_meta(args: argparse.Namespace) -> int:
@@ -579,16 +677,20 @@ def _root_or_die(args: argparse.Namespace) -> Path | None:
 def cmd_git_branches(args: argparse.Namespace) -> int:
     """List game + module branch names as JSON for Studio dropdowns."""
     from project_studio.gitops import (
-        DEFAULT_PSXRECOMP_URL,
         DEFAULT_RBENGINE_URL,
         DEFAULT_RECOMP_NET_URL,
         DEFAULT_RECOMP_UI_URL,
         current_branch,
+        framework_name,
+        framework_url,
         list_branches,
         list_module_branches,
         list_remote_head_branches,
         resolve_module_dir,
     )
+
+    fw = framework_name()
+    fw_url = framework_url()
 
     def prefer_current(names: list[str], cur: str) -> list[str]:
         cur = (cur or "").strip()
@@ -599,15 +701,17 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
 
     fetch = bool(getattr(args, "fetch", False))
     root_s = (getattr(args, "root", None) or "").strip()
+    # Keyed by the live framework name, with a stable "framework" alias so the
+    # GUI reads one shape on both consoles instead of guessing the key.
     out: dict = {
         "game": [],
-        "psxrecomp": [],
+        fw: [],
         "recomp-ui": [],
         "recomp-net": [],
         "rbengine": [],
         "current": {
             "game": "",
-            "psxrecomp": "",
+            fw: "",
             "recomp-ui": "",
             "recomp-net": "",
             "rbengine": "",
@@ -619,8 +723,8 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
             print(f"error: not a directory: {root}", file=sys.stderr)
             return 2
         out["game"] = list_branches(root, remotes=True, fetch=fetch)
-        out["psxrecomp"] = list_module_branches(
-            root, "psxrecomp", remotes=True, fetch=fetch, url_fallback=DEFAULT_PSXRECOMP_URL
+        out[fw] = list_module_branches(
+            root, fw, remotes=True, fetch=fetch, url_fallback=fw_url
         )
         out["recomp-ui"] = list_module_branches(
             root, "recomp-ui", remotes=True, fetch=fetch, url_fallback=DEFAULT_RECOMP_UI_URL
@@ -644,7 +748,7 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
         cur = out["current"]
         cur["game"] = current_branch(root) or ""
         for key, path, nested in (
-            ("psxrecomp", "psxrecomp", False),
+            (fw, fw, False),
             ("recomp-ui", "recomp-ui", False),
             ("recomp-net", "lib/recomp-net", True),
             ("rbengine", "lib/retcomm-rbengine", True),
@@ -653,13 +757,13 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
             cur[key] = (current_branch(sub) or "") if sub is not None else ""
         # Put live checkouts first so dropdowns open on the active branch.
         out["game"] = prefer_current(out["game"], cur["game"])
-        out["psxrecomp"] = prefer_current(out["psxrecomp"], cur["psxrecomp"])
+        out[fw] = prefer_current(out[fw], cur[fw])
         out["recomp-ui"] = prefer_current(out["recomp-ui"], cur["recomp-ui"])
         out["recomp-net"] = prefer_current(out["recomp-net"], cur["recomp-net"])
         out["rbengine"] = prefer_current(out["rbengine"], cur["rbengine"])
     else:
         # New-project / no checkout: ls-remote default module URLs.
-        out["psxrecomp"] = list_remote_head_branches(DEFAULT_PSXRECOMP_URL)
+        out[fw] = list_remote_head_branches(fw_url)
         out["recomp-ui"] = list_remote_head_branches(DEFAULT_RECOMP_UI_URL)
         out["recomp-net"] = list_remote_head_branches(DEFAULT_RECOMP_NET_URL)
         out["rbengine"] = list_remote_head_branches(DEFAULT_RBENGINE_URL)
@@ -670,6 +774,10 @@ def cmd_git_branches(args: argparse.Namespace) -> int:
     for key in ("recomp-net", "rbengine"):
         if "(default)" not in out[key]:
             out[key] = ["(default)", *out[key]]
+
+    out["framework"] = out[fw]
+    out["framework_name"] = fw
+    out["current"]["framework"] = out["current"][fw]
 
     print(json.dumps(out, indent=2))
     return 0
@@ -695,8 +803,9 @@ def cmd_git_status(args: argparse.Namespace) -> int:
     print(f"  dirty:    {st.dirty}  (staged={st.staged} unstaged={st.unstaged} untracked={st.untracked})")
     print(f"  origin:   {st.remote_url or '(none)'}")
     print(f"  gh:       {st.gh_repo or ('available' if st.gh_available else 'missing')}")
-    if st.psxrecomp_root:
-        print(f"  psxrecomp: {st.psxrecomp_root}")
+    fw = platforms.current().framework
+    if st.framework_root:
+        print(f"  {fw}: {st.framework_root}")
     print()
     print("Submodules:")
     for s in st.submodules:
@@ -705,9 +814,9 @@ def cmd_git_status(args: argparse.Namespace) -> int:
             f"  [{mark}] {s.path:<12} branch={s.branch or '-':<16} "
             f"sha={s.sha or '-':<12} {s.url}"
         )
-    if st.nested_submodules and st.psxrecomp_root != st.root:
+    if st.nested_submodules and st.framework_root != st.root:
         print()
-        print("Nested (inside psxrecomp):")
+        print(f"Nested (inside {fw}):")
         for s in st.nested_submodules:
             mark = "OK" if s.present else "MISSING"
             print(
@@ -731,7 +840,7 @@ def cmd_git_ensure_submodules(args: argparse.Namespace) -> int:
         return 2
     results = ensure_known_submodules(
         root,
-        psxrecomp_branch=args.psxrecomp_branch,
+        framework_branch_name=args.psxrecomp_branch,
         recomp_ui_branch=args.recomp_ui_branch,
         dry_run=args.dry_run,
     )
@@ -820,9 +929,10 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
     from project_studio.gitops import (
         CmdResult,
         default_module_paths,
+        framework_name,
         switch_branch,
+        switch_framework,
         switch_modules,
-        switch_psxrecomp,
     )
 
     root = _root_or_die(args)
@@ -883,7 +993,7 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
         if psx_branch or ui_branch:
             branch_by_path = {}
             if psx_branch:
-                branch_by_path["psxrecomp"] = psx_branch
+                branch_by_path[framework_name()] = psx_branch
             if ui_branch:
                 branch_by_path["recomp-ui"] = ui_branch
             paths = list(branch_by_path.keys())
@@ -906,11 +1016,11 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
         use = psx_branch or branch
         if not use:
             print(
-                "error: --psxrecomp requires --branch or --psxrecomp-branch",
+                "error: --framework requires --branch or --framework-branch",
                 file=sys.stderr,
             )
             return 2
-        r = switch_psxrecomp(root, use, create=create, dry_run=args.dry_run)
+        r = switch_framework(root, use, create=create, dry_run=args.dry_run)
         results.append(CmdResult(r.ok, r.message, r.detail))
 
     if t["nested"]:
@@ -1149,7 +1259,7 @@ def cmd_git_bulk_switch(args: argparse.Namespace) -> int:
 
 
 def cmd_git_pull(args: argparse.Namespace) -> int:
-    from project_studio.gitops import CmdResult, pull, pull_modules, pull_psxrecomp
+    from project_studio.gitops import CmdResult, pull, pull_modules, pull_framework
 
     root = _root_or_die(args)
     if root is None:
@@ -1173,7 +1283,7 @@ def cmd_git_pull(args: argparse.Namespace) -> int:
             )
         )
     elif t["psxrecomp"]:
-        r = pull_psxrecomp(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
+        r = pull_framework(root, mode=mode, dirty=dirty, dry_run=args.dry_run)
         results.append(CmdResult(r.ok, r.message, r.detail))
     if t["nested"]:
         results.extend(
@@ -1238,7 +1348,7 @@ def cmd_git_push(args: argparse.Namespace) -> int:
         default_module_paths,
         push,
         push_modules,
-        push_psxrecomp,
+        push_framework,
     )
 
     root = _root_or_die(args)
@@ -1267,7 +1377,7 @@ def cmd_git_push(args: argparse.Namespace) -> int:
             )
         )
     elif t["psxrecomp"]:
-        r = push_psxrecomp(root, branch=branch, dry_run=args.dry_run)
+        r = push_framework(root, branch=branch, dry_run=args.dry_run)
         results.append(CmdResult(r.ok, r.message, r.detail))
     if t["nested"]:
         paths = _module_paths_from_args(args)
@@ -1374,6 +1484,17 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
+    if platforms.current().key == "snes":
+        # The script configures PSX_NETPLAY, stages OpenBIOS and builds
+        # psx-runtime. Refusing is honest; running it against a SNES tree would
+        # fail deep inside cmake with a message about none of that.
+        print(
+            "error: build mingw is a psxrecomp cross-build; there is no snesrecomp "
+            "counterpart yet. Use CI, or build natively on Windows.",
+            file=sys.stderr,
+        )
+        return 2
+
     script = _TOOLKIT / "scripts" / "build_windows_mingw.sh"
     if not script.is_file():
         print(f"error: missing {script}", file=sys.stderr)
@@ -1410,7 +1531,11 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     if getattr(args, "dry_run", False):
         cmd.append("--dry-run")
     if getattr(args, "extra", ""):
-        cmd += ["--extra", args.extra]
+        # "--extra=<value>", not two argv entries. cmake args start with '-',
+        # and argparse rejects a leading-dash value for an option that expects
+        # one argument ("expected one argument"). The '=' form is the only
+        # spelling that survives it.
+        cmd.append(f"--extra={args.extra}")
 
     print("+", " ".join(cmd), flush=True)
     r = subprocess.run(cmd, check=False)
@@ -1463,6 +1588,14 @@ def cmd_build_configure(args: argparse.Namespace) -> int:
 
 
 def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
+    if platforms.current().key == "snes":
+        print(
+            "error: ensure-bios is psxrecomp-only — a SNES cartridge has no BIOS "
+            "backend and no separate emitter build. Use `build generate` "
+            "(tools/regen.sh) instead.",
+            file=sys.stderr,
+        )
+        return 2
     from project_studio.buildops import ensure_bios_backends
 
     root = _root_or_die(args)
@@ -1480,11 +1613,26 @@ def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
 
 
 def cmd_build_generate(args: argparse.Namespace) -> int:
-    from project_studio.buildops import generate_rom_and_bios
+    from project_studio.buildops import generate_rom_and_bios, generate_snes_c
 
     root = _root_or_die(args)
     if root is None:
         return 2
+    if platforms.current().key == "snes":
+        # --disc carries the ROM path here, same single-image rule as
+        # new-project. There is no BIOS half on a cartridge.
+        r = generate_snes_c(
+            root,
+            rom=getattr(args, "disc", "") or "",
+            cfg_roots=bool(getattr(args, "cfg_roots", False)),
+            verify=not bool(getattr(args, "no_verify", False)),
+            dry_run=args.dry_run,
+            log=print,
+        )
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.detail and not r.ok:
+            print(r.detail)
+        return 0 if r.ok else 1
     r = generate_rom_and_bios(
         root,
         disc=getattr(args, "disc", "") or "",
@@ -1500,6 +1648,14 @@ def cmd_build_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_build_ensure_emitters(args: argparse.Namespace) -> int:
+    if platforms.current().key == "snes":
+        print(
+            "error: ensure-emitters is psxrecomp-only — a SNES cartridge has no BIOS "
+            "backend and no separate emitter build. Use `build generate` "
+            "(tools/regen.sh) instead.",
+            file=sys.stderr,
+        )
+        return 2
     from project_studio.buildops import ensure_emitters
 
     root = _root_or_die(args)
@@ -1518,15 +1674,16 @@ def cmd_build_ensure_emitters(args: argparse.Namespace) -> int:
 
 
 def cmd_build_compile(args: argparse.Namespace) -> int:
-    from project_studio.buildops import build
+    from project_studio.buildops import build, default_target
 
     root = _root_or_die(args)
     if root is None:
         return 2
+    target = (getattr(args, "target", None) or "").strip() or default_target(root)
     r = build(
         root,
         build_dir=args.build_dir,
-        target=args.target,
+        target=target,
         jobs=args.jobs or None,
         dry_run=args.dry_run,
         log=print,
@@ -1535,16 +1692,61 @@ def cmd_build_compile(args: argparse.Namespace) -> int:
     return 0 if r.ok else 1
 
 
+def cmd_build_package(args: argparse.Namespace) -> int:
+    """Bundle the existing local build into dist/*.zip (Studio Bundle+Export)."""
+    import json
+    from pathlib import Path
+
+    from project_studio.buildops import package_local
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+
+    def _log(line: str) -> None:
+        # Piped into Studio — must flush or activity log stalls until buffer fill.
+        print(line, flush=True)
+
+    r = package_local(
+        root,
+        build_dir=args.build_dir,
+        artifact_tag=args.tag,
+        exe=Path(args.exe) if args.exe else None,
+        use_repo_script=not args.no_repo_script,
+        dry_run=args.dry_run,
+        log=_log,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}", flush=True)
+    # Studio Bundle+Export parses the BUNDLE_ZIP line / JSON trailer.
+    zip_path = str(r.zip_path) if r.zip_path else ""
+    if r.ok and zip_path:
+        print(f"BUNDLE_ZIP={zip_path}", flush=True)
+        print(json.dumps({"ok": True, "zip": zip_path}), flush=True)
+    elif not args.dry_run:
+        print(json.dumps({"ok": False, "zip": "", "error": r.message}), flush=True)
+    return 0 if r.ok else 1
+
+
 def cmd_build_run(args: argparse.Namespace) -> int:
     import shlex
     from pathlib import Path
 
-    from project_studio.buildops import launch
+    from project_studio.buildops import launch, launch_rom_for
 
     root = _root_or_die(args)
     if root is None:
         return 2
     extra = shlex.split(args.args, posix=os.name != "nt") if args.args else []
+
+    rom, whence = launch_rom_for(root, getattr(args, "rom", None) or "")
+    if rom and whence != "explicit":
+        print(f"rom: {rom} (from {whence})", flush=True)
+    if rom:
+        rom_p = Path(rom).expanduser()
+        if not rom_p.is_file():
+            print(f"error: ROM not found: {rom_p}", file=sys.stderr)
+            return 2
+        extra.append(str(rom_p))
 
     def _log(line: str) -> None:
         # Piped into Studio — must flush or activity log stalls until buffer fill.
@@ -1596,6 +1798,118 @@ def cmd_build_status(args: argparse.Namespace) -> int:
     return 0 if exe else 1
 
 
+def _analyze_is_psx_only() -> bool:
+    """`analyze` wraps psxrecomp-analyze; there is no SNES equivalent yet."""
+    if platforms.current().key != "snes":
+        return False
+    print(
+        "error: analyze wraps psxrecomp-analyze (the Functions tab's data source); "
+        "snesrecomp's analysis runs through tools/regen.sh and recomp/*.cfg.",
+        file=sys.stderr,
+    )
+    return True
+
+
+def cmd_analyze_status(args: argparse.Namespace) -> int:
+    if _analyze_is_psx_only():
+        return 2
+    from project_studio.analyzeops import status
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    print(json.dumps(status(root), indent=2))
+    return 0
+
+
+def cmd_analyze_run(args: argparse.Namespace) -> int:
+    if _analyze_is_psx_only():
+        return 2
+    from project_studio.analyzeops import run_analysis
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    r = run_analysis(
+        root,
+        exe=getattr(args, "exe", "") or "",
+        exact=bool(getattr(args, "exact", False)),
+        with_refs=bool(getattr(args, "refs", False)),
+        emit_symbols=bool(getattr(args, "emit_symbols", False)),
+        min_confidence=getattr(args, "min_confidence", "high") or "high",
+        emit_ghidra=bool(getattr(args, "emit_ghidra", False)),
+        emit_symbol_addrs=bool(getattr(args, "emit_symbol_addrs", False)),
+        diff=not bool(getattr(args, "no_diff", False)),
+        widescreen=bool(getattr(args, "widescreen", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        log=print,
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    if r.detail and not r.ok:
+        print(r.detail)
+    return 0 if r.ok else 1
+
+
+def _parse_pc(text: str) -> int:
+    text = text.strip()
+    return int(text, 16 if text.lower().startswith("0x") else 0)
+
+
+def cmd_analyze_set_symbol(args: argparse.Namespace) -> int:
+    if _analyze_is_psx_only():
+        return 2
+    from project_studio.analyzeops import set_symbol
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    try:
+        pc = _parse_pc(args.pc)
+    except ValueError:
+        print(f"[FAIL] bad --pc {args.pc!r}")
+        return 2
+    r = set_symbol(
+        root,
+        pc,
+        args.name,
+        status_value=getattr(args, "status", "") or "",
+        note=getattr(args, "note", "") or "",
+        emit=(None if getattr(args, "emit", "") == "" else args.emit == "true"),
+    )
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    return 0 if r.ok else 1
+
+
+def cmd_analyze_clear_symbol(args: argparse.Namespace) -> int:
+    if _analyze_is_psx_only():
+        return 2
+    from project_studio.analyzeops import clear_symbol
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    try:
+        pc = _parse_pc(args.pc)
+    except ValueError:
+        print(f"[FAIL] bad --pc {args.pc!r}")
+        return 2
+    r = clear_symbol(root, pc)
+    print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+    return 0 if r.ok else 1
+
+
+def cmd_analyze_symbols(args: argparse.Namespace) -> int:
+    if _analyze_is_psx_only():
+        return 2
+    from project_studio.analyzeops import read_symbols
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    print(json.dumps({"symbols": read_symbols(root)}, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="migrate_project",
@@ -1605,6 +1919,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    # Global, not per-command: the platform decides which repo index, which
+    # framework submodule and which scaffolder every subcommand reaches for, so
+    # it has to be resolved before the subparser runs rather than threaded
+    # through each one. Defaults to psx so every pre-SNES invocation is
+    # byte-for-byte unchanged.
+    ap.add_argument(
+        "--platform",
+        choices=list(platforms.KEYS),
+        default=platforms.DEFAULT_KEY,
+        help="Console this session works on (default: psx)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_root(p: argparse.ArgumentParser, required: bool = True) -> None:
@@ -1681,11 +2006,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_rr.add_argument("--path", required=True)
     p_rr.add_argument("--json", action="store_true", default=True)
     p_rr.set_defaults(func=cmd_repos_remove)
-    p_rsc = repos_sub.add_parser("set-cue", help="Set .cue for an indexed repo")
+    p_rsc = repos_sub.add_parser(
+        "set-cue", help="Set the game image (.cue / ROM) for an indexed repo"
+    )
     p_rsc.add_argument("--path", required=True)
-    p_rsc.add_argument("--cue", required=True)
+    # Not argparse-required: --rom is a second action on the same dest, and
+    # argparse enforces required per action, so --rom alone would still fail.
+    # cmd_repos_set_cue reports a missing image in the platform's own words.
+    p_rsc.add_argument("--cue", default="")
+    # --rom for the same reason new-project takes one: a cartridge has no cue,
+    # and the flag that reads wrong is the flag that gets left unset.
+    p_rsc.add_argument("--rom", dest="cue", help="Alias for --cue (SNES)")
     p_rsc.add_argument("--json", action="store_true", default=True)
     p_rsc.set_defaults(func=cmd_repos_set_cue)
+    p_rcc = repos_sub.add_parser(
+        "clear-cue", help="Forget the game image recorded for an indexed repo"
+    )
+    p_rcc.add_argument("--path", required=True)
+    p_rcc.add_argument("--json", action="store_true", default=True)
+    p_rcc.set_defaults(func=cmd_repos_clear_cue)
     p_rsl = repos_sub.add_parser("set-last", help="Remember last-selected repo")
     p_rsl.add_argument("--path", required=True)
     p_rsl.add_argument("--json", action="store_true", default=True)
@@ -1736,7 +2075,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run setup_project.sh/.ps1 (OS-routed) then index the new repo",
     )
     p_np.add_argument("--name", required=True, help="Project folder / display name")
-    p_np.add_argument("--disc", required=True, help="Redump .cue path")
+    # Not argparse-required: --rom is a second action on the same dest, and
+    # argparse enforces required per action, so --rom alone would still fail.
+    # validate_options() reports the missing image with a platform-correct name.
+    p_np.add_argument(
+        "--disc",
+        default="",
+        help="Game image: Redump .cue (psx) or ROM .sfc/.smc (snes)",
+    )
+    # --rom reads better for a cartridge and writes the same field. One field,
+    # because a project has one game image and two would let them disagree.
+    p_np.add_argument("--rom", dest="disc", help="Alias for --disc (SNES)")
     p_np.add_argument(
         "--dir",
         default=".",
@@ -1751,7 +2100,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument("--description", default="")
     p_np.add_argument("--publisher", default="")
     p_np.add_argument("--year", default="")
-    p_np.add_argument("--region", default="USA")
+    # No default here: "USA" is a PSX habit, and on SNES an unset region means
+    # "use the cartridge header", which is a better answer than any guess.
+    # cmd_new_project restores the PSX default.
+    p_np.add_argument("--region", default="")
     p_np.add_argument("--lobby-url", default="netplay.retcomm.net")
     p_np.add_argument("--no-recomp-ui", action="store_true")
     p_np.add_argument("--no-wizard", action="store_true")
@@ -1767,7 +2119,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("private", "public", "internal"),
         default="private",
     )
-    p_np.add_argument("--psxrecomp-ref", default="master")
+    p_np.add_argument("--psxrecomp-ref", "--framework-ref", dest="psxrecomp_ref",
+                      default="master")
+    p_np.add_argument("--snesrecomp-ref", default="main")
+    p_np.add_argument(
+        "--multitap",
+        choices=("port1", "port2", "both", "off"),
+        default="",
+        help="SNES: override the seat-count-derived tap layout",
+    )
+    p_np.add_argument(
+        "--enable-rollback",
+        action="store_true",
+        help="SNES: build retcomm-rbengine in (implies netplay)",
+    )
     p_np.add_argument("--recomp-ui-ref", default="master")
     p_np.add_argument("--recomp-net-ref", default="")
     p_np.add_argument("--rbengine-ref", default="")
@@ -1778,6 +2143,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fill empty players/description/publisher/year/region from disc digests",
     )
     p_np.set_defaults(func=cmd_new_project)
+
+    p_pr = sub.add_parser(
+        "probe-rom",
+        help="SNES cartridge identity as JSON (New Project defaults)",
+    )
+    p_pr.add_argument("--rom", required=True, help="Path to a .sfc / .smc ROM")
+    p_pr.add_argument(
+        "--root",
+        default="",
+        help="Project whose snesrecomp/ checkout should supply the probe",
+    )
+    p_pr.set_defaults(func=cmd_probe_rom)
 
     p_meta = sub.add_parser(
         "lookup-disc-meta",
@@ -1824,7 +2201,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_ge = git_sub.add_parser("ensure-submodules", help="Add psxrecomp + recomp-ui")
     add_git_root(p_ge)
-    p_ge.add_argument("--psxrecomp-branch", default="master")
+    # --framework-branch is the platform-neutral spelling the GUI emits;
+    # --psxrecomp-branch stays as an alias so existing scripts keep working.
+    p_ge.add_argument(
+        "--psxrecomp-branch", "--framework-branch", dest="psxrecomp_branch", default=""
+    )
     p_ge.add_argument("--recomp-ui-branch", default="master")
     p_ge.set_defaults(func=cmd_git_ensure_submodules)
 
@@ -1887,11 +2268,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gsw.add_argument(
         "--psxrecomp",
+        "--framework",
+        dest="psxrecomp",
         action="store_true",
         help="Switch the psxrecomp checkout itself",
     )
     p_gsw.add_argument(
         "--psxrecomp-branch",
+        "--framework-branch",
+        dest="psxrecomp_branch",
         default="",
         help="psxrecomp branch (with --modules or --psxrecomp)",
     )
@@ -1985,6 +2370,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gpull.add_argument(
         "--psxrecomp",
+        "--framework",
+        dest="psxrecomp",
         action="store_true",
         help="Pull the psxrecomp checkout itself",
     )
@@ -2057,6 +2444,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gpush.add_argument(
         "--psxrecomp",
+        "--framework",
+        dest="psxrecomp",
         action="store_true",
         help="Push the psxrecomp checkout itself",
     )
@@ -2092,6 +2481,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument(
             "--psxrecomp",
+        "--framework",
+        dest="psxrecomp",
             action="store_true",
             help="Operate on the psxrecomp checkout",
         )
@@ -2156,6 +2547,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gbsw.add_argument(
         "--psxrecomp-branch",
+        "--framework-branch",
+        dest="psxrecomp_branch",
         default="",
         help="psxrecomp branch (with --modules or --psxrecomp)",
     )
@@ -2305,15 +2698,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Host ensure-emitters / ensure-bios / generate before cross-build",
     )
     p_bm.add_argument("--jobs", type=int, default=0)
-    p_bm.add_argument("--extra", default="", help="Extra cmake -D args (one shell string)")
+    p_bm.add_argument(
+        "--extra",
+        default="",
+        help="Extra cmake -D args, one shell string. Spell it --extra=-DFOO=ON: "
+        "a leading-dash value after a space is parsed as an option, not a value.",
+    )
     p_bm.add_argument("--dry-run", action="store_true")
     p_bm.set_defaults(func=cmd_build_mingw)
 
     p_bc = build_sub.add_parser("configure", help="cmake -S . -B <dir>")
     add_build_root(p_bc)
     p_bc.add_argument("--build-type", default="Release")
-    p_bc.add_argument("--generator", default=None, help="Empty = auto")
-    p_bc.add_argument("--extra", default="", help="Extra cmake args (shell-quoted)")
+    p_bc.add_argument(
+        "--generator",
+        default=None,
+        help="Ninja / 'Unix Makefiles' / Auto (empty: reuse CMakeCache, else Ninja if available)",
+    )
+    p_bc.add_argument(
+        "--extra",
+        default="",
+        help="Extra cmake args, shell-quoted. Spell it --extra=-DPSX_DEBUG_TOOLS=ON: "
+        "a leading-dash value after a space is parsed as an option, not a value.",
+    )
     p_bc.add_argument(
         "--skip-bios",
         action="store_true",
@@ -2358,6 +2765,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip BIOS regen when backends already exist",
     )
+    p_bg.add_argument("--rom", dest="disc", help="Alias for --disc (SNES)")
+    p_bg.add_argument(
+        "--cfg-roots",
+        action="store_true",
+        help="SNES: seed analysis from every func declaration in recomp/*.cfg",
+    )
+    p_bg.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="SNES: skip regen.sh's ROM digest check",
+    )
     p_bg.set_defaults(func=cmd_build_generate)
 
     p_bee = build_sub.add_parser(
@@ -2374,9 +2792,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bb = build_sub.add_parser("compile", help="cmake --build (alias: build)")
     add_build_root(p_bb)
-    p_bb.add_argument("--target", default="psx-runtime")
+    # Empty = ask buildops, which reads project() for SNES. A literal default
+    # here would silently build the wrong (or no) target on a cartridge port.
+    p_bb.add_argument("--target", default="")
     p_bb.add_argument("--jobs", type=int, default=0)
     p_bb.set_defaults(func=cmd_build_compile)
+
+    p_bp = build_sub.add_parser(
+        "package",
+        help="Bundle the existing local build into dist/<prefix>-<ver>-<tag>.zip",
+    )
+    add_build_root(p_bp)
+    p_bp.add_argument(
+        "--tag",
+        default="",
+        help="Artifact tag (default: host, e.g. linux-x64 / windows-x64)",
+    )
+    p_bp.add_argument("--exe", default="", help="Override executable to package")
+    p_bp.add_argument(
+        "--no-repo-script",
+        action="store_true",
+        help="Ignore scripts/package_release.sh and use the built-in stager",
+    )
+    p_bp.set_defaults(func=cmd_build_package)
 
     p_br = build_sub.add_parser("run", help="Launch product binary with env")
     add_build_root(p_br)
@@ -2387,6 +2825,11 @@ def build_parser() -> argparse.ArgumentParser:
         help='Env pairs, e.g. \'RBE_CROSS_OS_PACING_DIAG=1 FOO="bar baz"\'',
     )
     p_br.add_argument("--args", default="", help="Extra CLI args for the game")
+    p_br.add_argument(
+        "--rom",
+        default="",
+        help="SNES: ROM to run (default: the one recorded for this repo)",
+    )
     p_br.set_defaults(func=cmd_build_run)
 
     p_bs = build_sub.add_parser("stop", help="Stop Studio-launched process")
@@ -2396,12 +2839,57 @@ def build_parser() -> argparse.ArgumentParser:
     add_build_root(p_bst)
     p_bst.set_defaults(func=cmd_build_status)
 
+    # ---- analyze: static function discovery (Functions tab) -----------------
+    ana = sub.add_parser("analyze", help="Static function discovery / symbols")
+    ana_sub = ana.add_subparsers(dest="analyze_cmd", required=True)
+
+    p_as = ana_sub.add_parser("status", help="Analysis + symbols presence (JSON)")
+    p_as.add_argument("--root", required=True)
+    p_as.set_defaults(func=cmd_analyze_status)
+
+    p_ar = ana_sub.add_parser("run", help="Analyze the boot EXE (no runtime input)")
+    p_ar.add_argument("--root", required=True)
+    p_ar.add_argument("--dry-run", action="store_true")
+    p_ar.add_argument("--exe", default="", help="Override the boot EXE path")
+    p_ar.add_argument("--exact", action="store_true", help="Reachability-only partition")
+    p_ar.add_argument("--refs", action="store_true", help="Also write refs.json")
+    p_ar.add_argument("--no-diff", action="store_true", help="Skip the previous-run diff")
+    p_ar.add_argument("--emit-symbols", action="store_true")
+    p_ar.add_argument("--min-confidence", default="high")
+    p_ar.add_argument("--emit-ghidra", action="store_true")
+    p_ar.add_argument(
+        "--widescreen", action="store_true", help="also scan [widescreen.cull] sites"
+    )
+    p_ar.add_argument("--emit-symbol-addrs", action="store_true")
+    p_ar.set_defaults(func=cmd_analyze_run)
+
+    p_asy = ana_sub.add_parser("symbols", help="Current symbols.toml entries (JSON)")
+    p_asy.add_argument("--root", required=True)
+    p_asy.set_defaults(func=cmd_analyze_symbols)
+
+    p_ass = ana_sub.add_parser("set-symbol", help="Name one function in symbols.toml")
+    p_ass.add_argument("--root", required=True)
+    p_ass.add_argument("--pc", required=True)
+    p_ass.add_argument("--name", required=True)
+    p_ass.add_argument("--status", default="", help="guessed|confirmed|hot")
+    p_ass.add_argument("--note", default="")
+    p_ass.add_argument("--emit", default="", choices=["", "true", "false"])
+    p_ass.set_defaults(func=cmd_analyze_set_symbol)
+
+    p_acs = ana_sub.add_parser("clear-symbol", help="Remove one symbols.toml entry")
+    p_acs.add_argument("--root", required=True)
+    p_acs.add_argument("--pc", required=True)
+    p_acs.set_defaults(func=cmd_analyze_clear_symbol)
+
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
+    # Publish the choice before any ops module is imported and asked which
+    # framework it is looking at.
+    platforms.set_current(getattr(args, "platform", None))
     return int(args.func(args))
 
 

@@ -15,18 +15,20 @@ from .gitops import (
     CmdResult,
     commit_all,
     commit_modules,
+    framework_branch,
+    framework_name,
     install_and_push_release_ci,
     pull,
+    pull_framework,
     pull_modules,
-    pull_psxrecomp,
     push,
+    push_framework,
     push_modules,
-    push_psxrecomp,
     repo_status,
     run_release_workflow,
     switch_branch,
+    switch_framework,
     switch_modules,
-    switch_psxrecomp,
 )
 from .repo_index import RepoEntry, RepoIndex, load_index
 
@@ -256,7 +258,7 @@ def bulk_pull(
             ):
                 out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if psxrecomp:
-            r = pull_psxrecomp(root, mode=mode, dirty=dirty, dry_run=dry_run)
+            r = pull_framework(root, mode=mode, dirty=dirty, dry_run=dry_run)
             out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if nested:
             for r in pull_modules(
@@ -291,7 +293,7 @@ def bulk_push(
             for r in push_modules(root, nested=False, dry_run=dry_run):
                 out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if psxrecomp:
-            r = push_psxrecomp(root, dry_run=dry_run)
+            r = push_framework(root, dry_run=dry_run)
             out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         if nested:
             for r in push_modules(root, nested=True, dry_run=dry_run):
@@ -397,7 +399,7 @@ def bulk_switch(
         if modules:
             branch_by_path: dict[str, str] = {}
             if psxrecomp_branch:
-                branch_by_path["psxrecomp"] = psxrecomp_branch
+                branch_by_path[framework_name()] = psxrecomp_branch
             if recomp_ui_branch:
                 branch_by_path["recomp-ui"] = recomp_ui_branch
             paths = list(branch_by_path.keys()) or None
@@ -412,7 +414,7 @@ def bulk_switch(
             ):
                 out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
         elif psxrecomp:
-            r = switch_psxrecomp(
+            r = switch_framework(
                 root, psxrecomp_branch, create=create, dry_run=dry_run
             )
             out.append(CmdResult(r.ok, f"{label}: {r.message}", r.detail))
@@ -421,18 +423,18 @@ def bulk_switch(
                     current_branch,
                     is_default_branch_token,
                     resolve_default_branch,
-                    resolve_psxrecomp_dir,
+                    resolve_framework_dir,
                     set_submodule_branch,
                 )
 
                 actual = psxrecomp_branch
-                psx = resolve_psxrecomp_dir(root)
+                psx = resolve_framework_dir(root)
                 if psx is not None and not dry_run:
                     actual = current_branch(psx) or actual
                 if is_default_branch_token(actual) and psx is not None:
-                    actual = resolve_default_branch(psx) or "master"
+                    actual = resolve_default_branch(psx) or framework_branch()
                 tr = set_submodule_branch(
-                    root, "psxrecomp", actual, dry_run=dry_run
+                    root, framework_name(), actual, dry_run=dry_run
                 )
                 out.append(CmdResult(tr.ok, f"{label}: {tr.message}", tr.detail))
         if nested:

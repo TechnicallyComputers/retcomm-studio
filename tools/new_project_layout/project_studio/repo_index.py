@@ -3,11 +3,34 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import os
+import re
+import shlex
+import zlib
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from . import platforms
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _TOOLKIT = Path(__file__).resolve().parent.parent
-DEFAULT_INDEX_PATH = _TOOLKIT / "project_studio_repos.json"
+# Kept for callers that predate the platform split; new code asks
+# default_index_path() so a SNES session never writes the PSX index.
+DEFAULT_INDEX_PATH = _TOOLKIT / platforms.PSX.repo_index_file
+
+
+def default_index_path(platform: str | None = None) -> Path:
+    """Index file for `platform` (default: this process's platform).
+
+    One file per console rather than one file with a platform column: the two
+    lists are edited by different sessions, and a shared file would have every
+    SNES add rewrite the PSX list it never read.
+    """
+    profile = platforms.get(platform) if platform else platforms.current()
+    return _TOOLKIT / profile.repo_index_file
 
 
 @dataclass
@@ -55,7 +78,7 @@ class RepoEntry:
 class RepoIndex:
     repos: list[RepoEntry]
     last: str = ""
-    path: Path = DEFAULT_INDEX_PATH
+    path: Path = field(default_factory=default_index_path)
     log_height: int = 160  # Studio activity-log pane height (px)
     catalog_only: bool = False  # Filter Game-repo dropdown to catalog titles
     bulk_jobs: int = 2  # Parallel workers for Bulk tab (1–4)
@@ -176,21 +199,194 @@ def discover_cue(root: Path) -> str:
     return ""
 
 
+ROM_EXTS: tuple[str, ...] = ("*.sfc", "*.smc")
+ROM_DIRS_ENV = "RETCOMM_SNES_ROM_DIRS"
+# A headered SNES dump tops out well under this; the cap only exists so a
+# stray same-named file cannot cost a multi-gigabyte read to reject.
+_MAX_ROM_BYTES = 16 * 1024 * 1024
+
+# `for cand in "A.sfc" "B.sfc"; do` — the only place a scaffolded repo records
+# what its ROM is *called*. The wizard writes it; nothing writes where it lives.
+_REGEN_CANDS_RE = re.compile(r"^\s*for\s+cand\s+in\s+(.+?);\s*do\s*$", re.MULTILINE)
+_REGEN_CRC32_RE = re.compile(
+    r'EXPECTED_CRC32="?\$\{SNESRECOMP_EXPECTED_CRC32:-([0-9a-fA-F]+)'
+)
+
+
+def _regen_text(root: Path) -> str:
+    regen = root / "tools" / "regen.sh"
+    if not regen.is_file():
+        return ""
+    try:
+        return regen.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def regen_rom_names(root: Path) -> list[str]:
+    """ROM filenames ``tools/regen.sh`` will accept, in its own order."""
+    m = _REGEN_CANDS_RE.search(_regen_text(root))
+    if not m:
+        return []
+    try:
+        names = shlex.split(m.group(1))
+    except ValueError:
+        return []
+    out: list[str] = []
+    for n in names:
+        n = n.strip()
+        # Only literals: an unexpanded $VAR names no file, and guessing at one
+        # is exactly the habit this module refuses.
+        if n and "$" not in n and n not in out:
+            out.append(n)
+    return out
+
+
+def regen_expected_crc32(root: Path) -> str:
+    m = _REGEN_CRC32_RE.search(_regen_text(root))
+    return m.group(1).lower() if m else ""
+
+
+def _crc32_of(path: Path) -> str:
+    try:
+        if path.stat().st_size > _MAX_ROM_BYTES:
+            return ""
+        crc = 0
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                crc = zlib.crc32(chunk, crc)
+    except OSError:
+        return ""
+    return f"{crc & 0xFFFFFFFF:08x}"
+
+
+def rom_library_dirs() -> list[Path]:
+    """Directories the user keeps dumps in (``RETCOMM_SNES_ROM_DIRS``)."""
+    raw = os.environ.get(ROM_DIRS_ENV) or ""
+    out: list[Path] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            d = Path(part).expanduser().resolve()
+        except OSError:
+            continue
+        if d.is_dir() and d not in out:
+            out.append(d)
+    return out
+
+
+def discover_rom(root: Path, extra_dirs: "Sequence[Path | str]" = ()) -> str:
+    """Best-effort SNES ROM path for a title repo.
+
+    The ROM is never committed (snesrecomp's scaffold gitignores *.sfc/*.smc)
+    and the wizard never records where the copy it was run against lives, so
+    the repo alone is usually not enough. Three sources, in falling order of
+    how directly they were stated:
+
+      1. ``SNESRECOMP_ROM`` — the same variable ``regen.sh`` itself honours.
+      2. A dump parked in the working tree (root, ``rom/``, ``roms/``).
+      3. A file named by ``tools/regen.sh`` sitting in a known ROM directory —
+         ``RETCOMM_SNES_ROM_DIRS`` or a directory another indexed title's ROM
+         was already found in.
+
+    Source 3 is only accepted when its CRC32 matches the digest this port was
+    pinned to. A matching name in a library folder is a guess; a matching
+    digest is the ROM. Finding nothing stays a normal outcome, not a failure.
+    """
+    root = root.expanduser().resolve()
+
+    env = (os.environ.get("SNESRECOMP_ROM") or "").strip()
+    if env:
+        p = Path(env).expanduser()
+        if p.is_file():
+            try:
+                return str(p.resolve())
+            except OSError:
+                return str(p)
+
+    for sub in (root, root / "rom", root / "roms"):
+        if not sub.is_dir():
+            continue
+        hits = sorted(
+            [p for ext in ROM_EXTS for p in sub.glob(ext)],
+            key=lambda p: p.name.lower(),
+        )
+        if hits:
+            return str(hits[0].resolve())
+
+    names = regen_rom_names(root)
+    if not names:
+        return ""
+    want = regen_expected_crc32(root)
+    seen: set[Path] = set()
+    dirs: list[Path] = []
+    for d in list(extra_dirs) + list(rom_library_dirs()):
+        try:
+            dp = Path(str(d)).expanduser().resolve()
+        except OSError:
+            continue
+        if dp in seen or not dp.is_dir():
+            continue
+        seen.add(dp)
+        dirs.append(dp)
+    for d in dirs:
+        for name in names:
+            cand = d / name
+            if not cand.is_file():
+                continue
+            # No pinned digest means nothing here can prove the match, and a
+            # wrong ROM regenerates wrong C. Name alone is not enough.
+            if not want or _crc32_of(cand) != want:
+                continue
+            return str(cand)
+    return ""
+
+
+def discover_image(root: Path, extra_dirs: "Sequence[Path | str]" = ()) -> str:
+    """Platform-appropriate game image: .cue for PSX, ROM for SNES."""
+    if platforms.current().image_kind == "rom":
+        return discover_rom(root, extra_dirs)
+    return discover_cue(root)
+
+
 def looks_like_game_repo(root: Path) -> bool:
+    """Does `root` look like a port for this process's platform?
+
+    Deliberately platform-scoped: adding a PSX repo to the SNES index would
+    hand every later Bulk/Build op a tree whose framework it cannot find, and
+    the failure would surface as a confusing git error rather than "wrong
+    list".
+    """
     root = root.expanduser().resolve()
     if not root.is_dir():
+        return False
+    profile = platforms.current()
+    if profile.key == "snes":
+        if not (root / "CMakeLists.txt").is_file():
+            return False
+        # A SNES port has no game.toml. Its identity is the framework checkout
+        # plus the per-title analysis config the recompiler consumes.
+        if (root / profile.framework).exists():
+            return True
+        recomp = root / "recomp"
+        if recomp.is_dir() and (
+            (recomp / "symbols.toml").is_file() or any(recomp.glob("bank*.cfg"))
+        ):
+            return True
         return False
     if (root / "game.toml").is_file():
         return True
     if (root / "CMakeLists.txt").is_file() and (
-        (root / "psxrecomp").exists() or (root / "runtime").exists()
+        (root / profile.framework).exists() or (root / "runtime").exists()
     ):
         return True
     return False
 
 
 def load_index(path: Path | None = None) -> RepoIndex:
-    path = path or DEFAULT_INDEX_PATH
+    path = path or default_index_path()
     if not path.is_file():
         return RepoIndex(
             repos=[], last="", path=path, log_height=160, catalog_only=False, bulk_jobs=2
@@ -238,9 +434,23 @@ def load_index(path: Path | None = None) -> RepoIndex:
                 cue = str(cue_p.resolve())
             except OSError:
                 pass
-        elif root_p.is_dir():
-            cue = discover_cue(root_p)
         repos.append(RepoEntry(path=key, name=name, cue=cue, build=build))
+    # Discovery runs in a second pass so every image the index already states
+    # can serve as a search directory for the entries that state none — one
+    # title pointed at your ROM folder is enough to find the rest.
+    known_dirs: list[Path] = []
+    for entry in repos:
+        if not entry.cue:
+            continue
+        d = Path(entry.cue).parent
+        if d not in known_dirs:
+            known_dirs.append(d)
+    for entry in repos:
+        if entry.cue:
+            continue
+        root_p = Path(entry.path)
+        if root_p.is_dir():
+            entry.cue = discover_image(root_p, known_dirs)
     last = str(data.get("last") or "").strip()
     if last:
         try:
@@ -277,7 +487,7 @@ def load_index(path: Path | None = None) -> RepoIndex:
 
 
 def save_index(index: RepoIndex) -> None:
-    path = index.path or DEFAULT_INDEX_PATH
+    path = index.path or default_index_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(index.to_dict(), indent=2, sort_keys=False) + "\n",
@@ -301,7 +511,11 @@ def add_repo(
         except OSError:
             cue_s = str(cue).strip()
     else:
-        cue_s = discover_cue(root)
+        # discover_image, not discover_cue: a SNES add that fell through to the
+        # PSX-only probe recorded nothing and looked like "no ROM exists".
+        cue_s = discover_image(
+            root, [Path(e.cue).parent for e in index.repos if e.cue]
+        )
     for existing in index.repos:
         if existing.path == key:
             if name and name != existing.name:

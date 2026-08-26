@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Single source of truth for the Beetle PSX (mednafen-psx libretro) oracle pin.",
+    "beetle_oracle.py reads this. Bump upstream_base only together with",
+    "regenerated hook patches:  cd <checkout> && git diff <new base> -- <file> ...",
+    "",
+    "Upstream master was converted from C++ to plain C (libretro.cpp -> libretro.c,",
+    "PS_CPU class dropped) after this commit, and no longer compiles against",
+    "runtime/src/beetle_libretro.cpp. This is the last C++-tree base we target."
+  ],
+  "upstream_url": "https://github.com/libretro/beetle-psx-libretro.git",
+  "upstream_base": "5759277be50052b9f3f388578bf56cc7899d833f",
+  "upstream_base_subject": "Beetle PSX libretro: audit pass - exceptions, leaks, hardening, dead code",
+  "patches": [
+    "beetle_cdcmd_trace_hook.patch",
+    "beetle_sio_trace_hook.patch",
+    "beetle_wtrace_hook.patch"
+  ],
+  "oracle_port": 4380,
+  "bios": {
+    "expects": "scph5501.bin",
+    "sha1_prefix": "0555c6fa",
+    "note": "mednafen-psx looks for a lowercase per-region BIOS filename in the BIOS directory. Only the prefix is recorded: psxrecomp/docs/beetle-linux.md gives '0555C6FA...' truncated, and the full digest has NOT been verified against a dump here. Verify and complete before gating on it."
+  }
+}

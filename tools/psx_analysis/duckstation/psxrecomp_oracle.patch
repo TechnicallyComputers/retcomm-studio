@@ -1,0 +1,1863 @@
+diff --git a/src/common/log_channels.h b/src/common/log_channels.h
+index a1576e73..6dfdb45e 100644
+--- a/src/common/log_channels.h
++++ b/src/common/log_channels.h
+@@ -47,6 +47,7 @@
+   X(PerfMon)                                                                                                           \
+   X(PlatformMisc)                                                                                                      \
+   X(PostProcessing)                                                                                                    \
++  X(PSXRecompDebug)                                                                                                    \
+   X(PIO)                                                                                                               \
+   X(ReShadeFXShader)                                                                                                   \
+   X(Recompiler)                                                                                                        \
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index e2d0294b..b290bd35 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -116,6 +116,8 @@ add_library(core
+   playstation_mouse.h
+   psf_loader.cpp
+   psf_loader.h
++  psxrecomp_debug_server.cpp
++  psxrecomp_debug_server.h
+   save_state_version.h
+   settings.cpp
+   settings.h
+diff --git a/src/core/cdrom.cpp b/src/core/cdrom.cpp
+index c36b9341..39f7c5b9 100644
+--- a/src/core/cdrom.cpp
++++ b/src/core/cdrom.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "cdrom.h"
++#include "psxrecomp_debug_server.h"
+ #include "cdrom_async_reader.h"
+ #include "cdrom_subq_replacement.h"
+ #include "dma.h"
+@@ -395,6 +396,9 @@ struct SectorBuffer
+   FixedHeapArray<u8, RAW_SECTOR_OUTPUT_SIZE> data;
+   u32 position;
+   u32 size;
++  // PSXRecomp oracle: which sector these bytes came from, so a DMA drain can
++  // be attributed to an LBA the same way psx-runtime's cd_read_log does.
++  s32 lba;
+ };
+ 
+ struct CDROMState
+@@ -1345,6 +1349,12 @@ void CDROM::DMARead(u32* words, u32 word_count)
+   CheckForSectorBufferReadComplete();
+ }
+ 
++s32 CDROM::GetCurrentReadBufferLBA()
++{
++  const SectorBuffer& sb = s_state.sector_buffers[s_state.current_read_sector_buffer];
++  return (sb.size > 0) ? sb.lba : -1;
++}
++
+ bool CDROM::HasPendingCommand()
+ {
+   return s_state.command != Command::None;
+@@ -1371,12 +1381,16 @@ void CDROM::SetAsyncInterrupt(Interrupt interrupt)
+   if (s_state.interrupt_flag_register == static_cast<u8>(interrupt))
+   {
+     DEV_LOG("Not setting async interrupt {} because there is already one unacknowledged", static_cast<u8>(interrupt));
++    if (interrupt == Interrupt::DataReady)
++      PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_DROPPED);
+     s_state.async_response_fifo.Clear();
+     return;
+   }
+ 
+   Assert(s_state.pending_async_interrupt == 0);
+   s_state.pending_async_interrupt = static_cast<u8>(interrupt);
++  if (interrupt == Interrupt::DataReady)
++    PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_QUEUED);
+   if (!HasPendingInterrupt())
+   {
+     // Pending interrupt should block INT1 from going through. But pending command needs to as well, for games like
+@@ -1442,7 +1456,10 @@ void CDROM::DeliverAsyncInterrupt(void*, TickCount ticks, TickCount ticks_late)
+ 
+     // This is the HC05 setting the read position from the decoder.
+     if (s_state.pending_async_interrupt == static_cast<u8>(Interrupt::DataReady))
++    {
+       s_state.current_read_sector_buffer = s_state.current_write_sector_buffer;
++      PSXRecompDebug::FlagCdSectorDelivered(s_state.current_read_sector_buffer);
++    }
+ 
+     s_state.response_fifo.Clear();
+     s_state.response_fifo.PushFromQueue(&s_state.async_response_fifo);
+@@ -1850,6 +1867,17 @@ void CDROM::ExecuteCommand(void*, TickCount ticks, TickCount ticks_late)
+     s_state.response_fifo.Clear();
+   }
+ 
++  // PSXRecomp oracle: record the command with its original params before the
++  // handlers consume the FIFO, mirroring psx-runtime's cdrom_command_history.
++  {
++    u8 rec_params[8];
++    u32 rec_n = 0;
++    const u32 fifo_n = s_state.param_fifo.GetSize();
++    for (u32 i = 0; i < fifo_n && rec_n < 8; i++)
++      rec_params[rec_n++] = s_state.param_fifo.Peek(i);
++    PSXRecompDebug::RecordCdCommand(static_cast<u8>(s_state.command), rec_params, rec_n);
++  }
++
+   // Stop command event first, reduces our chances of ending up with out-of-order events.
+   s_state.command_event.Deactivate();
+ 
+@@ -3495,7 +3523,9 @@ ALWAYS_INLINE_RELEASE void CDROM::ProcessDataSector(const u8* raw_sector, const
+   }
+ 
+   sb->position = 0;
++  sb->lba = static_cast<s32>(s_state.current_lba);
+   s_state.current_write_sector_buffer = sb_num;
++  PSXRecompDebug::RecordCdSector(sb->lba, sb_num);
+ 
+   // Deliver to CPU
+   if (HasPendingAsyncInterrupt())
+@@ -4001,6 +4031,7 @@ void CDROM::CheckForSectorBufferReadComplete()
+   // Buffer complete?
+   if (sb.position >= sb.size)
+   {
++    PSXRecompDebug::FlagCdSectorDrained();
+     sb.position = 0;
+     sb.size = 0;
+   }
+@@ -4014,6 +4045,7 @@ void CDROM::CheckForSectorBufferReadComplete()
+   if (next_sb.position == 0 && next_sb.size > 0 && !HasPendingAsyncInterrupt() && IsReading())
+   {
+     DEV_LOG("Sending additional INT1 for missed sector in buffer {}", s_state.current_write_sector_buffer);
++    PSXRecompDebug::FlagCdSector(s_state.current_write_sector_buffer, PSXRecompDebug::CDSE_REDELIVERED);
+     s_state.async_response_fifo.Push(s_state.secondary_status.bits);
+     s_state.pending_async_interrupt = static_cast<u8>(Interrupt::DataReady);
+     s_state.async_interrupt_event.Schedule(
+diff --git a/src/core/cdrom.h b/src/core/cdrom.h
+index 02f27f5e..108043bf 100644
+--- a/src/core/cdrom.h
++++ b/src/core/cdrom.h
+@@ -42,6 +42,8 @@ void CPUClockChanged();
+ u8 ReadRegister(u32 offset);
+ void WriteRegister(u32 offset, u8 value);
+ void DMARead(u32* words, u32 word_count);
++/// PSXRecomp oracle: LBA of the sector currently being drained, or -1.
++s32 GetCurrentReadBufferLBA();
+ 
+ // Render statistics debug window.
+ void DrawDebugWindow(float scale);
+diff --git a/src/core/cpu_core.cpp b/src/core/cpu_core.cpp
+index c78acbf3..d991249e 100644
+--- a/src/core/cpu_core.cpp
++++ b/src/core/cpu_core.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: CC-BY-NC-ND-4.0
+ 
+ #include "cpu_core.h"
++#include "psxrecomp_debug_server.h"
+ #include "bus.h"
+ #include "cpu_code_cache_private.h"
+ #include "cpu_core_private.h"
+@@ -3576,8 +3577,26 @@ bool CPU::ReadMemoryWord(VirtualMemoryAddress addr, u32* value)
+   return true;
+ }
+ 
++// Fold guest stores into the cross-emulator fingerprint.
++//
++// Hooked here rather than at the sb/sh/sw cases so swl/swr/sc are covered too --
++// every store instruction funnels through these three.
++//
++// The value is truncated to the WIDTH ACTUALLY WRITTEN before hashing, because
++// that is what psxrecomp's memory.c passes to fp_record_write (it hands over the
++// u8/u16/u32 it is about to store, zero-extended). Hashing the untruncated
++// register here would make every byte store disagree, and every frame would
++// then "diverge" for a reason that has nothing to do with the emulators.
++//
++// NOTE: this sees CPU stores only. DMA-written RAM does not pass through here.
++// Compare `wc` (write counts) between the two sides before trusting `wr` -- if
++// the counts do not track, the two are not observing the same set of writes and
++// the hashes are not comparable. See tools/fingerprint_diff.py.
+ bool CPU::WriteMemoryByte(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value & 0xFFu, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::Byte, addr, value);
+ 
+   GetMemoryWriteHandler(addr, MemoryAccessSize::Byte)(addr, value);
+@@ -3593,6 +3612,9 @@ bool CPU::WriteMemoryByte(VirtualMemoryAddress addr, u32 value)
+ 
+ bool CPU::WriteMemoryHalfWord(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value & 0xFFFFu, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::HalfWord, addr, value);
+ 
+   if (!DoAlignmentCheck<MemoryAccessType::Write, MemoryAccessSize::HalfWord>(addr))
+@@ -3611,6 +3633,9 @@ bool CPU::WriteMemoryHalfWord(VirtualMemoryAddress addr, u32 value)
+ 
+ bool CPU::WriteMemoryWord(VirtualMemoryAddress addr, u32 value)
+ {
++  if (PSXRecompDebug::FingerprintArmed()) [[unlikely]]
++    PSXRecompDebug::RecordWrite(addr, value, g_state.current_instruction_pc);
++
+   MEMORY_BREAKPOINT(MemoryAccessType::Write, MemoryAccessSize::Word, addr, value);
+ 
+   if (!DoAlignmentCheck<MemoryAccessType::Write, MemoryAccessSize::Word>(addr))
+diff --git a/src/core/dma.cpp b/src/core/dma.cpp
+index 3aa6c404..e95eb8b6 100644
+--- a/src/core/dma.cpp
++++ b/src/core/dma.cpp
+@@ -4,6 +4,7 @@
+ #include "dma.h"
+ #include "bus.h"
+ #include "cdrom.h"
++#include "psxrecomp_debug_server.h"
+ #include "cpu_code_cache.h"
+ #include "cpu_core.h"
+ #include "gpu.h"
+@@ -926,8 +927,12 @@ TickCount DMA::TransferDeviceToMemory(u32 address, u32 increment, u32 word_count
+       break;
+ 
+     case Channel::CDROM:
++    {
++      const s32 cd_lba = CDROM::GetCurrentReadBufferLBA();
+       CDROM::DMARead(dest_pointer, word_count);
+-      break;
++      PSXRecompDebug::RecordCdDma(address, word_count * 4u, cd_lba, dest_pointer);
++    }
++    break;
+ 
+     case Channel::SPU:
+       SPU::DMARead(dest_pointer, word_count);
+diff --git a/src/core/gpu.h b/src/core/gpu.h
+index 975f8d5d..05fa3600 100644
+--- a/src/core/gpu.h
++++ b/src/core/gpu.h
+@@ -212,6 +212,19 @@ public:
+   ALWAYS_INLINE u16 GetCRTCActiveStartLine() const { return m_crtc_state.vertical_display_start; }
+   ALWAYS_INLINE u16 GetCRTCActiveEndLine() const { return m_crtc_state.vertical_display_end; }
+ 
++  // PSXRecomp debug accessors
++  ALWAYS_INLINE u16 GetDisplayVRAMLeft() const { return m_crtc_state.display_vram_left; }
++  ALWAYS_INLINE u16 GetDisplayVRAMTop() const { return m_crtc_state.display_vram_top; }
++  ALWAYS_INLINE u16 GetDisplayVRAMWidth() const { return m_crtc_state.display_vram_width; }
++  ALWAYS_INLINE u16 GetDisplayVRAMHeight() const { return m_crtc_state.display_vram_height; }
++  ALWAYS_INLINE s32 GetDrawingOffsetX() const { return m_drawing_offset.x; }
++  ALWAYS_INLINE s32 GetDrawingOffsetY() const { return m_drawing_offset.y; }
++  ALWAYS_INLINE u32 GetGPUSTATBits() const { return m_GPUSTAT.bits; }
++  ALWAYS_INLINE u32 GetDrawingAreaLeft() const { return m_drawing_area.left; }
++  ALWAYS_INLINE u32 GetDrawingAreaTop() const { return m_drawing_area.top; }
++  ALWAYS_INLINE u32 GetDrawingAreaRight() const { return m_drawing_area.right; }
++  ALWAYS_INLINE u32 GetDrawingAreaBottom() const { return m_drawing_area.bottom; }
++
+   // Returns the video clock frequency.
+   TickCount GetCRTCFrequency() const;
+ 
+diff --git a/src/core/psxrecomp_debug_server.cpp b/src/core/psxrecomp_debug_server.cpp
+new file mode 100644
+index 00000000..33a95adc
+--- /dev/null
++++ b/src/core/psxrecomp_debug_server.cpp
+@@ -0,0 +1,1476 @@
++// PSXRecomp TCP debug server for DuckStation
++// JSON-over-newline protocol on localhost:4371 (same as runner debug server).
++// Includes 36000-frame ring buffer with CPU, GPU, pad, and RAM snapshot state.
++
++#include "psxrecomp_debug_server.h"
++#include "bus.h"
++#include "controller.h"
++#include "cpu_core.h"
++#include "cpu_types.h"
++#include "digital_controller.h"
++#include "dma.h"
++#include "gpu.h"
++#include "interrupt_controller.h"
++#include "pad.h"
++#include "settings.h"
++#include "system.h"
++#include "timing_event.h"
++
++#include <vector>
++
++#include "common/assert.h"
++#include "common/log.h"
++#include "common/small_string.h"
++
++#include "util/image.h"
++#include "util/sockets.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "fmt/format.h"
++
++LOG_CHANNEL(PSXRecompDebug);
++
++// ---------------------------------------------------------------------------
++// Minimal JSON helpers
++// ---------------------------------------------------------------------------
++
++static bool json_get_str(const char* json, const char* key, char* out, size_t out_sz)
++{
++  char pattern[128];
++  std::snprintf(pattern, sizeof(pattern), "\"%s\"", key);
++  const char* p = std::strstr(json, pattern);
++  if (!p) return false;
++  p += std::strlen(pattern);
++  while (*p == ' ' || *p == ':') p++;
++  if (*p != '"') return false;
++  p++;
++  size_t i = 0;
++  while (*p && *p != '"' && i + 1 < out_sz) out[i++] = *p++;
++  out[i] = 0;
++  return true;
++}
++
++static bool json_get_u32(const char* json, const char* key, u32* out)
++{
++  char pattern[128];
++  std::snprintf(pattern, sizeof(pattern), "\"%s\"", key);
++  const char* p = std::strstr(json, pattern);
++  if (!p) return false;
++  p += std::strlen(pattern);
++  while (*p == ' ' || *p == ':') p++;
++  if (*p == '"') p++;
++  *out = static_cast<u32>(std::strtoul(p, nullptr, 0));
++  return true;
++}
++
++static s32 json_get_int(const char* json, const char* key, s32 def)
++{
++  u32 v;
++  if (!json_get_u32(json, key, &v)) return def;
++  return static_cast<s32>(v);
++}
++
++// ---------------------------------------------------------------------------
++// Frame record (ring buffer element)
++// ---------------------------------------------------------------------------
++
++static constexpr u32 FRAME_HISTORY_CAP = 36000; // ~10 min @ 60fps
++
++// ---------------------------------------------------------------------------
++// Per-frame write fingerprint -- the cross-emulator invariant
++// ---------------------------------------------------------------------------
++//
++// A rolling FNV-1a hash of every guest write since boot, snapshotted once per
++// frame. Comparing frame N's hash between two emulators answers "did the entire
++// write history up to frame N match", so the FIRST frame whose hash differs is
++// the frame execution forked -- which is usually many frames before anything is
++// visible on screen. That is the point: find the first divergence, not the
++// final visible bug.
++//
++// This is a byte-for-byte port of the fingerprint in psxrecomp's
++// debug_server.c. The constants, the classification, and the JSON field names
++// all have to match exactly or the two sides cannot be compared. Main RAM,
++// scratchpad, and MMIO stay in separate columns so a RAM-state fork can be told
++// apart from a device-interaction fork.
++static constexpr u32 FP_RING_CAP = 32768;
++static constexpr u64 FNV_OFFSET = 1469598103934665603ULL;
++static constexpr u64 FNV_PRIME = 1099511628211ULL;
++
++struct FpEntry
++{
++  u32 frame;
++  u64 wr_hash, pc_hash, wcount;
++  u64 mmio_hash, mmio_count;
++  u64 sp_hash, sp_count;
++  u64 cyc;
++};
++
++static bool s_fp_armed = false;
++static u64 s_fp_wr_hash = FNV_OFFSET;
++static u64 s_fp_pc_hash = FNV_OFFSET;
++static u64 s_fp_write_count = 0;
++static u64 s_fp_mmio_hash = FNV_OFFSET;
++static u64 s_fp_mmio_count = 0;
++static u64 s_fp_sp_hash = FNV_OFFSET;
++static u64 s_fp_sp_count = 0;
++static std::vector<FpEntry> s_fp_ring;
++static u32 s_fp_head = 0;
++static u64 s_fp_total = 0;
++
++static void fp_reset()
++{
++  s_fp_wr_hash = s_fp_pc_hash = s_fp_mmio_hash = s_fp_sp_hash = FNV_OFFSET;
++  s_fp_write_count = s_fp_mmio_count = s_fp_sp_count = 0;
++  s_fp_head = 0;
++  s_fp_total = 0;
++  if (s_fp_ring.empty())
++    s_fp_ring.resize(FP_RING_CAP);
++}
++
++bool PSXRecompDebug::FingerprintArmed()
++{
++  return s_fp_armed;
++}
++
++void PSXRecompDebug::RecordWrite(u32 addr, u32 value, u32 pc)
++{
++  const u32 phys = addr & 0x1FFFFFFFu;
++
++  if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) // scratchpad -- separate hash
++  {
++    u64 h = s_fp_sp_hash;
++    h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(pc)) * FNV_PRIME;
++    s_fp_sp_hash = h;
++    s_fp_sp_count++;
++    return;
++  }
++
++  if (phys >= Bus::g_ram_size) // MMIO / device registers -- separate hash
++  {
++    u64 h = s_fp_mmio_hash;
++    h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++    h = (h ^ static_cast<u64>(pc)) * FNV_PRIME;
++    s_fp_mmio_hash = h;
++    s_fp_mmio_count++;
++    return;
++  }
++
++  u64 h = s_fp_wr_hash;
++  h = (h ^ static_cast<u64>(phys)) * FNV_PRIME;
++  h = (h ^ static_cast<u64>(value)) * FNV_PRIME;
++  s_fp_wr_hash = h;
++  s_fp_pc_hash = (s_fp_pc_hash ^ static_cast<u64>(pc)) * FNV_PRIME;
++  s_fp_write_count++;
++}
++
++static void fp_snapshot(u32 frame)
++{
++  if (!s_fp_armed || s_fp_ring.empty())
++    return;
++  FpEntry& e = s_fp_ring[s_fp_head];
++  e.frame = frame;
++  e.wr_hash = s_fp_wr_hash;
++  e.pc_hash = s_fp_pc_hash;
++  e.wcount = s_fp_write_count;
++  e.mmio_hash = s_fp_mmio_hash;
++  e.mmio_count = s_fp_mmio_count;
++  e.sp_hash = s_fp_sp_hash;
++  e.sp_count = s_fp_sp_count;
++  e.cyc = static_cast<u64>(TimingEvents::GetGlobalTickCounter());
++  s_fp_head = (s_fp_head + 1) % FP_RING_CAP;
++  s_fp_total++;
++}
++
++// Snapshot of a RAM region stored per frame
++static constexpr int RAM_SNAPSHOT_REGIONS = 4;
++static constexpr int RAM_SNAPSHOT_SIZE = 128; // bytes per region
++
++struct FrameRecord
++{
++  u32 frame_number;
++
++  // CPU
++  u32 gpr[32];
++  u32 pc, hi, lo;
++
++  // GPU
++  u16 display_vram_left, display_vram_top;
++  u16 display_vram_width, display_vram_height;
++  u8  display_disable;
++  u8  interlaced;
++  u8  pal_mode;
++  u8  _gpu_pad;
++
++  // Pad
++  u16 pad1_buttons; // inverted PS1 style: 0=pressed
++
++  u16 _reserved;
++
++  // RAM snapshots — configurable regions captured every frame
++  u32 snapshot_addr[RAM_SNAPSHOT_REGIONS];
++  u8  snapshot_data[RAM_SNAPSHOT_REGIONS][RAM_SNAPSHOT_SIZE];
++};
++
++// ---------------------------------------------------------------------------
++// State
++// ---------------------------------------------------------------------------
++
++namespace PSXRecompDebug {
++
++namespace {
++
++class ClientSocket final : public BufferedStreamSocket
++{
++public:
++  ClientSocket(SocketMultiplexer& multiplexer, SocketDescriptor descriptor);
++  ~ClientSocket() override;
++
++  void SendJSON(const std::string& json);
++
++protected:
++  void OnConnected() override;
++  void OnDisconnected(const Error& error) override;
++  void OnRead() override;
++
++private:
++  void ProcessLine(std::string_view line);
++};
++
++} // namespace
++
++static std::shared_ptr<ListenSocket> s_listen_socket;
++static std::vector<std::shared_ptr<ClientSocket>> s_clients;
++
++// Frame counter & control
++static u32 s_frame_counter = 0;
++
++// ---- CD command history (mirror of psx-runtime's cdrom_command_history) ----
++// One entry per command as it begins execution; flood-immune (no per-byte
++// FIFO traffic). Exists so the two emulators' request streams can be diffed.
++namespace {
++struct CdCmdEntry
++{
++  u64 seq;
++  u32 frame;
++  u8 command;
++  u8 param_count;
++  u8 params[8];
++};
++constexpr u32 CD_CMD_HISTORY_CAP = 4096;
++CdCmdEntry s_cd_cmd_history[CD_CMD_HISTORY_CAP];
++u64 s_cd_cmd_history_seq = 0;
++} // namespace
++
++// ---- CD DMA log (mirror of psx-runtime's cd_read_log) ----------------------
++// One entry per channel-3 DMA into RAM: destination, size, the LBA of the
++// sector actually drained, and the head of the transferred data. This is the
++// half that was missing: native's slot map was known in detail, the oracle's
++// only inferred, and the palette reaches its table through one of these.
++namespace {
++struct CdDmaEntry
++{
++  u32 dest;
++  u32 size;
++  s32 lba;
++  u32 frame;
++  u32 first_words[2];
++};
++// Match psx-runtime's 65536. At ~3 DMAs per sector, 4096 entries is barely a
++// thousand sectors -- FMV streaming after a scene flushes an earlier load
++// straight out of the ring, which is exactly how the palette load vanished
++// while native (65536) still had it. 65536 * 24 B = 1.5 MB, and this only
++// exists in the oracle build.
++constexpr u32 CD_DMA_LOG_CAP = 65536;
++CdDmaEntry s_cd_dma_log[CD_DMA_LOG_CAP];
++u64 s_cd_dma_log_seq = 0;
++} // namespace
++
++void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data)
++{
++  // Mirror psx-runtime's cd_dma_log_push exactly: transfers to 0x1C0000+ are
++  // FMV / streaming buffers and are NOT logged. Without this the oracle's
++  // ring floods -- FMV runs ~3 DMAs per sector and had evicted the palette
++  // load (LBA 125111/125113) while native, which applies the exclusion, still
++  // held it. An asymmetric log is worse than no log: it looks like the oracle
++  // never loaded the file.
++  if (dest >= 0x1C0000u)
++    return;
++
++  CdDmaEntry& e = s_cd_dma_log[s_cd_dma_log_seq++ % CD_DMA_LOG_CAP];
++  e.dest = dest;
++  e.size = size_bytes;
++  e.lba = lba;
++  e.frame = s_frame_counter;
++  e.first_words[0] = e.first_words[1] = 0;
++  if (data && size_bytes >= 8)
++  {
++    std::memcpy(&e.first_words[0], data, 4);
++    std::memcpy(&e.first_words[1], static_cast<const u8*>(data) + 4, 4);
++  }
++}
++
++// ---- per-sector notification accounting -----------------------------------
++namespace {
++struct CdSectorEvent
++{
++  u64 seq;
++  s32 lba;
++  u32 frame;
++  u32 buffer;
++  u8 flags;
++};
++constexpr u32 CD_SECTOR_LOG_CAP = 4096;
++CdSectorEvent s_cd_sector_log[CD_SECTOR_LOG_CAP];
++u64 s_cd_sector_seq = 0;
++// Newest entry index per buffer slot, so a later notification can be
++// attributed to the sector it concerns rather than to whatever is newest.
++u64 s_cd_buf_last[16] = {};
++bool s_cd_buf_valid[16] = {};
++} // namespace
++
++void RecordCdSector(s32 lba, u32 buffer)
++{
++  const u64 seq = s_cd_sector_seq++;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  e.seq = seq;
++  e.lba = lba;
++  e.frame = s_frame_counter;
++  e.buffer = buffer;
++  e.flags = CDSE_DATA;
++  if (buffer < 16)
++  {
++    s_cd_buf_last[buffer] = seq;
++    s_cd_buf_valid[buffer] = true;
++  }
++}
++
++// The sector whose INT1 was last presented -- i.e. the one the guest is
++// actually draining. Slot reuse (8 slots, many sectors) means looking a
++// sector up by buffer index attributes a later drain to a NEWER entry, which
++// is why every row reported drained=0.
++static u64 s_cd_delivered_seq = 0;
++static bool s_cd_delivered_valid = false;
++
++void FlagCdSectorDelivered(u32 buffer)
++{
++  if (buffer < 16 && s_cd_buf_valid[buffer])
++  {
++    s_cd_delivered_seq = s_cd_buf_last[buffer];
++    s_cd_delivered_valid = true;
++  }
++  FlagCdSector(buffer, CDSE_DELIVERED);
++}
++
++void FlagCdSectorDrained()
++{
++  if (!s_cd_delivered_valid)
++    return;
++  const u64 seq = s_cd_delivered_seq;
++  if (s_cd_sector_seq - seq > CD_SECTOR_LOG_CAP)
++    return;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  if (e.seq == seq)
++    e.flags |= CDSE_DRAINED;
++}
++
++void FlagCdSector(u32 buffer, u8 bits)
++{
++  if (buffer >= 16 || !s_cd_buf_valid[buffer])
++    return;
++  const u64 seq = s_cd_buf_last[buffer];
++  if (s_cd_sector_seq - seq > CD_SECTOR_LOG_CAP)
++    return;
++  CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++  if (e.seq == seq)
++    e.flags |= bits;
++}
++
++void RecordCdCommand(u8 command, const u8* params, u32 param_count)
++{
++  CdCmdEntry& e = s_cd_cmd_history[s_cd_cmd_history_seq % CD_CMD_HISTORY_CAP];
++  e.seq = s_cd_cmd_history_seq++;
++  e.frame = s_frame_counter;
++  e.command = command;
++  e.param_count = static_cast<u8>(std::min<u32>(param_count, 8));
++  for (u32 i = 0; i < e.param_count; i++)
++    e.params[i] = params[i];
++}
++static int s_step_frames = 0;
++static bool s_paused = false;
++static int s_request_id = 0;
++static u32 s_run_to_frame = 0; // target frame for run_to_frame (0=disabled)
++
++// Ring buffer
++static FrameRecord s_history[FRAME_HISTORY_CAP];
++static u64 s_history_count = 0;
++
++// Watchpoints
++static constexpr int MAX_WATCHPOINTS = 8;
++static struct { u32 addr; u8 prev_val; bool active; } s_watchpoints[MAX_WATCHPOINTS] = {};
++
++// PC breakpoints — execute breakpoint with state capture on hit.
++// When the callback fires we capture all GPRs + PC + $ra into a pending-hit
++// record, pause the system, and broadcast an event. The pending record stays
++// until queried via "pc_hit_last" (or cleared via "pc_hit_clear").
++static constexpr int MAX_PC_BREAKS = 16;
++static struct { u32 addr; bool active; } s_pc_breaks[MAX_PC_BREAKS] = {};
++static struct {
++  bool valid;
++  u32 addr_hit;
++  u32 pc;
++  u32 ra;
++  u32 hi, lo;
++  u32 gpr[32];
++  u32 cop0_sr, cop0_cause, cop0_epc;
++} s_pc_hit_last = {};
++
++// Input override (-1 = no override, otherwise PS1 inverted bitmask)
++static s32 s_input_override = -1;
++
++// RAM snapshot regions (user-configurable via "set_snapshot" command)
++static u32 s_snapshot_addrs[RAM_SNAPSHOT_REGIONS] = {
++  0x00097C40, // DMA context (default for memcard investigation)
++  0x00097840, // staging buffer
++  0, 0
++};
++
++// Helper: broadcast to all clients
++static void BroadcastJSON(const std::string& msg)
++{
++  for (auto& c : s_clients)
++    c->SendJSON(msg);
++}
++
++} // namespace PSXRecompDebug
++
++// ---------------------------------------------------------------------------
++// Client socket
++// ---------------------------------------------------------------------------
++
++PSXRecompDebug::ClientSocket::ClientSocket(SocketMultiplexer& multiplexer, SocketDescriptor descriptor)
++  : BufferedStreamSocket(multiplexer, descriptor, 8192, 65536)
++{
++}
++
++PSXRecompDebug::ClientSocket::~ClientSocket() = default;
++
++void PSXRecompDebug::ClientSocket::OnConnected()
++{
++  INFO_LOG("PSXRecomp debug client connected from {}", GetRemoteAddress().ToString());
++  s_clients.push_back(std::static_pointer_cast<ClientSocket>(shared_from_this()));
++}
++
++void PSXRecompDebug::ClientSocket::OnDisconnected(const Error& error)
++{
++  INFO_LOG("PSXRecomp debug client disconnected: {}", error.GetDescription());
++  auto it = std::find_if(s_clients.begin(), s_clients.end(),
++                         [this](const auto& c) { return c.get() == this; });
++  if (it != s_clients.end()) s_clients.erase(it);
++}
++
++void PSXRecompDebug::ClientSocket::OnRead()
++{
++  const std::span<const u8> buffer = AcquireReadBuffer();
++  if (buffer.empty()) return;
++
++  size_t consumed = 0;
++  for (size_t i = 0; i < buffer.size(); i++)
++  {
++    if (buffer[i] == '\n')
++    {
++      std::string_view line(reinterpret_cast<const char*>(buffer.data() + consumed), i - consumed);
++      if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
++      if (!line.empty()) ProcessLine(line);
++      consumed = i + 1;
++    }
++  }
++  ReleaseReadBuffer(consumed);
++}
++
++void PSXRecompDebug::ClientSocket::SendJSON(const std::string& json)
++{
++  std::string msg = json + "\n";
++  Write(msg.data(), msg.size());
++}
++
++// ---------------------------------------------------------------------------
++// Register names
++// ---------------------------------------------------------------------------
++
++static const char* const s_reg_names[32] = {
++  "zero","at","v0","v1","a0","a1","a2","a3",
++  "t0","t1","t2","t3","t4","t5","t6","t7",
++  "s0","s1","s2","s3","s4","s5","s6","s7",
++  "t8","t9","k0","k1","gp","sp","fp","ra",
++};
++
++// ---------------------------------------------------------------------------
++// Hex encoding helper
++// ---------------------------------------------------------------------------
++
++static std::string hex_encode(const u8* data, size_t len)
++{
++  std::string hex;
++  hex.reserve(len * 2);
++  for (size_t i = 0; i < len; i++)
++    fmt::format_to(std::back_inserter(hex), "{:02x}", data[i]);
++  return hex;
++}
++
++// ---------------------------------------------------------------------------
++// Command handlers
++// ---------------------------------------------------------------------------
++
++void PSXRecompDebug::ClientSocket::ProcessLine(std::string_view line)
++{
++  std::string line_str(line);
++  const char* json = line_str.c_str();
++
++  char cmd[64] = {};
++  json_get_str(json, "cmd", cmd, sizeof(cmd));
++  u32 id = 0;
++  json_get_u32(json, "id", &id);
++  s_request_id = static_cast<int>(id);
++
++  // ---- ping / frame ----
++  if (std::strcmp(cmd, "ping") == 0 || std::strcmp(cmd, "frame") == 0)
++  {
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"frame":{}}})", s_request_id, s_frame_counter));
++  }
++  // ---- registers ----
++  else if (std::strcmp(cmd, "get_registers") == 0 || std::strcmp(cmd, "regs") == 0)
++  {
++    std::string resp = fmt::format(
++      R"({{"id":{},"ok":true,"pc":"0x{:08X}","hi":"0x{:08X}","lo":"0x{:08X}","regs":{{)",
++      s_request_id, CPU::g_state.pc, CPU::g_state.regs.hi, CPU::g_state.regs.lo);
++    for (int i = 0; i < 32; i++)
++    {
++      if (i > 0) resp += ",";
++      resp += fmt::format(R"("{}":"0x{:08X}")", s_reg_names[i], CPU::g_state.regs.r[i]);
++    }
++    resp += "}}";
++    SendJSON(resp);
++  }
++  // ---- read_ram ----
++  else if (std::strcmp(cmd, "read_ram") == 0)
++  {
++    u32 addr = 0, len = 1;
++    json_get_u32(json, "addr", &addr);
++    json_get_u32(json, "len", &len);
++    if (len > 65536) len = 65536;
++
++    u32 phys = addr & 0x1FFFFFFFu;
++    std::string hex;
++    hex.reserve(len * 2);
++    for (u32 i = 0; i < len; i++)
++    {
++      u8 byte = (phys + i < Bus::g_ram_size) ? Bus::g_ram[phys + i] : 0;
++      fmt::format_to(std::back_inserter(hex), "{:02x}", byte);
++    }
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"addr":"0x{:08X}","len":{},"hex":"{}"}})",
++      s_request_id, addr, len, hex));
++  }
++  // ---- write_ram ----
++  else if (std::strcmp(cmd, "write_ram") == 0)
++  {
++    u32 addr = 0;
++    json_get_u32(json, "addr", &addr);
++    char hex_data[131072] = {};
++    json_get_str(json, "hex", hex_data, sizeof(hex_data));
++
++    u32 phys = addr & 0x1FFFFFFFu;
++    size_t hex_len = std::strlen(hex_data);
++    u32 byte_count = 0;
++    for (size_t i = 0; i + 1 < hex_len; i += 2)
++    {
++      char bs[3] = {hex_data[i], hex_data[i + 1], 0};
++      u8 byte = static_cast<u8>(std::strtoul(bs, nullptr, 16));
++      if (phys + byte_count < Bus::g_ram_size)
++        Bus::g_ram[phys + byte_count] = byte;
++      byte_count++;
++    }
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"bytes_written":{}}})", s_request_id, byte_count));
++  }
++  // ---- gpu_state ----
++  else if (std::strcmp(cmd, "gpu_state") == 0)
++  {
++    // Map display width to h_resolution index (0=256,1=320,2=512,3=640)
++    u16 w = g_gpu.GetDisplayVRAMWidth();
++    u8 h_res = (w >= 640) ? 3 : (w >= 512) ? 2 : (w >= 320) ? 1 : 0;
++    // Map display height to v_resolution index (0=240,1=480i)
++    u16 h = g_gpu.GetDisplayVRAMHeight();
++    u8 v_res = (h > 240) ? 1 : 0;
++    // display_enable: 0=on, 1=off (same as native convention)
++    u8 disp_en = g_gpu.IsDisplayDisabled() ? 1 : 0;
++
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"display_area_x":{},"display_area_y":{},"draw_offset_x":{},"draw_offset_y":{},"h_resolution":{},"v_resolution":{},"display_enable":{},"gpustat":"0x{:08X}","disp_w":{},"disp_h":{},"clip":[{},{},{},{}]}})",
++      s_request_id,
++      g_gpu.GetDisplayVRAMLeft(), g_gpu.GetDisplayVRAMTop(),
++      g_gpu.GetDrawingOffsetX(), g_gpu.GetDrawingOffsetY(),
++      h_res, v_res, disp_en,
++      g_gpu.GetGPUSTATBits(),
++      g_gpu.GetDisplayVRAMWidth(), g_gpu.GetDisplayVRAMHeight(),
++      g_gpu.GetDrawingAreaLeft(), g_gpu.GetDrawingAreaTop(),
++      g_gpu.GetDrawingAreaRight(), g_gpu.GetDrawingAreaBottom()));
++  }
++  // ---- frame_fingerprint ----
++  // Same command name and same JSON field names as psxrecomp's, so
++  // tools/fingerprint_diff.py can point at either port without knowing which
++  // emulator answered. Field names are terse (wr/pc/wc/mmio/mc/sp/sc/cyc)
++  // because that side chose them; matching beats improving.
++  else if (std::strcmp(cmd, "frame_fingerprint") == 0)
++  {
++    u32 count = 1024, arm = 2, reset = 0;
++    json_get_u32(json, "count", &count);
++    json_get_u32(json, "arm", &arm);
++    json_get_u32(json, "reset", &reset);
++    const s32 flo = json_get_int(json, "frame_lo", -1);
++    const s32 fhi = json_get_int(json, "frame_hi", -1);
++
++    if (reset)
++      fp_reset();
++    if (arm <= 1)
++    {
++      const bool want = (arm == 1);
++      if (want && !s_fp_armed)
++        fp_reset(); // a fresh arm starts a fresh history, not a resumed one
++      s_fp_armed = want;
++    }
++
++    if (count < 1) count = 1;
++    if (count > FP_RING_CAP) count = FP_RING_CAP;
++    const u32 avail = (s_fp_total < FP_RING_CAP) ? static_cast<u32>(s_fp_total) : FP_RING_CAP;
++    const u32 start = (s_fp_total < FP_RING_CAP) ? 0 : s_fp_head;
++
++    // The store hook lives in the INTERPRETER's write path. A recompiler build
++    // inlines stores and never reaches it, so fingerprinting would silently
++    // record almost nothing and the comparison would report a bogus match.
++    // Report the mode rather than let a caller trust an empty hash.
++    const bool interp = (g_settings.cpu_execution_mode == CPUExecutionMode::Interpreter);
++    std::string resp = fmt::format(
++      R"({{"id":{},"ok":true,"armed":{},"interpreter":{},"total":{},"available":{},"entries":[)",
++      s_request_id, s_fp_armed ? "true" : "false", interp ? "true" : "false",
++      s_fp_total, avail);
++    u32 emitted = 0;
++    for (u32 i = 0; i < avail && emitted < count; i++)
++    {
++      const FpEntry& e = s_fp_ring[(start + i) % FP_RING_CAP];
++      if (flo >= 0 && static_cast<s32>(e.frame) < flo) continue;
++      if (fhi >= 0 && static_cast<s32>(e.frame) > fhi) continue;
++      fmt::format_to(std::back_inserter(resp),
++        R"({}{{"frame":{},"wr":"0x{:016x}","pc":"0x{:016x}","wc":{},)"
++        R"("mmio":"0x{:016x}","mc":{},"sp":"0x{:016x}","sc":{},"cyc":{}}})",
++        emitted ? "," : "", e.frame, e.wr_hash, e.pc_hash, e.wcount,
++        e.mmio_hash, e.mmio_count, e.sp_hash, e.sp_count, e.cyc);
++      emitted++;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  // ---- pause ----
++  else if (std::strcmp(cmd, "pause") == 0)
++  {
++    s_paused = true;
++    System::PauseSystem(true);
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"paused":true,"frame":{}}})", s_request_id, s_frame_counter));
++  }
++  // ---- continue ----
++  else if (std::strcmp(cmd, "continue") == 0 || std::strcmp(cmd, "c") == 0)
++  {
++    s_paused = false;
++    System::PauseSystem(false);
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"paused":false,"frame":{}}})", s_request_id, s_frame_counter));
++  }
++  // ---- step ----
++  else if (std::strcmp(cmd, "step") == 0)
++  {
++    u32 n = 1;
++    json_get_u32(json, "count", &n);
++    if (n < 1) n = 1;
++    s_step_frames = static_cast<int>(n);
++    s_paused = false;
++    System::PauseSystem(false);
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"stepping":{},"frame":{}}})", s_request_id, n, s_frame_counter));
++  }
++  // ---- watch ----
++  else if (std::strcmp(cmd, "watch") == 0)
++  {
++    u32 addr = 0;
++    json_get_u32(json, "addr", &addr);
++    bool added = false;
++    for (int i = 0; i < MAX_WATCHPOINTS; i++)
++    {
++      if (!s_watchpoints[i].active)
++      {
++        s_watchpoints[i].addr = addr & 0x1FFFFFFFu;
++        s_watchpoints[i].prev_val = (s_watchpoints[i].addr < Bus::g_ram_size) ?
++                                      Bus::g_ram[s_watchpoints[i].addr] : 0;
++        s_watchpoints[i].active = true;
++        added = true;
++        break;
++      }
++    }
++    SendJSON(fmt::format(R"({{"id":{},"ok":{},"addr":"0x{:08X}"}})",
++      s_request_id, added ? "true" : "false", addr));
++  }
++  // ---- unwatch ----
++  else if (std::strcmp(cmd, "unwatch") == 0)
++  {
++    u32 addr = 0;
++    json_get_u32(json, "addr", &addr);
++    u32 phys = addr & 0x1FFFFFFFu;
++    for (int i = 0; i < MAX_WATCHPOINTS; i++)
++      if (s_watchpoints[i].active && s_watchpoints[i].addr == phys)
++        s_watchpoints[i].active = false;
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"addr":"0x{:08X}"}})", s_request_id, addr));
++  }
++  // ---- pc_break: set execute breakpoint at given PC (full state capture on hit) ----
++  else if (std::strcmp(cmd, "pc_break") == 0)
++  {
++    u32 addr = 0;
++    json_get_u32(json, "addr", &addr);
++    bool added = false;
++    int slot = -1;
++    for (int i = 0; i < MAX_PC_BREAKS; i++)
++    {
++      if (!s_pc_breaks[i].active) { slot = i; break; }
++    }
++    if (slot >= 0)
++    {
++      bool ok = CPU::AddBreakpointWithCallback(
++        CPU::BreakpointType::Execute, addr,
++        [](CPU::BreakpointType, VirtualMemoryAddress pc_hit, VirtualMemoryAddress) -> bool {
++          // Capture full state at hit.
++          s_pc_hit_last.valid = true;
++          s_pc_hit_last.addr_hit = pc_hit;
++          s_pc_hit_last.pc = CPU::g_state.pc;
++          s_pc_hit_last.ra = CPU::g_state.regs.r[31];
++          s_pc_hit_last.hi = CPU::g_state.regs.hi;
++          s_pc_hit_last.lo = CPU::g_state.regs.lo;
++          for (int i = 0; i < 32; i++) s_pc_hit_last.gpr[i] = CPU::g_state.regs.r[i];
++          s_pc_hit_last.cop0_sr    = CPU::g_state.cop0_regs.sr.bits;
++          s_pc_hit_last.cop0_cause = CPU::g_state.cop0_regs.cause.bits;
++          s_pc_hit_last.cop0_epc   = CPU::g_state.cop0_regs.EPC;
++          // Pause the system so the client can inspect before anything else runs.
++          s_paused = true;
++          System::PauseSystem(true);
++          // Broadcast event (best-effort; client may reconnect and query pc_hit_last).
++          BroadcastJSON(fmt::format(
++            R"({{"event":"pc_hit","addr":"0x{:08X}","pc":"0x{:08X}","ra":"0x{:08X}","frame":{}}})",
++            pc_hit, CPU::g_state.pc, CPU::g_state.regs.r[31], s_frame_counter));
++          return true; // keep breakpoint
++        });
++      if (ok)
++      {
++        s_pc_breaks[slot].addr = addr;
++        s_pc_breaks[slot].active = true;
++        added = true;
++      }
++    }
++    SendJSON(fmt::format(R"({{"id":{},"ok":{},"addr":"0x{:08X}","slot":{}}})",
++      s_request_id, added ? "true" : "false", addr, slot));
++  }
++  // ---- pc_unbreak: remove execute breakpoint at given PC ----
++  else if (std::strcmp(cmd, "pc_unbreak") == 0)
++  {
++    u32 addr = 0;
++    json_get_u32(json, "addr", &addr);
++    bool removed = CPU::RemoveBreakpoint(CPU::BreakpointType::Execute, addr);
++    for (int i = 0; i < MAX_PC_BREAKS; i++)
++      if (s_pc_breaks[i].active && s_pc_breaks[i].addr == addr)
++        s_pc_breaks[i].active = false;
++    SendJSON(fmt::format(R"({{"id":{},"ok":{},"addr":"0x{:08X}"}})",
++      s_request_id, removed ? "true" : "false", addr));
++  }
++  // ---- pc_break_list ----
++  else if (std::strcmp(cmd, "pc_break_list") == 0)
++  {
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"breaks":[)", s_request_id);
++    bool first = true;
++    for (int i = 0; i < MAX_PC_BREAKS; i++)
++    {
++      if (!s_pc_breaks[i].active) continue;
++      if (!first) resp += ",";
++      resp += fmt::format(R"("0x{:08X}")", s_pc_breaks[i].addr);
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  // ---- pc_hit_last: return captured state from most recent PC break hit ----
++  else if (std::strcmp(cmd, "pc_hit_last") == 0)
++  {
++    if (!s_pc_hit_last.valid)
++    {
++      SendJSON(fmt::format(R"({{"id":{},"ok":true,"valid":false}})", s_request_id));
++    }
++    else
++    {
++      std::string resp = fmt::format(
++        R"({{"id":{},"ok":true,"valid":true,"addr_hit":"0x{:08X}","pc":"0x{:08X}","ra":"0x{:08X}",)"
++        R"("hi":"0x{:08X}","lo":"0x{:08X}","cop0_sr":"0x{:08X}","cop0_cause":"0x{:08X}","cop0_epc":"0x{:08X}","regs":{{)",
++        s_request_id, s_pc_hit_last.addr_hit, s_pc_hit_last.pc, s_pc_hit_last.ra,
++        s_pc_hit_last.hi, s_pc_hit_last.lo,
++        s_pc_hit_last.cop0_sr, s_pc_hit_last.cop0_cause, s_pc_hit_last.cop0_epc);
++      for (int i = 0; i < 32; i++)
++      {
++        if (i > 0) resp += ",";
++        resp += fmt::format(R"("{}":"0x{:08X}")", s_reg_names[i], s_pc_hit_last.gpr[i]);
++      }
++      resp += "}}";
++      SendJSON(resp);
++    }
++  }
++  // ---- pc_hit_clear ----
++  else if (std::strcmp(cmd, "pc_hit_clear") == 0)
++  {
++    s_pc_hit_last.valid = false;
++    SendJSON(fmt::format(R"({{"id":{},"ok":true}})", s_request_id));
++  }
++  // ---- history (ring buffer stats) ----
++  else if (std::strcmp(cmd, "history") == 0)
++  {
++    u64 oldest = (s_history_count > FRAME_HISTORY_CAP) ? s_history_count - FRAME_HISTORY_CAP : 0;
++    u64 newest = s_history_count > 0 ? s_history_count - 1 : 0;
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"count":{},"oldest":{},"newest":{}}})",
++      s_request_id, s_history_count, oldest, newest));
++  }
++  // ---- get_frame (single frame from ring buffer) ----
++  else if (std::strcmp(cmd, "get_frame") == 0)
++  {
++    s32 f = json_get_int(json, "frame", -1);
++    if (f < 0) { SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"missing frame"}})", s_request_id)); return; }
++
++    u64 oldest = (s_history_count > FRAME_HISTORY_CAP) ? s_history_count - FRAME_HISTORY_CAP : 0;
++    if (static_cast<u64>(f) < oldest || static_cast<u64>(f) >= s_history_count)
++    {
++      SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"frame not in buffer"}})", s_request_id));
++      return;
++    }
++
++    u32 idx = static_cast<u32>(f) % FRAME_HISTORY_CAP;
++    const FrameRecord& r = s_history[idx];
++
++    // Encode snapshot regions as hex
++    std::string snaps = "[";
++    for (int si = 0; si < RAM_SNAPSHOT_REGIONS; si++)
++    {
++      if (si > 0) snaps += ",";
++      if (r.snapshot_addr[si] == 0)
++      {
++        snaps += "null";
++      }
++      else
++      {
++        snaps += fmt::format(R"({{"addr":"0x{:08X}","hex":"{}"}})",
++          r.snapshot_addr[si] | 0x80000000u,
++          hex_encode(r.snapshot_data[si], RAM_SNAPSHOT_SIZE));
++      }
++    }
++    snaps += "]";
++
++    std::string resp = fmt::format(
++      R"({{"id":{},"ok":true,"frame":{},"pc":"0x{:08X}","hi":"0x{:08X}","lo":"0x{:08X}",)"
++      R"("sp":"0x{:08X}","ra":"0x{:08X}","v0":"0x{:08X}","a0":"0x{:08X}",)"
++      R"("gpu":{{"da_x":{},"da_y":{},"do_x":0,"do_y":0}},)"
++      R"("pad":"0x{:04X}",)"
++      R"("overlay_base":"0x00000000",)"
++      R"("dispatch_misses":0,)"
++      R"("game_data":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",)"
++      R"("last_func":"",)"
++      R"("snapshots":{}}})",
++      s_request_id, r.frame_number, r.pc, r.hi, r.lo,
++      r.gpr[29], r.gpr[31], r.gpr[2], r.gpr[4],
++      r.display_vram_left, r.display_vram_top,
++      r.pad1_buttons,
++      snaps);
++    SendJSON(resp);
++  }
++  // ---- frame_range (batch query, max 200) ----
++  else if (std::strcmp(cmd, "frame_range") == 0)
++  {
++    s32 start = json_get_int(json, "start", -1);
++    s32 end = json_get_int(json, "end", -1);
++    if (start < 0 || end < 0) { SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"missing start/end"}})", s_request_id)); return; }
++    if (end - start + 1 > 200) { SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"max 200 frames"}})", s_request_id)); return; }
++
++    u64 oldest = (s_history_count > FRAME_HISTORY_CAP) ? s_history_count - FRAME_HISTORY_CAP : 0;
++
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"frames":[)", s_request_id);
++    bool first = true;
++    for (s32 f = start; f <= end; f++)
++    {
++      if (!first) resp += ",";
++      first = false;
++
++      if (static_cast<u64>(f) < oldest || static_cast<u64>(f) >= s_history_count)
++      {
++        resp += fmt::format(R"({{"frame":{},"available":false}})", f);
++        continue;
++      }
++
++      u32 idx = static_cast<u32>(f) % FRAME_HISTORY_CAP;
++      const FrameRecord& r = s_history[idx];
++
++      // Include first snapshot region hex for compact view
++      std::string snap0_hex = (r.snapshot_addr[0] != 0) ?
++        hex_encode(r.snapshot_data[0], RAM_SNAPSHOT_SIZE) : "";
++
++      resp += fmt::format(
++        R"({{"frame":{},"pc":"0x{:08X}","pad":"0x{:04X}","game_data":"0000000000000000000000000000000000000000000000000000000000000000","snap0":"{}"}})",
++        r.frame_number, r.pc, r.pad1_buttons, snap0_hex);
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  // ---- frame_timeseries (compact batch, max 200) ----
++  else if (std::strcmp(cmd, "frame_timeseries") == 0)
++  {
++    s32 start = json_get_int(json, "start", -1);
++    s32 end = json_get_int(json, "end", -1);
++    if (start < 0 || end < 0) { SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"missing start/end"}})", s_request_id)); return; }
++    if (end - start + 1 > 200) { SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"max 200 frames"}})", s_request_id)); return; }
++
++    u64 oldest = (s_history_count > FRAME_HISTORY_CAP) ? s_history_count - FRAME_HISTORY_CAP : 0;
++
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"ts":[)", s_request_id);
++    bool first = true;
++    for (s32 f = start; f <= end; f++)
++    {
++      if (!first) resp += ",";
++      first = false;
++
++      if (static_cast<u64>(f) < oldest || static_cast<u64>(f) >= s_history_count)
++      {
++        resp += "null";
++        continue;
++      }
++
++      u32 idx = static_cast<u32>(f) % FRAME_HISTORY_CAP;
++      const FrameRecord& r = s_history[idx];
++
++      resp += fmt::format(
++        R"({{"f":{},"pc":"0x{:08X}","sp":"0x{:08X}","ra":"0x{:08X}","pad":{},"da_x":{},"da_y":{},"misses":0,"gd":"0000000000000000000000000000000000000000000000000000000000000000"}})",
++        r.frame_number, r.pc, r.gpr[29], r.gpr[31],
++        r.pad1_buttons, r.display_vram_left, r.display_vram_top);
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  // ---- set_snapshot (configure RAM snapshot regions) ----
++  else if (std::strcmp(cmd, "set_snapshot") == 0)
++  {
++    // set_snapshot: {"cmd":"set_snapshot","slot":0,"addr":"0x80097C40"}
++    u32 slot = 0, addr = 0;
++    json_get_u32(json, "slot", &slot);
++    json_get_u32(json, "addr", &addr);
++    if (slot < RAM_SNAPSHOT_REGIONS)
++    {
++      s_snapshot_addrs[slot] = addr & 0x1FFFFFFFu;
++      SendJSON(fmt::format(R"({{"id":{},"ok":true,"slot":{},"addr":"0x{:08X}"}})",
++        s_request_id, slot, addr));
++    }
++    else
++    {
++      SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"slot must be 0-{}"}})",
++        s_request_id, RAM_SNAPSHOT_REGIONS - 1));
++    }
++  }
++  // ---- get_snapshots (show current snapshot config) ----
++  else if (std::strcmp(cmd, "get_snapshots") == 0)
++  {
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"regions":[)", s_request_id);
++    for (int i = 0; i < RAM_SNAPSHOT_REGIONS; i++)
++    {
++      if (i > 0) resp += ",";
++      if (s_snapshot_addrs[i] == 0)
++        resp += "null";
++      else
++        resp += fmt::format(R"({{"slot":{},"addr":"0x{:08X}","size":{}}})",
++          i, s_snapshot_addrs[i] | 0x80000000u, RAM_SNAPSHOT_SIZE);
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  // ---- read_scratch (scratchpad memory) ----
++  else if (std::strcmp(cmd, "read_scratch") == 0)
++  {
++    u32 addr = 0, len = 1;
++    json_get_u32(json, "addr", &addr);
++    json_get_u32(json, "len", &len);
++    if (len > 1024) len = 1024;
++
++    std::string hex;
++    hex.reserve(len * 2);
++    for (u32 i = 0; i < len; i++)
++    {
++      u32 off = (addr + i) & 0x3FFu;
++      fmt::format_to(std::back_inserter(hex), "{:02x}", CPU::g_state.scratchpad[off]);
++    }
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"addr":"0x{:08X}","len":{},"hex":"{}"}})",
++      s_request_id, addr, len, hex));
++  }
++  // ---- overlay_state (not applicable for DS, returns zeros) ----
++  else if (std::strcmp(cmd, "overlay_state") == 0)
++  {
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"overlay_base":"0x00000000","overlay_pc":"0x00000000"}})",
++      s_request_id));
++  }
++  // ---- run_to_frame ----
++  else if (std::strcmp(cmd, "run_to_frame") == 0)
++  {
++    u32 target = 0;
++    json_get_u32(json, "frame", &target);
++    if (target <= s_frame_counter)
++    {
++      SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"target frame already passed"}})", s_request_id));
++    }
++    else
++    {
++      s_run_to_frame = target;
++      s_paused = false;
++      System::PauseSystem(false);
++      SendJSON(fmt::format(R"({{"id":{},"ok":true,"running_to":{}}})", s_request_id, target));
++    }
++  }
++  // ---- dump_ram (chunked large reads, up to 64KB) ----
++  else if (std::strcmp(cmd, "dump_ram") == 0)
++  {
++    u32 addr = 0, len = 256;
++    json_get_u32(json, "addr", &addr);
++    json_get_u32(json, "len", &len);
++    if (len > 65536) len = 65536;
++
++    u32 phys = addr & 0x1FFFFFFFu;
++    u32 offset = 0;
++    while (offset < len)
++    {
++      u32 chunk = std::min(len - offset, 4096u);
++      std::string hex;
++      hex.reserve(chunk * 2);
++      for (u32 i = 0; i < chunk; i++)
++      {
++        u32 p = phys + offset + i;
++        u8 byte = (p < Bus::g_ram_size) ? Bus::g_ram[p] : 0;
++        fmt::format_to(std::back_inserter(hex), "{:02x}", byte);
++      }
++      SendJSON(fmt::format(
++        R"({{"id":{},"ok":true,"addr":"0x{:08X}","offset":{},"len":{},"hex":"{}"}})",
++        s_request_id, addr + offset, offset, chunk, hex));
++      offset += chunk;
++    }
++  }
++  // ---- read_vram (read VRAM pixels, max 128x128) ----
++  else if (std::strcmp(cmd, "read_vram") == 0)
++  {
++    u32 x = 0, y = 0, w = 1, h = 1;
++    json_get_u32(json, "x", &x);
++    json_get_u32(json, "y", &y);
++    json_get_u32(json, "w", &w);
++    json_get_u32(json, "h", &h);
++    if (w > 128) w = 128;
++    if (h > 128) h = 128;
++    if (w == 0) w = 1;
++    if (h == 0) h = 1;
++
++    std::string hex;
++    hex.reserve(w * h * 4);
++    for (u32 row = 0; row < h; row++)
++    {
++      u32 vy = (y + row) & (VRAM_HEIGHT - 1);
++      for (u32 col = 0; col < w; col++)
++      {
++        u32 vx = (x + col) & (VRAM_WIDTH - 1);
++        u16 pixel = g_vram[vy * VRAM_WIDTH + vx];
++        fmt::format_to(std::back_inserter(hex), "{:04x}", pixel);
++      }
++    }
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"x":{},"y":{},"w":{},"h":{},"pixels":"{}"}})",
++      s_request_id, x, y, w, h, hex));
++  }
++  // ---- set_input ----
++  else if (std::strcmp(cmd, "set_input") == 0)
++  {
++    u32 buttons = 0xFFFF;
++    json_get_u32(json, "buttons", &buttons);
++    s_input_override = static_cast<s32>(buttons & 0xFFFF);
++    SendJSON(fmt::format(R"({{"id":{},"ok":true,"buttons":"0x{:04X}"}})", s_request_id, s_input_override));
++  }
++  // ---- clear_input ----
++  else if (std::strcmp(cmd, "clear_input") == 0)
++  {
++    s_input_override = -1;
++    SendJSON(fmt::format(R"({{"id":{},"ok":true}})", s_request_id));
++  }
++  // ---- dma_state ----
++  else if (std::strcmp(cmd, "dma_state") == 0)
++  {
++    static const char* const dma_names[7] = {"MDECin","MDECout","GPU","CDROM","SPU","PIO","OTC"};
++    u32 dpcr = DMA::ReadRegister(0x70);
++    u32 dicr = DMA::ReadRegister(0x74);
++    std::string channels = "[";
++    for (u32 ch = 0; ch < 7; ch++)
++    {
++      if (ch > 0) channels += ",";
++      u32 base = ch * 16;
++      u32 madr = DMA::ReadRegister(base + 0);
++      u32 bcr  = DMA::ReadRegister(base + 4);
++      u32 chcr = DMA::ReadRegister(base + 8);
++      u32 enabled = (dpcr >> (ch * 4 + 3)) & 1;
++      channels += fmt::format(
++        R"({{"ch":{},"name":"{}","madr":"0x{:08X}","bcr":"0x{:08X}","chcr":"0x{:08X}","enabled":{}}})",
++        ch, dma_names[ch], madr, bcr, chcr, enabled);
++    }
++    channels += "]";
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"dpcr":"0x{:08X}","dicr":"0x{:08X}","channels":{}}})",
++      s_request_id, dpcr, dicr, channels));
++  }
++  // ---- irq_state ----
++  else if (std::strcmp(cmd, "irq_state") == 0)
++  {
++    u32 i_stat = InterruptController::ReadRegister(0x00);
++    u32 i_mask = InterruptController::ReadRegister(0x04);
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"i_stat":"0x{:08X}","i_mask":"0x{:08X}","chains":[]}})",
++      s_request_id, i_stat, i_mask));
++  }
++  // ---- event_state (BIOS concept — stub for DS) ----
++  else if (std::strcmp(cmd, "event_state") == 0)
++  {
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"evcb_base":0,"evcb_count":0,"events":[]}})",
++      s_request_id));
++  }
++  // ---- sio_state (read SIO/Pad registers) ----
++  else if (std::strcmp(cmd, "sio_state") == 0)
++  {
++    // Read SIO registers via Pad namespace (offsets from SIO base 0x1F801040)
++    u32 rx_data = Pad::ReadRegister(0x00);  // SIO_RX_DATA
++    u32 stat    = Pad::ReadRegister(0x04);  // SIO_STAT
++    u32 mode    = Pad::ReadRegister(0x08);  // SIO_MODE
++    u32 ctrl    = Pad::ReadRegister(0x0A);  // SIO_CTRL
++    u32 baud    = Pad::ReadRegister(0x0E);  // SIO_BAUD
++    SendJSON(fmt::format(
++      R"({{"id":{},"ok":true,"regs":{{"rx_data":"0x{:02X}","stat":"0x{:04X}","mode":"0x{:04X}","ctrl":"0x{:04X}","baud":"0x{:04X}"}},"note":"DS exposes raw registers only, not protocol state"}})",
++      s_request_id,
++      rx_data & 0xFF, stat & 0xFFFF, mode & 0xFFFF, ctrl & 0xFFFF, baud & 0xFFFF));
++  }
++  // ---- screenshot ----
++  else if (std::strcmp(cmd, "cd_sector_events") == 0)
++  {
++    int tail = json_get_int(json, "tail", 256);
++    if (tail < 1) tail = 1;
++    if (tail > 400) tail = 400;   // BufferedStreamSocket truncates large replies
++    const int lba_lo = json_get_int(json, "lba_lo", -1);
++    const int lba_hi = json_get_int(json, "lba_hi", -1);
++    const u64 total = s_cd_sector_seq;
++    u64 start = (total > static_cast<u64>(tail)) ? total - static_cast<u64>(tail) : 0;
++    if (total > CD_SECTOR_LOG_CAP && start < total - CD_SECTOR_LOG_CAP)
++      start = total - CD_SECTOR_LOG_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    for (u64 seq = start; seq < total; seq++)
++    {
++      const CdSectorEvent& e = s_cd_sector_log[seq % CD_SECTOR_LOG_CAP];
++      if (e.seq != seq)
++        continue;
++      if (lba_lo >= 0 && e.lba < lba_lo)
++        continue;
++      if (lba_hi >= 0 && e.lba > lba_hi)
++        continue;
++      resp += fmt::format(
++        R"({}{{"lba":{},"frame":{},"buffer":{},"data":{},"dropped":{},"queued":{},"delivered":{},"redelivered":{},"drained":{}}})",
++        first ? "" : ",", e.lba, e.frame, e.buffer, (e.flags & CDSE_DATA) ? 1 : 0,
++        (e.flags & CDSE_DROPPED) ? 1 : 0, (e.flags & CDSE_QUEUED) ? 1 : 0,
++        (e.flags & CDSE_DELIVERED) ? 1 : 0, (e.flags & CDSE_REDELIVERED) ? 1 : 0,
++        (e.flags & CDSE_DRAINED) ? 1 : 0);
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  else if (std::strcmp(cmd, "cd_read_log_clear") == 0)
++  {
++    s_cd_dma_log_seq = 0;
++    SendJSON(fmt::format(R"({{"id":{},"ok":true}})", s_request_id));
++  }
++  else if (std::strcmp(cmd, "cd_read_log") == 0)
++  {
++    // Filter SERVER-SIDE. Write() goes through BufferedStreamSocket, whose
++    // fixed buffer silently truncates a large reply -- the same limit that
++    // caps read_ram at 16 KB. An unfiltered dump of this log is ~570 KB, so
++    // the client received 64 KB and then waited forever. Callers pass the LBA
++    // window they care about; the reply stays a few KB.
++    int tail = json_get_int(json, "tail", 512);
++    if (tail < 1) tail = 1;
++    if (tail > static_cast<int>(CD_DMA_LOG_CAP)) tail = CD_DMA_LOG_CAP;
++    const int lba_lo = json_get_int(json, "lba_lo", -1);
++    const int lba_hi = json_get_int(json, "lba_hi", -1);
++    const int max_out = json_get_int(json, "max_entries", 256);
++    const u64 total = s_cd_dma_log_seq;
++    u64 start = (total > static_cast<u64>(tail)) ? total - static_cast<u64>(tail) : 0;
++    if (total > CD_DMA_LOG_CAP && start < total - CD_DMA_LOG_CAP)
++      start = total - CD_DMA_LOG_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    int emitted = 0;
++    for (u64 seq = start; seq < total && emitted < max_out; seq++)
++    {
++      const CdDmaEntry& e = s_cd_dma_log[seq % CD_DMA_LOG_CAP];
++      if (lba_lo >= 0 && e.lba < lba_lo)
++        continue;
++      if (lba_hi >= 0 && e.lba > lba_hi)
++        continue;
++      resp += fmt::format(
++        R"({}{{"lba":{},"delivered_lba":{},"dest":"0x{:08X}","size":{},"frame":{},"first_words":["0x{:08X}","0x{:08X}"]}})",
++        first ? "" : ",", e.lba, e.lba, e.dest, e.size, e.frame, e.first_words[0], e.first_words[1]);
++      first = false;
++      emitted++;
++    }
++    resp += fmt::format(R"(],"emitted":{}}})", emitted);
++    SendJSON(resp);
++  }
++  else if (std::strcmp(cmd, "cd_history") == 0)
++  {
++    int count = json_get_int(json, "count", 512);
++    if (count < 1) count = 1;
++    // Cap for the same BufferedStreamSocket reason as cd_read_log above.
++    if (count > 600) count = 600;
++    if (count > static_cast<int>(CD_CMD_HISTORY_CAP)) count = CD_CMD_HISTORY_CAP;
++    const u64 total = s_cd_cmd_history_seq;
++    u64 start = (total > static_cast<u64>(count)) ? total - static_cast<u64>(count) : 0;
++    if (total > CD_CMD_HISTORY_CAP && start < total - CD_CMD_HISTORY_CAP)
++      start = total - CD_CMD_HISTORY_CAP;
++    std::string resp = fmt::format(R"({{"id":{},"ok":true,"total":{},"entries":[)", s_request_id, total);
++    bool first = true;
++    for (u64 seq = start; seq < total; seq++)
++    {
++      const CdCmdEntry& e = s_cd_cmd_history[seq % CD_CMD_HISTORY_CAP];
++      if (e.seq != seq)
++        continue;
++      resp += fmt::format(R"({}{{"seq":{},"frame":{},"cmd":"0x{:02X}","params":[)", first ? "" : ",", e.seq,
++                          e.frame, e.command);
++      for (u32 i = 0; i < e.param_count; i++)
++        resp += fmt::format(R"({}"0x{:02X}")", i ? "," : "", e.params[i]);
++      resp += "]}";
++      first = false;
++    }
++    resp += "]}";
++    SendJSON(resp);
++  }
++  else if (std::strcmp(cmd, "screenshot") == 0)
++  {
++    char path[256] = {};
++    json_get_str(json, "path", path, sizeof(path));
++    if (path[0] == '\0')
++    {
++      SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"missing path"}})", s_request_id));
++    }
++    else
++    {
++      u16 dx = g_gpu.GetDisplayVRAMLeft();
++      u16 dy = g_gpu.GetDisplayVRAMTop();
++      u16 dw = g_gpu.GetDisplayVRAMWidth();
++      u16 dh = g_gpu.GetDisplayVRAMHeight();
++      if (dw == 0) dw = 320;
++      if (dh == 0) dh = 240;
++
++      Image img(dw, dh, ImageFormat::RGBA8);
++      for (u16 row = 0; row < dh; row++)
++      {
++        u32* dst = reinterpret_cast<u32*>(img.GetRowPixels(row));
++        for (u16 col = 0; col < dw; col++)
++        {
++          u16 vx = (dx + col) & (VRAM_WIDTH - 1);
++          u16 vy = (dy + row) & (VRAM_HEIGHT - 1);
++          u16 pixel = g_vram[vy * VRAM_WIDTH + vx];
++          u8 r = static_cast<u8>((pixel & 0x1F) << 3);
++          u8 g = static_cast<u8>(((pixel >> 5) & 0x1F) << 3);
++          u8 b = static_cast<u8>(((pixel >> 10) & 0x1F) << 3);
++          dst[col] = static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) | 0xFF000000u;
++        }
++      }
++
++      Error error;
++      if (img.SaveToFile(path, 85, &error))
++        SendJSON(fmt::format(R"({{"id":{},"ok":true,"path":"{}","w":{},"h":{}}})", s_request_id, path, dw, dh));
++      else
++        SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"save failed: {}"}})", s_request_id, error.GetDescription()));
++    }
++  }
++  // ---- unknown ----
++  else
++  {
++    SendJSON(fmt::format(R"({{"id":{},"ok":false,"error":"unknown command: {}"}})", s_request_id, cmd));
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++bool PSXRecompDebug::Initialize(u16 port)
++{
++  Error error;
++  Assert(!s_listen_socket);
++
++  const std::optional<SocketAddress> address =
++    SocketAddress::Parse(SocketAddress::Type::IPv4, "127.0.0.1", port, &error);
++  if (!address.has_value())
++  {
++    ERROR_LOG("Failed to parse address: {}", error.GetDescription());
++    return false;
++  }
++
++  SocketMultiplexer* multiplexer = System::GetSocketMultiplexer();
++  if (!multiplexer) return false;
++
++  s_listen_socket = multiplexer->CreateListenSocket<ClientSocket>(address.value(), &error);
++  if (!s_listen_socket)
++  {
++    ERROR_LOG("Failed to create listen socket: {}", error.GetDescription());
++    System::ReleaseSocketMultiplexer();
++    return false;
++  }
++
++  s_frame_counter = 0;
++  s_paused = false;
++  s_step_frames = 0;
++  s_run_to_frame = 0;
++  s_history_count = 0;
++  std::memset(s_watchpoints, 0, sizeof(s_watchpoints));
++  std::memset(s_pc_breaks, 0, sizeof(s_pc_breaks));
++  s_pc_hit_last.valid = false;
++  std::memset(s_history, 0, sizeof(s_history));
++
++  INFO_LOG("PSXRecomp debug server listening on 127.0.0.1:{}", port);
++  return true;
++}
++
++bool PSXRecompDebug::HasAnyClients() { return !s_clients.empty(); }
++
++void PSXRecompDebug::Shutdown()
++{
++  if (!s_listen_socket) return;
++  INFO_LOG("Shutting down PSXRecomp debug server ({} clients)", s_clients.size());
++  s_clients.clear();
++  s_listen_socket.reset();
++  System::ReleaseSocketMultiplexer();
++}
++
++void PSXRecompDebug::OnFrameDone()
++{
++  s_frame_counter++;
++
++  // Before anything else: the fingerprint describes the frame that just ran.
++  fp_snapshot(s_frame_counter);
++
++  // ---- Record frame into ring buffer ----
++  u32 idx = s_frame_counter % FRAME_HISTORY_CAP;
++  FrameRecord& r = s_history[idx];
++  r.frame_number = s_frame_counter;
++
++  // CPU
++  for (int i = 0; i < 32; i++)
++    r.gpr[i] = CPU::g_state.regs.r[i];
++  r.pc = CPU::g_state.pc;
++  r.hi = CPU::g_state.regs.hi;
++  r.lo = CPU::g_state.regs.lo;
++
++  // GPU
++  r.display_vram_left = g_gpu.GetDisplayVRAMLeft();
++  r.display_vram_top = g_gpu.GetDisplayVRAMTop();
++  r.display_vram_width = g_gpu.GetDisplayVRAMWidth();
++  r.display_vram_height = g_gpu.GetDisplayVRAMHeight();
++  r.display_disable = g_gpu.IsDisplayDisabled() ? 1 : 0;
++  r.interlaced = g_gpu.IsInterlacedDisplayEnabled() ? 1 : 0;
++  r.pal_mode = g_gpu.IsInPALMode() ? 1 : 0;
++  r._gpu_pad = 0;
++
++  // Pad
++  Controller* ctrl = System::GetController(0);
++  r.pad1_buttons = ctrl ? static_cast<u16>(ctrl->GetButtonStateBits()) : 0xFFFF;
++
++  r._reserved = 0;
++
++  // RAM snapshots
++  for (int si = 0; si < RAM_SNAPSHOT_REGIONS; si++)
++  {
++    r.snapshot_addr[si] = s_snapshot_addrs[si];
++    if (s_snapshot_addrs[si] != 0 && s_snapshot_addrs[si] + RAM_SNAPSHOT_SIZE <= Bus::g_ram_size)
++      std::memcpy(r.snapshot_data[si], Bus::g_ram + s_snapshot_addrs[si], RAM_SNAPSHOT_SIZE);
++    else
++      std::memset(r.snapshot_data[si], 0, RAM_SNAPSHOT_SIZE);
++  }
++
++  s_history_count = static_cast<u64>(s_frame_counter) + 1;
++
++  // ---- Input override ----
++  if (s_input_override >= 0)
++  {
++    Controller* pad = System::GetController(0);
++    if (pad)
++    {
++      u16 mask = static_cast<u16>(s_input_override);
++      for (u32 bit = 0; bit < 16; bit++)
++      {
++        // PS1 bitmask: 0 = pressed, 1 = released
++        float value = ((mask >> bit) & 1) == 0 ? 1.0f : 0.0f;
++        pad->SetBindState(bit, value);
++      }
++    }
++  }
++
++  // ---- Watchpoints ----
++  for (int i = 0; i < MAX_WATCHPOINTS; i++)
++  {
++    if (!s_watchpoints[i].active || s_watchpoints[i].addr >= Bus::g_ram_size)
++      continue;
++    u8 cur = Bus::g_ram[s_watchpoints[i].addr];
++    if (cur != s_watchpoints[i].prev_val)
++    {
++      BroadcastJSON(fmt::format(
++        R"({{"event":"watchpoint","addr":"0x{:08X}","old":"0x{:02X}","new":"0x{:02X}","frame":{}}})",
++        s_watchpoints[i].addr | 0x80000000u, s_watchpoints[i].prev_val, cur, s_frame_counter));
++      s_watchpoints[i].prev_val = cur;
++    }
++  }
++
++  // ---- Step mode ----
++  if (s_step_frames > 0)
++  {
++    s_step_frames--;
++    if (s_step_frames == 0)
++    {
++      s_paused = true;
++      System::PauseSystem(true);
++      BroadcastJSON(fmt::format(R"({{"event":"step_done","frame":{}}})", s_frame_counter));
++    }
++  }
++
++  // ---- Run-to-frame mode ----
++  if (s_run_to_frame > 0 && s_frame_counter >= s_run_to_frame)
++  {
++    s_run_to_frame = 0;
++    s_paused = true;
++    System::PauseSystem(true);
++    BroadcastJSON(fmt::format(R"({{"event":"run_to_done","frame":{}}})", s_frame_counter));
++  }
++}
+diff --git a/src/core/psxrecomp_debug_server.h b/src/core/psxrecomp_debug_server.h
+new file mode 100644
+index 00000000..4ac2ebe8
+--- /dev/null
++++ b/src/core/psxrecomp_debug_server.h
+@@ -0,0 +1,68 @@
++// PSXRecomp TCP debug server for DuckStation
++// JSON-over-newline protocol on localhost:4371
++// Same protocol as the PSXRecomp runner debug server.
++// Includes 36000-frame ring buffer for retroactive state queries.
++
++#pragma once
++
++#include "common/types.h"
++
++namespace PSXRecompDebug {
++
++bool Initialize(u16 port = 4371);
++void Shutdown();
++bool HasAnyClients();
++
++/// Call once per frame from System::FrameDone(). Records frame state into
++/// the ring buffer, checks watchpoints, handles step-N logic.
++void OnFrameDone();
++
++/// Fold one guest write into the per-frame fingerprint. Called from the
++/// interpreter's store path in cpu_core.cpp.
++///
++/// This mirrors fp_record_write() in psxrecomp's debug_server.c byte for byte,
++/// including the FNV-1a constants and the decision to keep main RAM,
++/// scratchpad, and MMIO in SEPARATE hashes -- folding device-register churn
++/// into the RAM signal is what previously hid a real first divergence, because
++/// the RAM hash only ever sees the AFTERMATH of a device-interaction fork.
++///
++/// The two emulators must agree exactly or `frame_fingerprint` compares
++/// nothing. Do not "improve" the hash on one side.
++void RecordWrite(u32 addr, u32 value, u32 pc);
++
++/// True when a client has armed fingerprinting. The store hook checks this
++/// first so an unattached oracle pays almost nothing.
++bool FingerprintArmed();
++
++/// Record one CDROM command as it begins execution (called from
++/// CDROM::ExecuteCommand). Mirrors psx-runtime's cdrom_command_history so
++/// the two emulators' command streams can be diffed directly -- the
++/// measurement that localises a game-side request divergence like Legend of
++/// Mana's land-creation palette load (native requests sector 125113 where
++/// the oracle requests 125112; every layer below the game measures clean).
++void RecordCdCommand(u8 command, const u8* params, u32 param_count);
++
++/// Record one channel-3 DMA into RAM (called from DMA::TransferMemoryBlock).
++/// Mirrors psx-runtime's cd_read_log so the two slot maps can be diffed.
++void RecordCdDma(u32 dest, u32 size_bytes, s32 lba, const void* data);
++
++/// Per-sector notification accounting, mirroring psx-runtime's per-sector
++/// delivery records ([D]ata / [P]ended / [L]ost). psx-runtime delivers an
++/// immediate INT1 for a sector arriving with the flag clear; DuckStation may
++/// instead DROP it and re-announce after the guest drains. Which of those
++/// happens to the sectors the guest misses is the open question.
++enum : u8
++{
++  CDSE_DATA = 1,        // sector stored in a buffer
++  CDSE_DROPPED = 2,     // INT1 not raised: one was already unacknowledged
++  CDSE_QUEUED = 4,      // INT1 became the pending async interrupt
++  CDSE_DELIVERED = 8,   // INT1 actually presented to the guest
++  CDSE_REDELIVERED = 16,// re-announced by the missed-sector path
++  CDSE_DRAINED = 32,    // guest read the buffer to completion
++};
++void RecordCdSector(s32 lba, u32 buffer);
++void FlagCdSector(u32 buffer, u8 bits);
++void FlagCdSectorDelivered(u32 buffer);
++void FlagCdSectorDrained();
++
++} // namespace PSXRecompDebug
+diff --git a/src/core/system.cpp b/src/core/system.cpp
+index a36ad755..1d23daf5 100644
+--- a/src/core/system.cpp
++++ b/src/core/system.cpp
+@@ -102,6 +102,7 @@ LOG_CHANNEL(System);
+ #define ENABLE_GDB_SERVER 1
+ #define ENABLE_SOCKET_MULTIPLEXER 1
+ #include "gdb_server.h"
++#include "psxrecomp_debug_server.h"
+ #endif
+ 
+ // #define PROFILE_MEMORY_SAVE_STATES 1
+@@ -2018,6 +2019,9 @@ bool System::BootSystem(SystemBootParameters parameters, Error* error)
+     GDBServer::Initialize(g_settings.gdb_server_port);
+ #endif
+ 
++  // PSXRecomp debug server — always enabled on port 4371
++  PSXRecompDebug::Initialize(4371);
++
+   Host::OnSystemStarted();
+ 
+   if (parameters.load_image_to_ram || g_settings.cdrom_load_image_to_ram)
+@@ -2136,6 +2140,8 @@ void System::DestroySystem()
+   GDBServer::Shutdown();
+ #endif
+ 
++  PSXRecompDebug::Shutdown();
++
+   VideoThread::RunOnThread([]() {
+     VideoThread::SetRunIdleReason(VideoThread::RunIdleReason::SystemPaused, false);
+     Host::ClearOSDMessages();
+@@ -2278,6 +2284,8 @@ void System::FrameDone()
+       Achievements::FrameUpdate();
+   }
+ 
++  PSXRecompDebug::OnFrameDone();
++
+ #ifdef ENABLE_DISCORD_PRESENCE
+   PollDiscordPresence();
+ #endif
+diff --git a/src/duckstation-qt/CMakeLists.txt b/src/duckstation-qt/CMakeLists.txt
+index acb8e40c..b7f7b8e3 100644
+--- a/src/duckstation-qt/CMakeLists.txt
++++ b/src/duckstation-qt/CMakeLists.txt
+@@ -210,7 +210,7 @@ foreach(src ${SRCS})
+     list(APPEND UI_FILES ${src})
+   endif()
+ endforeach()
+-qt_wrap_ui(UI_SRCS SOURCES ${UI_FILES})
++qt_wrap_ui(UI_SRCS ${UI_FILES})
+ target_sources(duckstation-qt PRIVATE ${UI_SRCS})
+ target_include_directories(duckstation-qt PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>")
+ 

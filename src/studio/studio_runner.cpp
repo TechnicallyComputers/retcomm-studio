@@ -392,14 +392,22 @@ RunResult run_project_studio(StudioModel& model, const std::vector<std::string>&
     setenv("RETCOMM_STUDIO_TOOLKIT", model.toolkit_dir.string().c_str(), 1);
 #endif
 
+    // --platform is global and goes ahead of the subcommand. Injecting it here
+    // rather than at each call site is deliberate: it is a property of the
+    // session, and ~90 call sites each remembering to pass it is ~90 chances
+    // for a SNES session to quietly run a PSX command.
     std::vector<std::string> full = {"-m", "project_studio"};
+    if (model.platform != Platform::None) {
+        full.push_back("--platform");
+        full.push_back(platform_key(model.platform));
+    }
     full.insert(full.end(), args.begin(), args.end());
 
     {
         std::string shown = model.python_exe + " -m project_studio";
-        for (const auto& a : args) {
+        for (auto it = full.begin() + 2; it != full.end(); ++it) {
             shown += " ";
-            shown += a;
+            shown += *it;
         }
         model.append_log("$ " + shown);
     }
@@ -439,6 +447,229 @@ void run_project_studio_async(StudioModel& model, std::vector<std::string> args,
     }).detach();
 }
 
+#if defined(_WIN32)
+
+long spawn_detached_logged(const std::string& exe, const std::vector<std::string>& args,
+                           const std::string& cwd, const std::string& logfile,
+                           const std::vector<std::pair<std::string, std::string>>& env,
+                           std::string* err) {
+    for (const auto& kv : env) SetEnvironmentVariableA(kv.first.c_str(), kv.second.c_str());
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE log = CreateFileA(logfile.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE) {
+        if (err) *err = "cannot open " + logfile;
+        return 0;
+    }
+    std::string cmdline = "\"" + exe + "\"";
+    for (const auto& a : args) cmdline += " \"" + a + "\"";
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = log;
+    si.hStdError = log;
+    PROCESS_INFORMATION pi{};
+    const BOOL ok = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+                                   CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS, nullptr,
+                                   cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    CloseHandle(log);
+    if (!ok) {
+        if (err) *err = "CreateProcess failed";
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<long>(pi.dwProcessId);
+}
+
+bool process_alive(long pid) {
+    if (pid <= 0) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (!h) return false;
+    DWORD code = 0;
+    const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
+bool process_stop(long pid) {
+    if (pid <= 0) return false;
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, static_cast<DWORD>(pid));
+    if (!h) return false;
+    const bool ok = TerminateProcess(h, 0) != 0;
+    CloseHandle(h);
+    return ok;
+}
+
+#else
+
+long spawn_detached_logged(const std::string& exe, const std::vector<std::string>& args,
+                           const std::string& cwd, const std::string& logfile,
+                           const std::vector<std::pair<std::string, std::string>>& env,
+                           std::string* err) {
+    const pid_t pid = fork();
+    if (pid < 0) {
+        if (err) *err = "fork failed";
+        return 0;
+    }
+    if (pid == 0) {
+        setsid();   // survive Studio exiting
+        const int fd = ::open(logfile.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            dup2(fd, STDERR_FILENO);
+            if (fd > STDERR_FILENO) ::close(fd);
+        }
+        ::close(STDIN_FILENO);
+        if (!cwd.empty()) { if (chdir(cwd.c_str()) != 0) _exit(127); }
+        for (const auto& kv : env) setenv(kv.first.c_str(), kv.second.c_str(), 1);
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(exe.c_str()));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execv(exe.c_str(), argv.data());
+        _exit(127);
+    }
+    return static_cast<long>(pid);
+}
+
+bool process_alive(long pid) {
+    if (pid <= 0) return false;
+    // Reap first: a detached child we forked stays a zombie until waited on,
+    // and a zombie answers kill(0) as alive.
+    int status = 0;
+    ::waitpid(static_cast<pid_t>(pid), &status, WNOHANG);
+    return ::kill(static_cast<pid_t>(pid), 0) == 0;
+}
+
+bool process_stop(long pid) {
+    if (pid <= 0) return false;
+    return ::kill(static_cast<pid_t>(pid), SIGTERM) == 0;
+}
+
+#endif
+
+std::string python_with_modules(StudioModel& model,
+                                const std::vector<std::string>& modules) {
+    if (modules.empty()) return model.python_exe;
+
+    static std::mutex mu;
+    static std::map<std::string, std::string> cache;
+    std::string key;
+    for (const auto& m : modules) key += m + ",";
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+    }
+
+    std::string import_line = "import ";
+    for (size_t i = 0; i < modules.size(); ++i)
+        import_line += (i ? ", " : "") + modules[i];
+
+    // Toolchain first (pinned, predictable), then whatever the host provides.
+    std::vector<std::string> candidates;
+    if (!model.python_exe.empty()) candidates.push_back(model.python_exe);
+    candidates.emplace_back("python3");
+    candidates.emplace_back("python");
+
+    std::string chosen;
+    for (const auto& cand : candidates) {
+        RunResult r = run_process(cand, {"-c", import_line}, nullptr, false);
+        if (r.ok()) {
+            chosen = cand;
+            break;
+        }
+    }
+    std::lock_guard<std::mutex> lk(mu);
+    cache[key] = chosen;
+    return chosen;
+}
+
+void run_python_script_async(StudioModel& model, std::string script,
+                             std::vector<std::string> args, DoneFn on_done,
+                             bool log_stdout, JobSlot slot,
+                             std::vector<std::string> requires_modules) {
+    std::atomic<bool>& lock = (slot == JobSlot::Global)  ? model.busy_global
+                              : (slot == JobSlot::Frames) ? model.busy_frames
+                                                          : model.busy;
+    if (model.python_exe.empty()) {
+        std::string e;
+        resolve_runtime(model, &e);  // best effort: we only need the interpreter
+    }
+    if (model.python_exe.empty()) {
+        model.append_log("[FAIL] No python interpreter found.");
+        if (on_done) {
+            RunResult r;
+            r.exit_code = 1;
+            r.stderr_text = "no python";
+            on_done(std::move(r));
+        }
+        return;
+    }
+    if (lock.exchange(true)) {
+        model.append_log(slot == JobSlot::Project
+                             ? "[FAIL] Another job is already running."
+                             : "[FAIL] That background job is already running.");
+        if (on_done) {
+            RunResult r;
+            r.exit_code = 1;
+            r.stderr_text = "busy";
+            on_done(std::move(r));
+        }
+        return;
+    }
+    std::string interpreter = model.python_exe;
+    if (!requires_modules.empty()) {
+        interpreter = python_with_modules(model, requires_modules);
+        if (interpreter.empty()) {
+            std::string names;
+            for (size_t i = 0; i < requires_modules.size(); ++i)
+                names += (i ? ", " : "") + requires_modules[i];
+            const std::string msg =
+                "[FAIL] No python found that can import: " + names +
+                ".  Install them into the toolchain python:\n    " +
+                model.python_exe + " -m pip install numpy pillow";
+            model.append_log(msg);
+            lock.store(false);
+            if (on_done) {
+                RunResult r;
+                r.exit_code = 1;
+                r.stderr_text = "missing python modules: " + names;
+                std::lock_guard<std::mutex> qlock(g_done_mu);
+                g_done_queue.push_back(PendingDone{std::move(on_done), std::move(r)});
+            }
+            return;
+        }
+        if (interpreter != model.python_exe)
+            model.append_log("using " + interpreter + " (the toolchain python "
+                             "cannot import " + requires_modules[0] + ")");
+    }
+
+    std::thread([&model, &lock, script = std::move(script), args = std::move(args),
+                 on_done = std::move(on_done), log_stdout,
+                 interpreter = std::move(interpreter)]() mutable {
+        std::vector<std::string> full = {script};
+        full.insert(full.end(), args.begin(), args.end());
+        {
+            std::string shown = interpreter + " " + script;
+            for (const auto& a : args) {
+                shown += " ";
+                shown += a;
+            }
+            model.append_log("$ " + shown);
+        }
+        RunResult r = run_process(interpreter, full, &model, log_stdout);
+        lock.store(false);
+        if (on_done) {
+            std::lock_guard<std::mutex> qlock(g_done_mu);
+            g_done_queue.push_back(PendingDone{std::move(on_done), std::move(r)});
+        }
+    }).detach();
+}
+
 void pump_async_jobs(StudioModel& /*model*/) {
     std::vector<PendingDone> local;
     {
@@ -450,6 +681,22 @@ void pump_async_jobs(StudioModel& /*model*/) {
     }
 }
 
+// nlohmann's value() falls back only when the KEY IS ABSENT. A key that is
+// present and null throws type_error.302 — which is how a SNES audit, whose
+// boot_exe is legitimately null because a cartridge boots from its reset
+// vector rather than a named executable, failed to parse at all.
+//
+// Every optional field crossing this boundary comes from a Python dataclass
+// with `str | None` somewhere in it, so this is the rule for all of them, not
+// a patch for one.
+std::string json_str(const nlohmann::json& j, const char* key, const char* fallback = "") {
+    if (!j.contains(key)) return fallback;
+    const auto& v = j.at(key);
+    if (v.is_null()) return fallback;
+    if (v.is_string()) return v.get<std::string>();
+    return v.dump();  // a number/bool where a string was expected: show it, don't throw
+}
+
 bool load_repos_from_json(StudioModel& model, const std::string& json_text, std::string* err) {
     try {
         auto j = nlohmann::json::parse(json_text);
@@ -459,13 +706,13 @@ bool load_repos_from_json(StudioModel& model, const std::string& json_text, std:
         model.bulk_jobs = j.value("bulk_jobs", 2);
         model.log_height = j.value("log_height", 160);
         model.log_h_pref = static_cast<float>(std::max(100, model.log_height));
-        const std::string last = j.value("last", "");
+        const std::string last = json_str(j, "last");
         for (const auto& r : j.at("repos")) {
             RepoEntry e;
-            e.path = r.value("path", "");
-            e.name = r.value("name", "");
-            e.cue = r.value("cue", "");
-            e.label = r.value("label", "");
+            e.path = json_str(r, "path");
+            e.name = json_str(r, "name");
+            e.cue = json_str(r, "cue");
+            e.label = json_str(r, "label");
             e.in_catalog = r.value("in_catalog", false);
             e.players = r.value("players", 2);
             if (e.players < 1) e.players = 1;
@@ -505,17 +752,15 @@ bool load_audit_from_json(StudioModel& model, const std::string& json_text, std:
         auto j = nlohmann::json::parse(json_text);
         std::lock_guard<std::mutex> lock(model.mu);
         model.audit_checks.clear();
-        model.audit_layout = j.value("layout", "");
-        model.audit_boot = j.value("boot_exe", "");
-        if (model.audit_boot == "null") model.audit_boot.clear();
+        model.audit_layout = json_str(j, "layout");
+        model.audit_boot = json_str(j, "boot_exe");
         for (const auto& c : j.at("checks")) {
             AuditCheck a;
-            a.id = c.value("id", "");
-            a.title = c.value("title", "");
-            a.status = c.value("status", "");
-            a.detail = c.value("detail", "");
-            if (c.contains("fix_op") && !c["fix_op"].is_null())
-                a.fix_op = c.value("fix_op", "");
+            a.id = json_str(c, "id");
+            a.title = json_str(c, "title");
+            a.status = json_str(c, "status");
+            a.detail = json_str(c, "detail");
+            a.fix_op = json_str(c, "fix_op");
             model.audit_checks.push_back(std::move(a));
         }
         return true;
@@ -532,9 +777,9 @@ bool load_plan_from_json(StudioModel& model, const std::string& json_text, std::
         model.plan_steps.clear();
         for (const auto& s : j.at("steps")) {
             PlanStep p;
-            p.op_id = s.value("op_id", "");
-            p.title = s.value("title", "");
-            p.detail = s.value("detail", "");
+            p.op_id = json_str(s, "op_id");
+            p.title = json_str(s, "title");
+            p.detail = json_str(s, "detail");
             p.selected = s.value("selected", true);
             model.plan_steps.push_back(std::move(p));
         }

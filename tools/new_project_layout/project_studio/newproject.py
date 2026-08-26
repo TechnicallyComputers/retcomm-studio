@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import platforms, snes_paths
 from .gitops import CmdResult, switch_modules
 from .paths import toolkit_dir
 
@@ -31,6 +32,8 @@ class NewProjectOptions:
     description: str = ""
     publisher: str = ""
     year: str = ""
+    # PSX default. The SNES path leaves this blank so the cartridge header
+    # decides — see build_snes_command.
     region: str = "USA"
 
     enable_recomp_ui: bool = True
@@ -48,8 +51,16 @@ class NewProjectOptions:
 
     psxrecomp_ref: str = "master"
     recomp_ui_ref: str = "master"
-    recomp_net_ref: str = ""  # empty = keep psxrecomp pin
-    rbengine_ref: str = ""  # post-setup switch only (script has no flag)
+    recomp_net_ref: str = ""  # empty = keep the framework's pin
+    rbengine_ref: str = ""  # post-setup switch only (psx script has no flag)
+
+    # --- SNES only ---------------------------------------------------------
+    # `disc` carries the ROM path on SNES; there is no second field, because a
+    # project has exactly one game image and two would let them disagree.
+    platform: str = "psx"
+    snesrecomp_ref: str = "main"
+    multitap: str = ""  # port1 | port2 | both | off; "" = derive from players
+    enable_rollback: bool = False
 
     dry_run: bool = False
 
@@ -62,6 +73,15 @@ def setup_script_paths() -> tuple[Path, Path]:
 
 def is_windows() -> bool:
     return platform.system().lower().startswith("win") or os.name == "nt"
+
+
+def opts_platform(opts: "NewProjectOptions") -> str:
+    """The console this scaffold is for; falls back to the session's."""
+    return platforms.normalize(opts.platform or platforms.current().key)
+
+
+def is_snes(opts: "NewProjectOptions") -> bool:
+    return opts_platform(opts) == "snes"
 
 
 def project_folder_name(opts: NewProjectOptions) -> str:
@@ -88,22 +108,32 @@ def project_root_for(opts: NewProjectOptions) -> Path:
 
 def validate_options(opts: NewProjectOptions) -> list[str]:
     errs: list[str] = []
+    snes = is_snes(opts)
+    profile = platforms.get(opts_platform(opts))
     name = (opts.name or "").strip()
     disc = (opts.disc or "").strip()
     if not name:
         errs.append("Project name is required")
     if not disc:
-        errs.append("Disc .cue path is required")
+        errs.append(f"{profile.image_label} path is required")
     else:
         p = Path(disc).expanduser()
         if not p.is_file():
-            errs.append(f"Disc not found: {disc}")
-    if opts.bios:
+            errs.append(f"{'ROM' if snes else 'Disc'} not found: {disc}")
+        elif snes and p.suffix.lower() not in profile.image_exts:
+            errs.append(f"Not a SNES ROM (expected .sfc / .smc): {p.name}")
+    if opts.bios and not snes:
         bp = Path(opts.bios).expanduser()
         if not bp.is_file():
             errs.append(f"BIOS not found: {opts.bios}")
     if opts.players < 1 or opts.players > 8:
         errs.append("Players must be 1–8")
+    if snes:
+        tap = (opts.multitap or "").strip().lower()
+        if tap and tap not in ("port1", "port2", "both", "off"):
+            errs.append("Multitap must be port1 / port2 / both / off")
+        if not snes_paths.setup_script(None).is_file():
+            errs.append("snesrecomp setup_project.sh not found (no checkout, no vendored copy)")
     if opts.do_build and not opts.do_generate:
         errs.append("Build requires Generate")
     # Wizard/netplay without UI (and 1P netplay) are auto-corrected at run time.
@@ -117,11 +147,111 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
     return errs
 
 
+def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
+    """argv + env for snesrecomp's ``tools/new_project/setup_project.sh``.
+
+    Only the flags that script actually has. The PSX form carries disc
+    metadata (publisher / year / region / boxart / lobby) that the SNES
+    scaffold has no slot for; passing them anyway would abort the run on an
+    unknown flag, so they are dropped here and the caller is told which ones.
+    """
+    script = snes_paths.setup_script(None)
+    if not script.is_file():
+        raise FileNotFoundError(f"Missing setup script: {script}")
+
+    env = os.environ.copy()
+    env["SNESRECOMP_SETUP_YES"] = "1"
+
+    cmd: list[str] = [
+        "sh",
+        str(script),
+        "--yes",
+        "--rom",
+        str(Path(opts.disc).expanduser().resolve()),
+        "--name",
+        opts.name.strip(),
+        "--players",
+        str(int(opts.players)),
+        "--dir",
+        str(Path((opts.parent_dir or ".").strip() or ".").expanduser().resolve()),
+        "--snesrecomp-ref",
+        (opts.snesrecomp_ref or "main").strip(),
+        "--github-visibility",
+        (opts.github_visibility or "private").strip().lower(),
+    ]
+    if (opts.multitap or "").strip():
+        cmd.extend(["--multitap", opts.multitap.strip().lower()])
+    if opts.zip_prefix:
+        cmd.extend(["--zip-prefix", opts.zip_prefix.strip()])
+    if opts.github_owner:
+        cmd.extend(["--github-owner", opts.github_owner.strip()])
+    if opts.github_repo:
+        cmd.extend(["--github-repo", opts.github_repo.strip()])
+    # README metadata the wizard prompts for on a terminal. Studio always
+    # passes --yes, which takes every default, so anything the user typed has
+    # to arrive as a flag or it is silently lost.
+    if opts.description:
+        cmd.extend(["--description", opts.description.strip()])
+    if opts.publisher:
+        cmd.extend(["--publisher", opts.publisher.strip()])
+    if opts.year:
+        cmd.extend(["--year", opts.year.strip()])
+    # Region only when set. Blank means "use the cartridge header", which is a
+    # better answer than any default Studio could carry — sending a habitual
+    # "USA" would relabel a Japanese cartridge.
+    if (opts.region or "").strip():
+        cmd.extend(["--region", opts.region.strip()])
+    if (opts.recomp_net_ref or "").strip():
+        cmd.extend(["--recomp-net-ref", opts.recomp_net_ref.strip()])
+    if (opts.rbengine_ref or "").strip():
+        cmd.extend(["--rbengine-ref", opts.rbengine_ref.strip()])
+    if opts.enable_recomp_ui:
+        cmd.extend(["--recomp-ui", "--recomp-ui-ref", (opts.recomp_ui_ref or "master").strip()])
+    else:
+        cmd.append("--no-recomp-ui")
+
+    def flag(yes: bool, on: str, off: str) -> None:
+        cmd.append(on if yes else off)
+
+    # --rollback implies --netplay in the script; keep our argv consistent
+    # with that rather than relying on order.
+    flag(opts.enable_netplay or opts.enable_rollback, "--netplay", "--no-netplay")
+    flag(opts.enable_rollback, "--rollback", "--no-rollback")
+    flag(opts.enable_ci, "--ci", "--no-ci")
+    flag(opts.do_generate or opts.do_build, "--generate", "--no-generate")
+    flag(opts.do_build, "--build", "--no-build")
+    flag(opts.create_github, "--create-github", "--no-github")
+    return cmd, env
+
+
+def snes_ignored_fields(opts: NewProjectOptions) -> list[str]:
+    """PSX-only inputs the SNES scaffolder has no flag for.
+
+    Description / publisher / year / region are deliberately NOT here: the
+    wizard grew prompts for them, and Studio passes them as flags.
+    """
+    ignored: list[str] = []
+    for label, value in (
+        ("BIOS", opts.bios),
+        ("Boot EXE", opts.boot_exe),
+        ("Lobby URL", opts.lobby_url if opts.enable_netplay else ""),
+    ):
+        if (value or "").strip():
+            ignored.append(label)
+    if opts.fetch_boxart:
+        ignored.append("Boxart")
+    if opts.stage_disc:
+        ignored.append("Stage image")
+    return ignored
+
+
 def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
     """Build argv + env for the OS-appropriate setup script.
 
     Always passes ``--yes`` / ``-Yes`` so the GUI/CLI supply every choice.
     """
+    if is_snes(opts):
+        return build_snes_command(opts)
     sh, ps1 = setup_script_paths()
     env = os.environ.copy()
     env["PSXRECOMP_SETUP_YES"] = "1"
@@ -271,6 +401,17 @@ def run_new_project(
         opts.enable_netplay = False
     if opts.players < 2:
         opts.enable_netplay = False
+        opts.enable_rollback = False
+
+    if is_snes(opts):
+        if on_line:
+            on_line(f"Using snesrecomp wizard: {snes_paths.wizard_source(None)}")
+            ignored = snes_ignored_fields(opts)
+            if ignored:
+                # Say it rather than silently dropping: the fields are on
+                # screen, and a scaffold that ignored them without a word looks
+                # like it honoured them.
+                on_line("note: not used by the SNES scaffolder — " + ", ".join(ignored))
 
     try:
         cmd, env = build_command(opts)
@@ -363,6 +504,8 @@ def index_new_project(
 
     if not root.is_dir():
         return CmdResult(False, f"Project root missing: {root}")
+    # load_index() resolves the per-platform file, so a SNES scaffold lands in
+    # the SNES list without this function knowing which one that is.
     idx = load_index()
     entry = add_repo(idx, root, name=name or root.name, cue=cue)
     notes: list[str] = [entry.path]

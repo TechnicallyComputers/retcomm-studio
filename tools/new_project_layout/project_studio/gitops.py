@@ -15,19 +15,59 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import platforms
+
 DEFAULT_PSXRECOMP_URL = "https://github.com/mstan/psxrecomp.git"
 DEFAULT_RECOMP_UI_URL = "https://github.com/mstan/recomp-ui.git"
 DEFAULT_RECOMP_NET_URL = "https://github.com/TechnicallyComputers/recomp-net.git"
 DEFAULT_RBENGINE_URL = "https://github.com/TechnicallyComputers/retcomm-rbengine.git"
 DEFAULT_BRANCH = "master"
 DEFAULT_NESTED_BRANCH = "main"
-KNOWN_SUBMODULES = ("psxrecomp", "recomp-ui")
-# Nested under a psxrecomp checkout (game/psxrecomp or the engine repo itself).
+# Nested under the framework checkout (game/<framework> or the engine repo
+# itself). Both consoles vendor the same two libraries at the same paths.
 KNOWN_NESTED_SUBMODULES: tuple[tuple[str, str, str], ...] = (
     ("lib/recomp-net", DEFAULT_RECOMP_NET_URL, DEFAULT_NESTED_BRANCH),
     ("lib/retcomm-rbengine", DEFAULT_RBENGINE_URL, DEFAULT_NESTED_BRANCH),
 )
 NESTED_PATHS = tuple(p for p, _, _ in KNOWN_NESTED_SUBMODULES)
+
+
+# ---------------------------------------------------------------------------
+# Which framework this session's repos are built on.
+#
+# Everything below used to say "psxrecomp" literally. These four helpers are
+# the only place that decision is now made, so a SNES session gets snesrecomp
+# in the submodule path, the default URL, the default branch and every error
+# message without a single call site passing a flag.
+# ---------------------------------------------------------------------------
+def framework_name() -> str:
+    return platforms.current().framework
+
+
+def framework_url() -> str:
+    return platforms.current().framework_url
+
+
+def framework_branch() -> str:
+    return platforms.current().framework_branch
+
+
+def framework_prefix() -> str:
+    return framework_name() + "/"
+
+
+def known_submodules() -> tuple[str, ...]:
+    return (framework_name(), "recomp-ui")
+
+
+# There is deliberately no KNOWN_SUBMODULES constant. One existed as a
+# back-compat alias, PSX-shaped by definition and carrying a comment telling
+# callers not to use it — and default_module_paths() used it anyway. Under
+# --platform snes every --modules op then targeted a psxrecomp that is not
+# there ("psxrecomp: checkout missing") while never touching snesrecomp, so a
+# framework commit was silently never committed, pulled, or PUSHED and CI hit
+# a submodule pin the remote had never seen. A constant that must not be used
+# is a rule in prose; deleting it is the same rule in the artifact.
 
 
 @dataclass
@@ -73,6 +113,9 @@ class RepoStatus:
     short_status: str = ""
     submodules: list[SubmoduleInfo] = field(default_factory=list)
     nested_submodules: list[SubmoduleInfo] = field(default_factory=list)
+    # Same value under two names: `framework_root` is what new code reads,
+    # `psxrecomp_root` stays so existing JSON consumers keep working.
+    framework_root: str = ""
     psxrecomp_root: str = ""
     notes: list[str] = field(default_factory=list)
 
@@ -229,6 +272,31 @@ def _is_git_repo(root: Path) -> bool:
     return code == 0 and out.strip() == "true"
 
 
+def _is_repo_root(path: Path) -> bool:
+    """True only if `path` is the TOPLEVEL of its own repository.
+
+    Module resolution must use this, never _is_git_repo(): that one answers
+    "inside a work tree", which is true for ANY subdirectory of a repo —
+    including an *uninitialised* submodule, which is just an empty directory.
+
+    The consequence was not cosmetic. `psxrecomp/lib/retcomm-rbengine` is empty
+    in several game repos, so every `git -C` on it silently resolved to
+    psxrecomp itself: the rbengine branch dropdown listed psxrecomp's branches
+    (feat/rbengine, master, …, which looked plausible), and worse, "switch
+    lib/retcomm-rbengine to master" actually moved PSXRECOMP to master —
+    immediately undoing the psxrecomp switch performed one step earlier in the
+    same run.
+    """
+    path = path.expanduser().resolve()
+    code, out, _ = _git(path, "rev-parse", "--show-toplevel")
+    if code != 0:
+        return False
+    try:
+        return Path(out.strip()).resolve() == path
+    except OSError:
+        return False
+
+
 def _read_gitmodules(root: Path) -> configparser.ConfigParser:
     cp = configparser.ConfigParser(interpolation=None)
     gm = root / ".gitmodules"
@@ -296,14 +364,23 @@ def _default_url_for_path(path: str) -> str:
     for p, url, _ in KNOWN_NESTED_SUBMODULES:
         if p == path:
             return url
-    if path == "psxrecomp":
-        return DEFAULT_PSXRECOMP_URL
+    if path == framework_name():
+        return framework_url()
     if path == "recomp-ui":
         return DEFAULT_RECOMP_UI_URL
+    # A tree cut against the other console still resolves, so a mixed
+    # workspace reports real URLs instead of blanks.
+    for profile in platforms.PROFILES.values():
+        if path == profile.framework:
+            return profile.framework_url
     return ""
 
 
-def _list_submodules(root: Path, *, known: tuple[str, ...] = KNOWN_SUBMODULES) -> list[SubmoduleInfo]:
+def _list_submodules(
+    root: Path, *, known: tuple[str, ...] | None = None
+) -> list[SubmoduleInfo]:
+    if known is None:
+        known = known_submodules()
     cp = _read_gitmodules(root)
     found: dict[str, SubmoduleInfo] = {}
     for section in cp.sections():
@@ -353,17 +430,29 @@ def _list_submodules(root: Path, *, known: tuple[str, ...] = KNOWN_SUBMODULES) -
     return ordered
 
 
-def resolve_psxrecomp_dir(root: Path) -> Path | None:
-    """Return the psxrecomp checkout: either ``root`` itself or ``root/psxrecomp``."""
+def resolve_framework_dir(root: Path) -> Path | None:
+    """The framework checkout: ``root`` itself, or ``root/<framework>``.
+
+    Studio is routinely pointed at the engine repo as well as at a port, so
+    both spellings have to resolve. The marker file (runtime.cmake /
+    runner.cmake) is what distinguishes a real checkout from an uninitialised
+    submodule directory of the same name.
+    """
     root = root.expanduser().resolve()
-    if (root / "runtime" / "runtime.cmake").is_file():
+    profile = platforms.current()
+    marker = profile.framework_marker
+    if marker and (root / marker).is_file():
         return root
-    nested = root / "psxrecomp"
-    if (nested / "runtime" / "runtime.cmake").is_file():
+    nested = root / profile.framework
+    if marker and (nested / marker).is_file():
         return nested
     if nested.is_dir() and (nested / ".git").exists():
         return nested
     return None
+
+
+# Historical name kept so nothing outside this module has to change at once.
+resolve_psxrecomp_dir = resolve_framework_dir
 
 
 def list_nested_modules(root: Path) -> list[SubmoduleInfo]:
@@ -425,12 +514,15 @@ def repo_status(root: Path) -> RepoStatus:
     st.submodules = _list_submodules(root)
     psx = resolve_psxrecomp_dir(root)
     if psx is not None:
+        st.framework_root = str(psx)
         st.psxrecomp_root = str(psx)
         if psx == root:
             # Engine checkout: top-level known slots are the nested libs.
             st.submodules = _list_submodules(root, known=NESTED_PATHS)
             st.nested_submodules = list(st.submodules)
-            st.notes.append("Root is a psxrecomp checkout (nested modules are direct).")
+            st.notes.append(
+                f"Root is a {framework_name()} checkout (nested modules are direct)."
+            )
         else:
             st.nested_submodules = list_nested_modules(root)
     return st
@@ -525,16 +617,17 @@ def ensure_submodule(
 def ensure_known_submodules(
     root: Path,
     *,
-    psxrecomp_branch: str = DEFAULT_BRANCH,
+    framework_branch_name: str = "",
     recomp_ui_branch: str = DEFAULT_BRANCH,
     dry_run: bool = False,
 ) -> list[CmdResult]:
+    """Add / init the framework + recomp-ui submodules for this platform."""
     return [
         ensure_submodule(
             root,
-            "psxrecomp",
-            url=DEFAULT_PSXRECOMP_URL,
-            branch=psxrecomp_branch or DEFAULT_BRANCH,
+            framework_name(),
+            url=framework_url(),
+            branch=framework_branch_name or framework_branch(),
             dry_run=dry_run,
         ),
         ensure_submodule(
@@ -554,12 +647,13 @@ def ensure_nested_modules(
     rbengine_branch: str = DEFAULT_NESTED_BRANCH,
     dry_run: bool = False,
 ) -> list[CmdResult]:
-    """Ensure ``lib/recomp-net`` + ``lib/retcomm-rbengine`` inside psxrecomp."""
+    """Ensure ``lib/recomp-net`` + ``lib/retcomm-rbengine`` inside the framework."""
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return [CmdResult(False, "No psxrecomp checkout found (need root or root/psxrecomp)")]
+        fw = framework_name()
+        return [CmdResult(False, f"No {fw} checkout found (need root or root/{fw})")]
     if not _is_git_repo(psx):
-        return [CmdResult(False, f"psxrecomp is not a git repo: {psx}")]
+        return [CmdResult(False, f"{framework_name()} is not a git repo: {psx}")]
 
     branch_by_path = {
         "lib/recomp-net": recomp_net_branch or DEFAULT_NESTED_BRANCH,
@@ -587,17 +681,17 @@ def update_nested_modules(
     stage: bool = True,
     dry_run: bool = False,
 ) -> CmdResult:
-    """Update nested modules inside psxrecomp; optionally stage gitlinks there."""
+    """Update nested modules inside the framework; optionally stage gitlinks there."""
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     want = paths or list(NESTED_PATHS)
     # Allow callers to pass game-relative paths
     normalized: list[str] = []
     for p in want:
         p = p.strip().replace("\\", "/")
-        if p.startswith("psxrecomp/"):
-            p = p[len("psxrecomp/") :]
+        if p.startswith(framework_prefix()):
+            p = p[len(framework_prefix()) :]
         normalized.append(p)
 
     r = update_submodules(psx, paths=normalized, remote=remote, dry_run=dry_run)
@@ -608,21 +702,21 @@ def update_nested_modules(
         if code != 0:
             return CmdResult(
                 False,
-                "Nested update ok but failed to stage gitlinks in psxrecomp",
+                f"Nested update ok but failed to stage gitlinks in {framework_name()}",
                 err or out,
             )
-        detail = (r.detail + "\n" if r.detail else "") + "staged in psxrecomp: " + ", ".join(
+        detail = (r.detail + "\n" if r.detail else "") + f"staged in {framework_name()}: " + ", ".join(
             normalized
         )
         return CmdResult(
             True,
-            r.message + " (staged in psxrecomp)",
+            r.message + f" (staged in {framework_name()})",
             detail.strip(),
         )
     if stage and dry_run:
         return CmdResult(
             True,
-            r.message + " (would stage in psxrecomp)",
+            r.message + f" (would stage in {framework_name()})",
             r.detail,
         )
     return r
@@ -634,13 +728,13 @@ def commit_nested(
     *,
     dry_run: bool = False,
 ) -> CmdResult:
-    """Commit inside the psxrecomp checkout (nested gitlink bumps)."""
+    """Commit inside the framework checkout (nested gitlink bumps)."""
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     r = commit_all(psx, message, dry_run=dry_run)
     if r.ok:
-        r = CmdResult(r.ok, f"psxrecomp: {r.message}", r.detail)
+        r = CmdResult(r.ok, f"{framework_name()}: {r.message}", r.detail)
     return r
 
 
@@ -653,10 +747,10 @@ def set_nested_branch(
 ) -> CmdResult:
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     path = path.strip().replace("\\", "/")
-    if path.startswith("psxrecomp/"):
-        path = path[len("psxrecomp/") :]
+    if path.startswith(framework_prefix()):
+        path = path[len(framework_prefix()) :]
     return set_submodule_branch(psx, path, branch, dry_run=dry_run)
 
 
@@ -954,20 +1048,20 @@ def list_module_branches(
     fetch: bool = False,
     url_fallback: str = "",
 ) -> list[str]:
-    """Branches for a game submodule or a nested module inside psxrecomp."""
+    """Branches for a game submodule or a nested module inside the framework."""
     root = root.expanduser().resolve()
     path = path.strip().replace("\\", "/")
     if nested:
         psx = resolve_psxrecomp_dir(root)
         if psx is None:
             return list_remote_head_branches(url_fallback) if url_fallback else []
-        if path.startswith("psxrecomp/"):
-            path = path[len("psxrecomp/") :]
+        if path.startswith(framework_prefix()):
+            path = path[len(framework_prefix()) :]
         owner = psx
     else:
         owner = root
     sub = owner / path
-    if sub.is_dir() and _is_git_repo(sub):
+    if sub.is_dir() and _is_repo_root(sub):
         return list_branches(sub, remotes=remotes, fetch=fetch)
     # Fall back to URL from .gitmodules or caller
     url = url_fallback
@@ -1222,8 +1316,8 @@ def push(
 
 def _normalize_module_path(path: str, *, nested: bool) -> str:
     p = path.strip().replace("\\", "/")
-    if nested and p.startswith("psxrecomp/"):
-        p = p[len("psxrecomp/") :]
+    if nested and p.startswith(framework_prefix()):
+        p = p[len(framework_prefix()) :]
     return p
 
 
@@ -1233,7 +1327,7 @@ def resolve_module_dir(
     *,
     nested: bool = False,
 ) -> Path | None:
-    """Resolve a game submodule or a nested module checkout under psxrecomp."""
+    """Resolve a game submodule or a nested module checkout under the framework."""
     root = root.expanduser().resolve()
     path = _normalize_module_path(path, nested=nested)
     if not path:
@@ -1247,13 +1341,14 @@ def resolve_module_dir(
     else:
         owner = root
     sub = owner / path
-    if sub.is_dir() and _is_git_repo(sub):
+    if sub.is_dir() and _is_repo_root(sub):
         return sub
     return None
 
 
 def default_module_paths(*, nested: bool = False) -> tuple[str, ...]:
-    return NESTED_PATHS if nested else KNOWN_SUBMODULES
+    """Module paths a --modules op covers, for THIS session's platform."""
+    return NESTED_PATHS if nested else known_submodules()
 
 
 def _tracking_branch_for(owner: Path, path: str) -> str:
@@ -1343,7 +1438,7 @@ def switch_modules(
     return results
 
 
-def switch_psxrecomp(
+def switch_framework(
     root: Path,
     branch: str,
     *,
@@ -1352,9 +1447,9 @@ def switch_psxrecomp(
 ) -> CmdResult:
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     r = switch_branch(psx, branch, create=create, dry_run=dry_run)
-    return CmdResult(r.ok, f"psxrecomp: {r.message}", r.detail)
+    return CmdResult(r.ok, f"{framework_name()}: {r.message}", r.detail)
 
 
 def pull_modules(
@@ -1428,7 +1523,7 @@ def commit_modules(
     return results
 
 
-def pull_psxrecomp(
+def pull_framework(
     root: Path,
     *,
     mode: str = "ff-only",
@@ -1437,12 +1532,12 @@ def pull_psxrecomp(
 ) -> CmdResult:
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     r = pull(psx, mode=mode, dirty=dirty, dry_run=dry_run)
-    return CmdResult(r.ok, f"psxrecomp: {r.message}", r.detail)
+    return CmdResult(r.ok, f"{framework_name()}: {r.message}", r.detail)
 
 
-def push_psxrecomp(
+def push_framework(
     root: Path,
     *,
     branch: str = "",
@@ -1450,9 +1545,9 @@ def push_psxrecomp(
 ) -> CmdResult:
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
-        return CmdResult(False, "No psxrecomp checkout found")
+        return CmdResult(False, f"No {framework_name()} checkout found")
     r = push(psx, branch=branch, dry_run=dry_run)
-    return CmdResult(r.ok, f"psxrecomp: {r.message}", r.detail)
+    return CmdResult(r.ok, f"{framework_name()}: {r.message}", r.detail)
 
 
 def install_and_push_release_ci(
@@ -1470,7 +1565,11 @@ def install_and_push_release_ci(
     registered ``release.yml`` (nudge commit if needed).
     """
     from .models import MigrateOptions
-    from .ops import op_emit_ci_workflow, op_emit_packager
+
+    if platforms.current().key == "snes":
+        from .snesops import op_emit_ci_workflow, op_emit_packager
+    else:
+        from .ops import op_emit_ci_workflow, op_emit_packager
 
     root = root.expanduser().resolve()
     if not _is_git_repo(root):
@@ -1538,7 +1637,7 @@ def install_and_push_release_ci(
         root,
         "commit",
         "-m",
-        "ci: add setup-host release.yml (psxrecomp template)",
+        f"ci: add release.yml ({framework_name()} template)",
     )
     if code != 0:
         return CmdResult(False, "git commit failed", err or out)
@@ -1643,6 +1742,59 @@ def release_workflow_name(root: Path) -> str | None:
     return None
 
 
+def declared_dispatch_inputs(workflow: Path) -> set[str]:
+    """Input names a workflow's ``workflow_dispatch:`` accepts.
+
+    ``gh workflow run`` rejects the whole dispatch if handed an ``-f`` the
+    workflow does not declare, and the two consoles' release workflows differ:
+    psxrecomp's takes version / bump / publish / reuse_cached_emitters,
+    snesrecomp's takes none and releases off a tag. Sending PSX's four at a
+    SNES repo fails with "unexpected inputs" — a confusing way to learn that
+    the release was never dispatched.
+
+    Deliberately a scanner, not a YAML parse: the toolkit CLI is stdlib-only,
+    and the shape being read here (two nested keys at known indents) does not
+    justify a dependency. Over-reporting an input is harmless; the only cost of
+    getting it wrong is the error we already had.
+    """
+    try:
+        text = workflow.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    lines = text.splitlines()
+    names: set[str] = set()
+    for i, line in enumerate(lines):
+        if line.strip().rstrip(":") != "workflow_dispatch":
+            continue
+        wd_indent = len(line) - len(line.lstrip())
+        # Walk the block under workflow_dispatch: looking for `inputs:`.
+        j = i + 1
+        inputs_indent = None
+        while j < len(lines):
+            cur = lines[j]
+            if not cur.strip() or cur.lstrip().startswith("#"):
+                j += 1
+                continue
+            indent = len(cur) - len(cur.lstrip())
+            if indent <= wd_indent:
+                break
+            if inputs_indent is None:
+                if cur.strip().rstrip(":") == "inputs":
+                    inputs_indent = indent
+                j += 1
+                continue
+            if indent <= inputs_indent:
+                break
+            # The first key level under inputs: is an input name; anything
+            # deeper is that input's description / type / default.
+            if indent == inputs_indent + 2:
+                key = cur.strip()
+                if key.endswith(":"):
+                    names.add(key[:-1].strip().strip("'\""))
+            j += 1
+    return names
+
+
 def run_release_workflow(
     root: Path,
     *,
@@ -1663,26 +1815,31 @@ def run_release_workflow(
         return CmdResult(False, "Missing .github/workflows/release.yml")
 
     # Prefer workflow file path; gh accepts it.
-    cmd = [
-        "gh",
-        "workflow",
-        "run",
-        "release.yml",
-        "-f",
-        f"version={version}",
-        "-f",
-        f"bump={bump}",
-        "-f",
-        f"publish={'true' if publish else 'false'}",
-        "-f",
-        f"reuse_cached_emitters={'true' if reuse_cached_emitters else 'false'}",
-    ]
+    cmd = ["gh", "workflow", "run", "release.yml"]
+    accepted = declared_dispatch_inputs(wf) if wf.is_file() else set()
+    wanted = {
+        "version": version,
+        "bump": bump,
+        "publish": "true" if publish else "false",
+        "reuse_cached_emitters": "true" if reuse_cached_emitters else "false",
+    }
+    skipped = []
+    for key, val in wanted.items():
+        if key in accepted:
+            cmd.extend(["-f", f"{key}={val}"])
+        else:
+            skipped.append(key)
     if dry_run:
         return CmdResult(True, "dry-run: " + " ".join(cmd))
 
     code, out, err = _run(cmd, root)
     if code != 0:
         return CmdResult(False, "Failed to dispatch release workflow", err or out)
+    note = ""
+    if skipped and accepted:
+        note = " (workflow declares no " + ", ".join(skipped) + " input)"
+    elif skipped and not accepted:
+        note = " (workflow takes no dispatch inputs; version/bump ignored)"
 
     # Best-effort: fetch latest run URL
     run_url = ""
@@ -1715,7 +1872,7 @@ def run_release_workflow(
     url = run_url or gh_url
     if gh_url and run_url and gh_url != run_url:
         url = run_url
-    msg = "Dispatched Release builds workflow"
+    msg = "Dispatched Release builds workflow" + note
     if url:
         msg += f"\n{url}"
     return CmdResult(True, msg)

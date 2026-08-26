@@ -48,6 +48,37 @@ void StudioModel::coerce_catalog_only_selection() {
     }
 }
 
+void StudioModel::reset_for_platform_switch() {
+    // Everything here is keyed to one console's repos. Leaving any of it
+    // behind means the first SNES frame shows a PSX path, a PSX branch list,
+    // or an audit of a repo that is no longer selectable.
+    repos.clear();
+    selected_repo = -1;
+    disc_cue[0] = '\0';
+    build_exe[0] = '\0';
+    git_branch[0] = '\0';
+    branches_game.clear();
+    branches_psx.clear();
+    branches_ui.clear();
+    branches_net.clear();
+    branches_rb.clear();
+    branches_root.clear();
+    branches_loading = false;
+    audit_checks.clear();
+    plan_steps.clear();
+    bulk_selected.clear();
+    git_summary.clear();
+    // Functions / Frames data belongs to a specific PSX executable.
+    fn_rows.clear();
+    fn_edges.clear();
+    fn_indirect.clear();
+    fn_view.clear();
+    fn_view_dirty = true;
+    fn_selected = -1;
+    fn_loaded_root.clear();
+    fn_error.clear();
+}
+
 void StudioModel::apply_selected_players() {
     if (selected_repo < 0 || selected_repo >= static_cast<int>(repos.size())) return;
     int n = repos[static_cast<size_t>(selected_repo)].players;

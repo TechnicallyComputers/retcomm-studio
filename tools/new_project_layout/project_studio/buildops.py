@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from . import platforms
 from .gitops import CmdResult
 
 DEFAULT_BUILD_DIR = "build-release"
@@ -205,6 +206,133 @@ def detect_host() -> BuildHost:
     )
 
 
+# --- retcomm toolchain packs -------------------------------------------------
+#
+# The cmake-clang-v1 pack ships its own clang, its own sysroot, and its own
+# pinned dependencies (SDL3, zlib) under ``<pack>/deps``. The pack's clang.cfg
+# passes ``--sysroot=<pack>/sysroot``, so the host distribution's /usr/include
+# is NOT on the compiler's search path. A find_package() that resolves to the
+# host's SDL3 therefore configures cleanly and then fails every compile with
+# "'SDL3/SDL.h' file not found" — the header is real, the compiler just cannot
+# see it. The pack's env.sh exports SDL3_DIR / ZLIB_ROOT to prevent that, but
+# Studio invokes cmake directly and cannot assume env.sh was sourced, so it
+# supplies the same contract itself.
+
+_TOOLCHAIN_MARKER = "retcomm-toolchain.json"
+
+
+def _toolchain_root_from(path: str | Path | None) -> Path | None:
+    """Walk up from a file inside a toolchain pack to the pack root."""
+    if not path:
+        return None
+    try:
+        cur = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    for cand in (cur, *cur.parents):
+        if (cand / _TOOLCHAIN_MARKER).is_file():
+            return cand
+    return None
+
+
+def toolchain_root(host: BuildHost | None = None) -> Path | None:
+    """Active retcomm toolchain pack, or None when building with host tools.
+
+    Only a pack that owns the running interpreter or the cmake we are about to
+    invoke counts — that is the pack whose sysroot the compile will use. An
+    installed-but-unused pack is deliberately ignored: its dependencies are
+    built against its own sysroot and would be the wrong answer for a build
+    driven by host clang.
+    """
+    env_dir = (os.environ.get("RETCOMM_TOOLCHAIN_DIR") or "").strip()
+    if env_dir:
+        cand = Path(env_dir).expanduser()
+        if (cand / _TOOLCHAIN_MARKER).is_file():
+            return cand.resolve()
+    host = host or detect_host()
+    for probe in (sys.executable, host.cmake):
+        found = _toolchain_root_from(probe)
+        if found is not None:
+            return found
+    return None
+
+
+def toolchain_env(host: BuildHost | None = None) -> dict[str, str]:
+    """Environment overlay pointing find_package() at the pack's deps.
+
+    Mirrors ``<pack>/env.sh``. Empty when no pack drives the build. These go
+    in the environment rather than on the command line because cmake warns
+    about ``-D`` variables a project never reads, and a project that links
+    SDL3 but not zlib would otherwise warn on every configure.
+    """
+    pack = toolchain_root(host)
+    if pack is None:
+        return {}
+    deps = pack / "deps"
+    if not deps.is_dir():
+        return {}
+    overlay: dict[str, str] = {}
+    sdl3_cfg = deps / "lib" / "cmake" / "SDL3"
+    if (sdl3_cfg / "SDL3Config.cmake").is_file() or (
+        sdl3_cfg / "SDL3-config.cmake"
+    ).is_file():
+        overlay["SDL3_DIR"] = str(sdl3_cfg)
+    if (deps / "include" / "zlib.h").is_file():
+        overlay["ZLIB_ROOT"] = str(deps)
+    prior = (os.environ.get("CMAKE_PREFIX_PATH") or "").strip()
+    overlay["CMAKE_PREFIX_PATH"] = (
+        f"{deps}{os.pathsep}{prior}" if prior else str(deps)
+    )
+    return overlay
+
+
+def toolchain_cache_repairs(
+    build_dir: Path,
+    extra_args: list[str] | None = None,
+    host: BuildHost | None = None,
+) -> list[str]:
+    """``-D`` pins that re-point a build tree already cached to host deps.
+
+    The environment overlay is only a *hint*: find_package() prefers an
+    existing ``<pkg>_DIR`` cache entry, so a tree configured before this fix
+    keeps resolving to the host's SDL3 and keeps failing to compile. Override
+    those entries explicitly. Only entries that are present and point outside
+    the pack are touched, so this never introduces an unused-variable warning:
+    the entry exists precisely because the project read it.
+    """
+    pack = toolchain_root(host)
+    if pack is None:
+        return []
+    already = _explicit_cache_vars(extra_args)
+    repairs: list[str] = []
+    for name, want in toolchain_env(host).items():
+        if name == "CMAKE_PREFIX_PATH" or name in already:
+            continue
+        have = cache_entry(build_dir, name)
+        if have and Path(have) != Path(want):
+            repairs.append(f"-D{name}:PATH={want}")
+    return repairs
+
+
+def _explicit_cache_vars(extra_args: list[str] | None) -> set[str]:
+    """Names of ``-DVAR[:TYPE]=…`` entries a caller already passed."""
+    names: set[str] = set()
+    for arg in extra_args or []:
+        m = re.match(r"-D([A-Za-z0-9_]+)(?::[A-Za-z]+)?=", arg)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def merged_env(overlay: dict[str, str]) -> dict[str, str] | None:
+    """os.environ plus ``overlay``, or None when there is nothing to add."""
+    if not overlay:
+        return None
+    env = os.environ.copy()
+    env.update(overlay)
+    return env
+
+
 def default_generator(host: BuildHost | None = None) -> str:
     host = host or detect_host()
     if host.ninja:
@@ -213,6 +341,58 @@ def default_generator(host: BuildHost | None = None) -> str:
         # Leave empty → cmake picks VS / default generator.
         return ""
     return "Unix Makefiles"
+
+
+def cache_entry(build_dir: Path, name: str) -> str:
+    """Value of ``name`` in an existing CMakeCache.txt, or empty.
+
+    Matches any cache type, so ``SDL3_DIR`` (PATH) and ``CMAKE_GENERATOR``
+    (INTERNAL) read the same way.
+    """
+    cache = Path(build_dir) / "CMakeCache.txt"
+    if not cache.is_file():
+        return ""
+    try:
+        text = cache.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    prefix = f"{name}:"
+    for line in text.splitlines():
+        if line.startswith(prefix) and "=" in line:
+            head, val = line.split("=", 1)
+            if head.split(":", 1)[0] == name:
+                return val.strip()
+    return ""
+
+
+def cached_cmake_generator(build_dir: Path) -> str:
+    """CMAKE_GENERATOR from an existing CMakeCache.txt, or empty."""
+    return cache_entry(build_dir, "CMAKE_GENERATOR")
+
+
+def normalize_generator_request(generator: str | None) -> str | None:
+    """None / empty / 'auto' → Auto. Otherwise the cmake -G name."""
+    if generator is None:
+        return None
+    g = generator.strip()
+    if not g or g.lower() == "auto":
+        return None
+    return g
+
+
+def resolve_configure_generator(
+    host: BuildHost,
+    build_dir: Path,
+    generator: str | None,
+) -> str:
+    """Explicit -G, else the cache's generator, else host default."""
+    requested = normalize_generator_request(generator)
+    if requested is not None:
+        return requested
+    cached = cached_cmake_generator(build_dir)
+    if cached:
+        return cached
+    return default_generator(host)
 
 
 def parse_env_text(text: str) -> dict[str, str]:
@@ -291,6 +471,83 @@ def resolve_framework_root(root: Path) -> Path | None:
         if (cand / "bios" / "OpenBIOS.toml").is_file() and (cand / "recompiler").is_dir():
             return cand
     return None
+
+
+_PROJECT_RE = re.compile(r"^\s*project\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE)
+
+
+def default_target(root: Path) -> str:
+    """The CMake target to build for this platform's projects.
+
+    PSX ports all build one shared runtime target (``psx-runtime``). SNES ports
+    name their executable after the project, so there is no constant to use —
+    the target is read out of the repo's own ``project()`` call.
+    """
+    if platforms.current().default_target:
+        return platforms.current().default_target
+    cml = Path(root).expanduser().resolve() / "CMakeLists.txt"
+    if cml.is_file():
+        try:
+            m = _PROJECT_RE.search(cml.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            m = None
+        if m:
+            return m.group(1)
+    # `all` builds everything the project defines — correct, if not minimal.
+    return "all"
+
+
+def snes_regen_script(root: Path) -> Path | None:
+    """``tools/regen.sh`` — the SNES ROM → C step, owned by the project."""
+    p = Path(root).expanduser().resolve() / "tools" / "regen.sh"
+    return p if p.is_file() else None
+
+
+def generate_snes_c(
+    root: Path,
+    *,
+    rom: str = "",
+    cfg_roots: bool = False,
+    verify: bool = True,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Run the project's own tools/regen.sh.
+
+    Studio deliberately does not reimplement generation: regen.sh carries the
+    ROM digests this port was pinned against and verifies them before emitting
+    anything. Calling snesrecomp_cli directly would skip that check, which is
+    the one thing standing between a mismatched dump and hours of chasing
+    divergence that was never in the recompiler.
+    """
+    root = Path(root).expanduser().resolve()
+    script = snes_regen_script(root)
+    if script is None:
+        return CmdResult(
+            False,
+            f"No tools/regen.sh in {root} — run Migrate → Emit tools/regen.sh first",
+        )
+    cmd = ["sh", str(script)]
+    if rom:
+        rom_p = Path(rom).expanduser()
+        if not rom_p.is_file():
+            return CmdResult(False, f"ROM not found: {rom}")
+        cmd.extend(["--rom", str(rom_p.resolve())])
+    if not verify:
+        cmd.append("--no-verify")
+    if cfg_roots:
+        cmd.append("--cfg-roots")
+    if dry_run:
+        msg = "dry-run: " + " ".join(cmd)
+        if log:
+            log(msg)
+        return CmdResult(True, msg)
+    r = _run_stream(cmd, root, log=log)
+    if r.ok:
+        gen = root / "src" / "gen"
+        n = len(list(gen.glob("*.c"))) if gen.is_dir() else 0
+        return CmdResult(True, f"Generated {n} C file(s) into src/gen", r.detail)
+    return r
 
 
 _MAX_PLAYERS_CMAKE_RE = re.compile(
@@ -379,6 +636,12 @@ def diagnose_configure_failure(detail: str, root: Path) -> str | None:
             "Game generated C may be missing — run Generate (disc→C) before "
             "Configure, or ensure generated/<boot>_dispatch.c exists."
         )
+    if "Does not match the generator used previously" in blob:
+        return (
+            "This build dir already uses a different CMake generator. "
+            "Pick matching Generator (Ninja vs Unix Makefiles) on the Build tab, "
+            "or remove CMakeCache.txt and CMakeFiles / use a new build dir."
+        )
     return None
 
 
@@ -436,15 +699,7 @@ def _recompiler_build_usable(build_dir: Path) -> bool:
     cache = build_dir / "CMakeCache.txt"
     if not cache.is_file():
         return False
-    try:
-        text = cache.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-    gen = ""
-    for line in text.splitlines():
-        if line.startswith("CMAKE_GENERATOR:INTERNAL="):
-            gen = line.split("=", 1)[1].strip()
-            break
+    gen = cached_cmake_generator(build_dir)
     if gen.startswith("Ninja"):
         return (build_dir / "build.ninja").is_file()
     if "Makefiles" in gen:
@@ -505,6 +760,7 @@ def ensure_bios_emitter(
     if gen:
         cfg.extend(["-G", gen])
     cfg.append(f"-DCMAKE_BUILD_TYPE={build_type}")
+    cfg.extend(toolchain_cache_repairs(build_dir, host=host))
 
     if dry_run:
         msg = "dry-run: " + " ".join(cfg)
@@ -517,7 +773,7 @@ def ensure_bios_emitter(
         if log:
             log("Configuring recompiler for psxrecomp-bios…")
         build_dir.mkdir(parents=True, exist_ok=True)
-        r = _run_stream(cfg, fw, log=log)
+        r = _run_stream(cfg, fw, log=log, env=merged_env(toolchain_env(host)))
         if not r.ok:
             return CmdResult(
                 False,
@@ -699,14 +955,16 @@ def configure(
     if not (root / "CMakeLists.txt").is_file():
         return CmdResult(False, f"No CMakeLists.txt in {root}")
 
-    if ensure_bios and not _allow_no_bios(extra_args):
+    # The BIOS backend step is a PSX concept: a SNES cartridge boots from its
+    # own reset vector and there is nothing to stage.
+    if ensure_bios and platforms.current().key != "snes" and not _allow_no_bios(extra_args):
         bios_r = ensure_bios_backends(root, dry_run=dry_run, log=log)
         if not bios_r.ok:
             return bios_r
         if log and bios_r.message:
             log(bios_r.message)
 
-    pre = preflight_max_players(root)
+    pre = preflight_max_players(root) if platforms.current().key != "snes" else None
     if pre is not None:
         if log:
             log(pre.message)
@@ -715,13 +973,17 @@ def configure(
     bdir = Path(build_dir)
     if not bdir.is_absolute():
         bdir = root / bdir
-    gen = generator if generator is not None else default_generator(host)
+    gen = resolve_configure_generator(host, bdir, generator)
     cmd = [host.cmake, "-S", str(root), "-B", str(bdir)]
     if gen:
         cmd.extend(["-G", gen])
     cmd.append(f"-DCMAKE_BUILD_TYPE={build_type}")
+    # Bundled deps before caller overrides: a caller's explicit -D wins.
+    repairs = toolchain_cache_repairs(bdir, extra_args, host)
+    cmd.extend(repairs)
     if extra_args:
         cmd.extend(extra_args)
+    tc_env = toolchain_env(host)
 
     if dry_run:
         msg = "dry-run: " + " ".join(cmd)
@@ -729,7 +991,9 @@ def configure(
             log(msg)
         return CmdResult(True, msg)
 
-    r = _run_stream(cmd, root, log=log)
+    if log and repairs:
+        log("Re-pointing cached host deps at the toolchain: " + " ".join(repairs))
+    r = _run_stream(cmd, root, log=log, env=merged_env(tc_env))
     if r.ok:
         r = CmdResult(
             True,
@@ -860,6 +1124,27 @@ def resolve_build_dir(root: Path, build_dir: str) -> Path:
     if not bdir.is_absolute():
         bdir = root / bdir
     return bdir
+
+
+def launch_rom_for(root: Path | str, rom: str = "") -> tuple[str, str]:
+    """Which ROM a SNES launch should hand the runner, and where it came from.
+
+    Returns ``(path, provenance)``; both empty when there is nothing to pass.
+    A cartridge runner takes the ROM as a positional and exits 1 without one,
+    and the path is not the caller's to remember — it is whatever New Project
+    or the Migrate tab recorded for this repo.
+    """
+    rom = (rom or "").strip()
+    if rom:
+        return rom, "explicit"
+    if not platforms.is_snes():
+        return "", ""
+    from .repo_index import load_index
+
+    entry = load_index().find(root)
+    if entry is not None and entry.cue:
+        return entry.cue, "the repo index"
+    return "", ""
 
 
 def launch(
@@ -1024,8 +1309,17 @@ def launch_status() -> str:
 
 
 def find_psxrecomp_cli(root: Path) -> Path | None:
-    """Locate ``psxrecomp_cli.py`` next to the game's framework checkout."""
+    """Locate ``psxrecomp_cli.py`` next to the game's framework checkout.
+
+    ``RETCOMM_PSXRECOMP_CLI`` overrides the search so a framework change can be
+    exercised against a game repo before its submodule pin moves.
+    """
     root = root.expanduser().resolve()
+    override = os.environ.get("RETCOMM_PSXRECOMP_CLI", "").strip()
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p.resolve()
     fw = resolve_framework_root(root)
     candidates: list[Path] = []
     if fw is not None:
@@ -1126,3 +1420,280 @@ def ensure_emitters(
     if log:
         log("Generate emitters (psxrecomp-game + psxrecomp-bios)" + (" [force]" if force else ""))
     return _run_stream(cmd, root, log=log)
+
+
+# --- local bundle + export -------------------------------------------------
+#
+# Studio's Build tab "Bundle + Export" for the regular (host) build: package
+# what is already in the local build dir into dist/<prefix>-<ver>-<tag>.zip,
+# then hand the path back so the GUI can open a native save dialog.
+
+
+@dataclass
+class PackageResult:
+    ok: bool
+    message: str
+    detail: str = ""
+    zip_path: Path | None = None
+
+
+def host_artifact_tag(host: BuildHost | None = None) -> str:
+    """`linux-x64`, `windows-x64`, `macos-arm64`, … — matches CI zip naming."""
+    host = host or detect_host()
+    machine = (platform.machine() or "").lower()
+    if machine in ("x86_64", "amd64", "x64"):
+        arch = "x64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    elif machine in ("i386", "i686", "x86"):
+        arch = "x86"
+    else:
+        arch = re.sub(r"[^a-z0-9]+", "", machine) or "unknown"
+    return f"{host.label}-{arch}"
+
+
+def project_version(root: Path) -> str:
+    """VERSION file → game.toml `version` → `0.0.0` (mirrors package_release.sh)."""
+    vf = root / "VERSION"
+    if vf.is_file():
+        text = vf.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return text.split()[0]
+    toml = root / "game.toml"
+    if toml.is_file():
+        for line in toml.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"""\s*version\s*=\s*["']([^"']+)["']""", line)
+            if m:
+                return m.group(1).strip()
+    return "0.0.0"
+
+
+def _zip_prefix(root: Path) -> str:
+    try:
+        from fill_tokens import derive_zip_prefix
+    except ImportError:
+        derive_zip_prefix = None  # type: ignore[assignment]
+    if derive_zip_prefix is not None:
+        prefix = derive_zip_prefix(root.name)
+        if prefix:
+            return prefix
+    return re.sub(r"[^a-z0-9._-]+", "", root.name.lower()) or "game"
+
+
+def _newest_zip(dist: Path, tag: str) -> Path | None:
+    if not dist.is_dir():
+        return None
+    zips = sorted(dist.glob(f"*-{tag}.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not zips:
+        zips = sorted(dist.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return zips[0].resolve() if zips else None
+
+
+def _stage_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True, symlinks=True)
+    else:
+        shutil.copy2(src, dst)
+
+
+def _write_zip(stage: Path, out: Path) -> None:
+    """Zip `stage` preserving the executable bit (no `zip` binary needed)."""
+    import zipfile
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        out.unlink()
+    entries = sorted(p for p in stage.rglob("*"))
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for path in entries:
+            rel = path.relative_to(stage).as_posix()
+            if path.is_dir():
+                info = zipfile.ZipInfo(rel + "/")
+                info.external_attr = (0o40755 << 16) | 0x10
+                zf.writestr(info, b"")
+                continue
+            info = zipfile.ZipInfo.from_file(path, rel)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            mode = path.stat().st_mode & 0o777
+            info.external_attr = mode << 16
+            with path.open("rb") as fh, zf.open(info, "w") as out_fh:
+                shutil.copyfileobj(fh, out_fh)
+
+
+def _stage_local_bundle(
+    root: Path,
+    exe: Path,
+    stage: Path,
+    *,
+    log: LogFn | None = None,
+) -> str:
+    """Built-in stager used when the repo has no scripts/package_release.sh.
+
+    Mirrors that script's payload: exe + assets/{fonts,img} + bundled OpenBIOS
+    + game.toml / VERSION. Never stages a disc image or retail BIOS dump.
+    """
+    exe_dir = exe.parent
+    _stage_copy(exe, stage / exe.name)
+
+    # Runtime shared libs sitting next to the exe (dynamic builds).
+    for pattern in ("*.dll", "*.DLL", "*.so", "*.so.*", "*.dylib"):
+        for lib in sorted(exe_dir.glob(pattern)):
+            if lib.is_file():
+                _stage_copy(lib, stage / lib.name)
+
+    staged_assets = False
+    for sub in ("fonts", "img"):
+        src = exe_dir / "assets" / sub
+        if src.is_dir():
+            _stage_copy(src, stage / "assets" / sub)
+            staged_assets = True
+    if not staged_assets:
+        return f"assets/fonts + assets/img missing next to {exe.name} — rebuild first"
+
+    bios_bin = ""
+    for cand in (
+        exe_dir / "bios" / "openbios.bin",
+        root / "psxrecomp" / "bios" / "openbios.bin",
+        root / "bios" / "openbios.bin",
+    ):
+        if cand.is_file():
+            _stage_copy(cand, stage / "bios" / "openbios.bin")
+            bios_bin = str(cand)
+            break
+    if not bios_bin:
+        return "bios/openbios.bin not found — rebuild psx-runtime to stage it"
+    for cand in (
+        exe_dir / "bios" / "OpenBIOS.LICENSE",
+        root / "psxrecomp" / "bios" / "OpenBIOS.LICENSE",
+    ):
+        if cand.is_file():
+            _stage_copy(cand, stage / "bios" / "OpenBIOS.LICENSE")
+            break
+
+    for name in ("game.toml", "VERSION", "README-SETUP.txt", "keybinds.ini"):
+        src = root / name
+        if src.is_file():
+            _stage_copy(src, stage / name)
+
+    # Exe-relative runtime data the build staged next to the binary. The
+    # runtime resolves these from the EXE's own directory (mods via
+    # <exe_dir>/mods), so a zip without them ships a game whose Mods page is
+    # empty and whose netplay lobbies can never agree on a mod plan.
+    # mods/state.toml is the packaging machine's own enable/disable state —
+    # preloaded catalogs ship default-disabled, so it must never travel.
+    staged_extra = []
+    for sub in ("mods", "bezels"):
+        src = exe_dir / sub
+        if src.is_dir():
+            _stage_copy(src, stage / sub)
+            staged_extra.append(sub)
+    for leftover in ("state.toml", "state.toml.tmp"):
+        stale = stage / "mods" / leftover
+        if stale.is_file():
+            stale.unlink()
+
+    # Project-root data the runtime reads relative to the project (not the
+    # exe): translations, and the mods/preloaded source a rebuild restages
+    # the catalog from.
+    for sub in ("translations",):
+        src = root / sub
+        if src.is_dir():
+            _stage_copy(src, stage / sub)
+            staged_extra.append(sub)
+
+    _flush_log(
+        log,
+        f"    staged {exe.name} + assets + bios (OpenBIOS: {bios_bin})"
+        + (f" + {', '.join(staged_extra)}" if staged_extra else ""),
+    )
+    return ""
+
+
+def package_local(
+    root: Path,
+    *,
+    build_dir: str = DEFAULT_BUILD_DIR,
+    artifact_tag: str = "",
+    exe: Path | None = None,
+    use_repo_script: bool = True,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> PackageResult:
+    """Zip the existing local build into ``<root>/dist``.
+
+    Prefers the repo's own ``scripts/package_release.sh`` (CI-parity payload
+    and zip name) when it exists and bash is available; otherwise stages an
+    equivalent bundle in Python so this works on Windows too.
+    """
+    root = root.expanduser().resolve()
+    bdir = resolve_build_dir(root, build_dir)
+    if not bdir.is_dir():
+        return PackageResult(False, f"Build dir missing — Build first: {bdir}")
+
+    binary = exe.expanduser().resolve() if exe else find_runtime_exe(bdir)
+    if binary is None or not binary.is_file():
+        return PackageResult(False, f"No runtime executable under {bdir} — Build first")
+
+    tag = artifact_tag.strip() or host_artifact_tag()
+    version = project_version(root)
+    dist = root / "dist"
+    script = root / "scripts" / "package_release.sh"
+    bash = shutil.which("bash")
+    use_script = use_repo_script and script.is_file() and bool(bash)
+
+    if dry_run:
+        how = f"{script.name} {bdir.name} {tag}" if use_script else f"built-in stager ({tag})"
+        msg = f"dry-run: package {binary.name} via {how} → {dist}"
+        _flush_log(log, msg)
+        return PackageResult(True, msg)
+
+    if platforms.current().key == "snes" and not use_script:
+        # The built-in stager bundles OpenBIOS, game.toml and the psxrecomp
+        # mods/bezels layout — none of which a SNES port has. Its own packager
+        # is the only correct answer, and it also enforces the no-ROM-bytes
+        # rule that a generic stager would not.
+        return PackageResult(
+            False,
+            "No scripts/package_release.sh in this repo — emit it from the "
+            "Migrate tab (snes_emit_packager) before packaging.",
+        )
+
+    if use_script:
+        _flush_log(log, f"==> package {tag} via scripts/package_release.sh")
+        if platforms.current().key == "snes":
+            # snesrecomp's packager is configured by environment, not argv:
+            # positional arguments would be silently ignored and it would
+            # package whatever is in ./build.
+            env = os.environ.copy()
+            env["BUILD_DIR"] = str(bdir)
+            env["PLATFORM"] = tag
+            r = _run_stream([bash, str(script)], root, log=log, env=env)
+        else:
+            r = _run_stream([bash, str(script), str(bdir), tag], root, log=log)
+        if not r.ok:
+            return PackageResult(False, f"package_release.sh failed for {tag}", r.detail)
+        zip_path = _newest_zip(dist, tag)
+        if zip_path is None:
+            return PackageResult(False, f"package_release.sh produced no zip under {dist}", r.detail)
+        return PackageResult(True, f"Packaged {zip_path.name}", r.detail, zip_path)
+
+    _flush_log(log, f"==> package {tag} (built-in stager)")
+    stage = dist / f"stage-local-{tag}"
+    if stage.exists():
+        shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    try:
+        err = _stage_local_bundle(root, binary, stage, log=log)
+        if err:
+            return PackageResult(False, err)
+        zip_path = dist / f"{_zip_prefix(root)}-{version}-{tag}.zip"
+        _write_zip(stage, zip_path)
+    except OSError as exc:
+        return PackageResult(False, f"Packaging failed: {exc}")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+    size_mb = zip_path.stat().st_size / (1024.0 * 1024.0)
+    _flush_log(log, f"Wrote {zip_path} ({size_mb:.1f} MiB)")
+    return PackageResult(True, f"Packaged {zip_path.name}", "", zip_path.resolve())

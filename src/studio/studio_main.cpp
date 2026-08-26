@@ -1,5 +1,7 @@
 #include "studio/studio_model.hpp"
 #include "studio/studio_runner.hpp"
+#include "studio/studio_frames.hpp"
+#include "studio/studio_functions.hpp"
 #include "studio/studio_theme.hpp"
 
 #include <nlohmann/json.hpp>
@@ -34,6 +36,13 @@
 #include <vector>
 
 namespace fs = std::filesystem;
+using retcomm::studio::Platform;
+using retcomm::studio::platform_display;
+using retcomm::studio::platform_framework;
+using retcomm::studio::platform_image_filter_ext;
+using retcomm::studio::platform_image_filter_name;
+using retcomm::studio::platform_image_label;
+using retcomm::studio::platform_key;
 using retcomm::studio::RunResult;
 using retcomm::studio::StudioModel;
 using retcomm::studio::Theme;
@@ -152,14 +161,18 @@ void left_label(const char* label, float col_w) {
 }
 
 // Returns true when the browse button is clicked (not on text edits).
+// `text_committed`, when given, reports a finished edit of the field itself —
+// typing a path by hand has to reach the same code the Browse button does, or
+// half the ways of setting a path silently do not persist.
 bool path_row(const char* id, const char* label, char* buf, size_t buf_n, float label_w,
-              const char* browse_label) {
+              const char* browse_label, bool* text_committed = nullptr) {
     left_label(label, label_w);
     const float browse_w = widget_label_width(browse_label) + ImGui::GetStyle().ItemSpacing.x;
     float field_w = ImGui::GetContentRegionAvail().x - browse_w;
     if (field_w < 80.f) field_w = 80.f;
     ImGui::SetNextItemWidth(field_w);
     ImGui::InputText(id, buf, buf_n);
+    if (text_committed) *text_committed = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SameLine();
     return ImGui::Button(browse_label);
 }
@@ -168,6 +181,92 @@ void field_row(const char* id, const char* label, char* buf, size_t buf_n, float
     left_label(label, label_w);
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
     ImGui::InputText(id, buf, buf_n);
+}
+
+std::string cached_cmake_generator(const std::string& root, const char* build_dir) {
+    if (root.empty() || !build_dir || !build_dir[0]) return {};
+    fs::path bdir(build_dir);
+    if (!bdir.is_absolute()) bdir = fs::path(root) / bdir;
+    std::ifstream in(bdir / "CMakeCache.txt");
+    if (!in) return {};
+    std::string line;
+    while (std::getline(in, line)) {
+        constexpr const char* kKey = "CMAKE_GENERATOR:INTERNAL=";
+        if (line.rfind(kKey, 0) == 0) return line.substr(std::strlen(kKey));
+    }
+    return {};
+}
+
+bool generator_combo(const char* id, char* buf, size_t buf_n, float label_w, const std::string& root,
+                     const char* build_dir) {
+    struct Opt {
+        const char* value;
+        const char* label;
+    };
+    static const Opt kOpts[] = {
+        {"", "Auto"},
+        {"Ninja", "Ninja"},
+        {"Unix Makefiles", "Unix Makefiles"},
+#if defined(_WIN32)
+        {"Visual Studio 17 2022", "Visual Studio 17 2022"},
+#endif
+    };
+    left_label("Generator", label_w);
+    const std::string cached = cached_cmake_generator(root, build_dir);
+    char preview[160];
+    if (!buf[0]) {
+        if (!cached.empty()) {
+            std::snprintf(preview, sizeof(preview), "Auto (%s)", cached.c_str());
+        } else {
+            std::snprintf(preview, sizeof(preview), "Auto");
+        }
+    } else {
+        std::snprintf(preview, sizeof(preview), "%s", buf);
+        for (const auto& o : kOpts) {
+            if (o.value[0] && std::strcmp(buf, o.value) == 0) {
+                std::snprintf(preview, sizeof(preview), "%s", o.label);
+                break;
+            }
+        }
+    }
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    bool changed = false;
+    if (ImGui::BeginCombo(id, preview, ImGuiComboFlags_HeightLarge)) {
+        bool have_cur = (buf[0] == '\0');
+        for (const auto& o : kOpts) {
+            if (o.value[0] && std::strcmp(buf, o.value) == 0) {
+                have_cur = true;
+                break;
+            }
+        }
+        if (buf[0] && !have_cur) {
+            if (ImGui::Selectable(buf, true)) changed = false;
+            ImGui::Separator();
+        }
+        for (const auto& o : kOpts) {
+            const bool sel = (std::strcmp(buf, o.value) == 0);
+            const char* lab = o.label;
+            char auto_lab[160];
+            if (!o.value[0] && !cached.empty()) {
+                std::snprintf(auto_lab, sizeof(auto_lab), "Auto (%s)", cached.c_str());
+                lab = auto_lab;
+            }
+            if (ImGui::Selectable(lab, sel)) {
+                std::snprintf(buf, buf_n, "%s", o.value);
+                changed = true;
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+        ImGui::SetTooltip(
+            "CMake -G. Auto keeps the generator already in this build dir "
+            "(else Ninja if ninja is on PATH, otherwise Unix Makefiles).\n"
+            "Switching Ninja ↔ Unix Makefiles on an existing dir needs a matching "
+            "choice here, or a wiped CMakeCache.txt / new build dir.");
+    }
+    return changed;
 }
 
 void int_field_row(const char* id, const char* label, int* v, float label_w, float field_w = 100.f) {
@@ -296,7 +395,11 @@ void load_branches_json(StudioModel& model, const std::string& json_text, const 
         };
         std::lock_guard<std::mutex> lock(model.mu);
         fill(model.branches_game, j["game"]);
-        fill(model.branches_psx, j["psxrecomp"]);
+        // "framework" is the platform-neutral alias the CLI always emits;
+        // "psxrecomp" is the pre-SNES spelling, kept as a fallback so an older
+        // toolkit still populates the dropdown.
+        fill(model.branches_psx,
+             j.contains("framework") ? j["framework"] : j["psxrecomp"]);
         fill(model.branches_ui, j["recomp-ui"]);
         fill(model.branches_net, j["recomp-net"]);
         fill(model.branches_rb, j["rbengine"]);
@@ -307,7 +410,7 @@ void load_branches_json(StudioModel& model, const std::string& json_text, const 
             const auto& cur = j["current"];
             set_cur(model.git_branch, sizeof(model.git_branch), cur.value("game", ""));
             set_cur(model.git_psx_branch, sizeof(model.git_psx_branch),
-                    cur.value("psxrecomp", ""));
+                    cur.value("framework", cur.value("psxrecomp", "")));
             set_cur(model.git_ui_branch, sizeof(model.git_ui_branch), cur.value("recomp-ui", ""));
             set_cur(model.git_net_branch, sizeof(model.git_net_branch),
                     cur.value("recomp-net", ""));
@@ -442,13 +545,14 @@ void begin_export_activity_log(StudioModel& model, SDL_Window* window) {
     SDL_ShowSaveFileDialog(file_callback, ctx, window, filters, 1, default_loc.c_str());
 }
 
-void begin_export_mingw_zip(StudioModel& model, SDL_Window* window, const std::string& src_zip) {
+// Native "Save as…" for a packaged build zip (local host build or MinGW cross).
+void begin_export_zip(StudioModel& model, SDL_Window* window, const std::string& src_zip) {
     if (!window || src_zip.empty()) return;
     {
         std::lock_guard<std::mutex> lock(model.pick_mu);
         if (model.file_pick_busy) return;
         model.file_pick_busy = true;
-        model.mingw_export_src = src_zip;
+        model.export_zip_src = src_zip;
     }
 #if defined(_WIN32)
     const char* home = std::getenv("USERPROFILE");
@@ -464,12 +568,13 @@ void begin_export_mingw_zip(StudioModel& model, SDL_Window* window, const std::s
     static SDL_DialogFileFilter filters[1];
     filters[0].name = "Zip archives";
     filters[0].pattern = "zip";
-    auto* ctx = new DialogCtx{&model, "export_mingw_zip"};
+    auto* ctx = new DialogCtx{&model, "export_zip"};
     SDL_ShowSaveFileDialog(file_callback, ctx, window, filters, 1, default_loc.c_str());
 }
 
-std::string parse_mingw_zip_from_output(const std::string& text) {
-    // Prefer last MINGW_ZIP= line; fall back to last JSON object with "zip".
+std::string parse_zip_from_output(const std::string& text) {
+    // Prefer the last BUNDLE_ZIP= / MINGW_ZIP= line; fall back to the last JSON
+    // object with a "zip" field (both packagers print the same trailer).
     std::string best;
     std::size_t pos = 0;
     while (pos < text.size()) {
@@ -477,12 +582,15 @@ std::string parse_mingw_zip_from_output(const std::string& text) {
         const std::string line =
             text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
         pos = (end == std::string::npos) ? text.size() : end + 1;
-        constexpr const char* kPrefix = "MINGW_ZIP=";
-        if (line.rfind(kPrefix, 0) == 0) {
-            best = line.substr(std::strlen(kPrefix));
+        bool matched = false;
+        for (const char* prefix : {"BUNDLE_ZIP=", "MINGW_ZIP="}) {
+            if (line.rfind(prefix, 0) != 0) continue;
+            best = line.substr(std::strlen(prefix));
             while (!best.empty() && (best.back() == '\r' || best.back() == ' ')) best.pop_back();
-            continue;
+            matched = true;
+            break;
         }
+        if (matched) continue;
         if (!line.empty() && line.front() == '{') {
             try {
                 auto j = nlohmann::json::parse(line);
@@ -495,6 +603,40 @@ std::string parse_mingw_zip_from_output(const std::string& text) {
         }
     }
     return best;
+}
+
+// Write the Migrate tab's game image into the repo index.
+//
+// It used to live only in the model, so a ROM picked here was forgotten the
+// moment Studio restarted — and the Build tab's "Regenerate C from ROM", which
+// reads the same field, ran without a --rom against a repo whose ROM sits
+// outside the working tree. Nothing else records where that ROM is: the
+// scaffolder bakes its *filename* into tools/regen.sh and its directory
+// nowhere.
+void persist_selected_image(StudioModel& model) {
+    const std::string root = model.selected_root();
+    if (root.empty()) return;
+    const std::string image = model.disc_cue;
+    std::vector<std::string> args;
+    if (image.empty()) {
+        args = {"repos", "clear-cue", "--path", root, "--json"};
+    } else {
+        args = {"repos", "set-cue", "--path", root, "--cue", image, "--json"};
+    }
+    retcomm::studio::run_project_studio_async(
+        model, std::move(args),
+        [&model, image](RunResult r) {
+            std::string err;
+            if (!r.ok() || !retcomm::studio::load_repos_from_json(model, r.stdout_text, &err)) {
+                model.append_log("[FAIL] Remember " +
+                                 std::string(platform_image_label(model.platform)) + ": " +
+                                 (err.empty() ? r.stderr_text : err));
+                return;
+            }
+            model.append_log(image.empty() ? "Cleared game image for this repo"
+                                           : "Remembered game image: " + image);
+        },
+        false);
 }
 
 void apply_pending_picks(StudioModel& model) {
@@ -527,6 +669,7 @@ void apply_pending_picks(StudioModel& model) {
     if (!file.empty()) {
         if (target == "disc") {
             std::snprintf(model.disc_cue, sizeof(model.disc_cue), "%s", file.c_str());
+            persist_selected_image(model);
         } else if (target == "np_disc") {
             std::snprintf(model.np_disc, sizeof(model.np_disc), "%s", file.c_str());
         } else if (target == "np_bios") {
@@ -560,15 +703,15 @@ void apply_pending_picks(StudioModel& model) {
                     model.set_status("Exported activity log");
                 }
             }
-        } else if (target == "export_mingw_zip") {
+        } else if (target == "export_zip") {
             std::string src;
             {
                 std::lock_guard<std::mutex> lock(model.pick_mu);
-                src = model.mingw_export_src;
+                src = model.export_zip_src;
             }
             if (src.empty() || !fs::is_regular_file(src)) {
-                model.append_log("[FAIL] MinGW export: packaged zip missing: " + src);
-                model.set_status("MinGW export failed");
+                model.append_log("[FAIL] Export: packaged zip missing: " + src);
+                model.set_status("Export failed");
             } else {
                 std::error_code ec;
                 fs::path dest(file);
@@ -576,12 +719,12 @@ void apply_pending_picks(StudioModel& model) {
                 fs::create_directories(dest.parent_path(), ec);
                 fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
                 if (ec) {
-                    model.append_log("[FAIL] MinGW export copy: " + ec.message() + " → " +
+                    model.append_log("[FAIL] Export copy: " + ec.message() + " → " +
                                      dest.string());
-                    model.set_status("MinGW export failed");
+                    model.set_status("Export failed");
                 } else {
-                    model.append_log("[OK] Exported MinGW zip → " + dest.string());
-                    model.set_status("Exported MinGW zip");
+                    model.append_log("[OK] Exported build zip → " + dest.string());
+                    model.set_status("Exported build zip");
                 }
             }
         }
@@ -589,6 +732,11 @@ void apply_pending_picks(StudioModel& model) {
 }
 
 void refresh_repos(StudioModel& model) {
+    // Which index to read is a property of the platform. Before the picker is
+    // answered there is no answer, and loading "the PSX one for now" races the
+    // pick: a startup update check that finishes after a SNES pick would
+    // overwrite the SNES list with PSX repos.
+    if (model.platform == Platform::None) return;
     retcomm::studio::run_project_studio_async(
         model, {"repos", "list", "--json"},
         [&model](RunResult r) {
@@ -605,6 +753,7 @@ void refresh_repos(StudioModel& model) {
 
 // After catalog sync: reload in_catalog flags; optionally re-apply Bulk "Catalog only".
 void refresh_repos_and_catalog_filters(StudioModel& model, bool reapply_bulk_catalog) {
+    if (model.platform == Platform::None) return;  // see refresh_repos()
     retcomm::studio::run_project_studio_async(
         model, {"repos", "list", "--json"},
         [&model, reapply_bulk_catalog](RunResult r) {
@@ -783,6 +932,205 @@ void do_apply(StudioModel& model) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Platform picker
+//
+// The console icons are drawn rather than loaded. Two reasons: Studio already
+// ships an icon-less assets/ dir and adding console art to it means shipping
+// (and licensing) photographs of hardware, and vector art scales with the
+// user's font/DPI where a bitmap at one size does not. They are deliberately
+// schematic — a top-down silhouette in the console's own colours, which is
+// what makes them readable at a glance without pretending to be product shots.
+// ---------------------------------------------------------------------------
+// Both icons draw into a 4:3 box fitted inside the space given, so a wide card
+// does not stretch a console into a hi-fi component.
+ImVec4 fit_icon_box(const ImVec2& p, float w, float h) {
+    const float want = 4.f / 3.f;
+    float iw = w, ih = w / want;
+    if (ih > h) {
+        ih = h;
+        iw = h * want;
+    }
+    return ImVec4(p.x + (w - iw) * 0.5f, p.y + (h - ih) * 0.5f, iw, ih);
+}
+
+void draw_psx_icon(ImDrawList* dl, const ImVec2& p, float w, float h) {
+    const ImVec4 box = fit_icon_box(p, w, h);
+    const float x = box.x, y = box.y, bw = box.z, bh = box.w;
+
+    const ImU32 body = IM_COL32(214, 213, 206, 255);
+    const ImU32 body_dk = IM_COL32(176, 175, 168, 255);
+    const ImU32 recess = IM_COL32(150, 149, 144, 255);
+    const ImU32 shadow = IM_COL32(120, 119, 114, 255);
+    const ImU32 hole = IM_COL32(62, 62, 60, 255);
+
+    // Chassis, seen from above: near-square with a shallow front lip.
+    const ImVec2 a(x, y);
+    const ImVec2 b(x + bw, y + bh * 0.86f);
+    dl->AddRectFilled(a, b, body, bh * 0.10f);
+    dl->AddRectFilled(ImVec2(a.x, b.y - bh * 0.20f), b, body_dk, bh * 0.10f,
+                      ImDrawFlags_RoundCornersBottom);
+
+    // The disc lid. Large and central — it is the whole silhouette of a PS1
+    // from above, and shrinking it is what makes the shape read as a VCR.
+    const ImVec2 c(x + bw * 0.42f, y + bh * 0.36f);
+    const float r = bh * 0.30f;
+    dl->AddCircleFilled(c, r * 1.06f, shadow, 56);
+    dl->AddCircleFilled(c, r, recess, 56);
+    dl->AddCircleFilled(c, r * 0.62f, body_dk, 48);
+    dl->AddCircleFilled(c, r * 0.20f, hole, 24);
+
+    // Open / power / reset column on the right shoulder.
+    for (int i = 0; i < 3; ++i) {
+        const float ry = y + bh * (0.13f + 0.17f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(x + bw * 0.80f, ry),
+                          ImVec2(x + bw * 0.93f, ry + bh * 0.10f), body_dk, bh * 0.03f);
+    }
+    // Two controller ports, two memory-card slots, along the front lip.
+    for (int i = 0; i < 2; ++i) {
+        const float cx = x + bw * (0.28f + 0.44f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(cx - bw * 0.11f, b.y - bh * 0.15f),
+                          ImVec2(cx + bw * 0.11f, b.y - bh * 0.06f), hole, bh * 0.03f);
+        dl->AddRectFilled(ImVec2(cx - bw * 0.07f, b.y - bh * 0.05f),
+                          ImVec2(cx + bw * 0.07f, b.y - bh * 0.01f), shadow, bh * 0.02f);
+    }
+}
+
+void draw_snes_icon(ImDrawList* dl, const ImVec2& p, float w, float h) {
+    const ImVec4 box = fit_icon_box(p, w, h);
+    const float x = box.x, y = box.y, bw = box.z, bh = box.w;
+
+    const ImU32 body = IM_COL32(212, 210, 200, 255);
+    const ImU32 body_dk = IM_COL32(172, 170, 162, 255);
+    const ImU32 shadow = IM_COL32(140, 138, 132, 255);
+    const ImU32 slot = IM_COL32(58, 57, 57, 255);
+    const ImU32 purple = IM_COL32(122, 104, 182, 255);
+    const ImU32 purple_dk = IM_COL32(88, 74, 140, 255);
+    const ImU32 hole = IM_COL32(62, 62, 60, 255);
+
+    const ImVec2 a(x, y);
+    const ImVec2 b(x + bw, y + bh * 0.88f);
+    dl->AddRectFilled(a, b, body, bh * 0.13f);
+
+    // Raised centre deck the cartridge drops into — the SNES's one big
+    // rounded block, flanked by the ribbed shoulders.
+    dl->AddRectFilled(ImVec2(x + bw * 0.18f, y + bh * 0.03f),
+                      ImVec2(x + bw * 0.82f, y + bh * 0.60f), shadow, bh * 0.12f);
+    dl->AddRectFilled(ImVec2(x + bw * 0.19f, y + bh * 0.03f),
+                      ImVec2(x + bw * 0.81f, y + bh * 0.57f), body_dk, bh * 0.12f);
+    dl->AddRectFilled(ImVec2(x + bw * 0.28f, y + bh * 0.12f),
+                      ImVec2(x + bw * 0.72f, y + bh * 0.24f), slot, bh * 0.02f);
+
+    // Purple power / eject. Oversized on purpose: the colour is what tells a
+    // SNES apart from every other grey box at this size.
+    dl->AddRectFilled(ImVec2(x + bw * 0.28f, y + bh * 0.34f),
+                      ImVec2(x + bw * 0.46f, y + bh * 0.50f), purple, bh * 0.04f);
+    dl->AddRectFilled(ImVec2(x + bw * 0.54f, y + bh * 0.34f),
+                      ImVec2(x + bw * 0.72f, y + bh * 0.50f), purple_dk, bh * 0.04f);
+
+    // Vent ribs on both shoulders.
+    for (int i = 0; i < 4; ++i) {
+        const float ry = y + bh * (0.12f + 0.11f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(x + bw * 0.04f, ry),
+                          ImVec2(x + bw * 0.15f, ry + bh * 0.045f), body_dk, bh * 0.02f);
+        dl->AddRectFilled(ImVec2(x + bw * 0.85f, ry),
+                          ImVec2(x + bw * 0.96f, ry + bh * 0.045f), body_dk, bh * 0.02f);
+    }
+    // Two controller ports along the front.
+    for (int i = 0; i < 2; ++i) {
+        const float cx = x + bw * (0.33f + 0.34f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(cx - bw * 0.08f, b.y - bh * 0.19f),
+                          ImVec2(cx + bw * 0.08f, b.y - bh * 0.05f), hole, bh * 0.07f);
+    }
+}
+
+// One big pickable card. Returns true when clicked.
+bool platform_card(StudioModel& model, const Theme& th, Platform which, const char* title,
+                   const char* subtitle, const ImVec2& size) {
+    ImGui::PushID(static_cast<int>(which));
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##card", size);
+    const bool hot = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 lo = origin;
+    const ImVec2 hi(origin.x + size.x, origin.y + size.y);
+    const ImVec4 fill = held ? th.accent_dim : (hot ? th.panel_hovered : th.panel);
+    dl->AddRectFilled(lo, hi, ImGui::GetColorU32(fill), th.radius_lg);
+    dl->AddRect(lo, hi, ImGui::GetColorU32(hot ? th.accent : th.border), th.radius_lg, 0,
+                hot ? 2.f : 1.f);
+
+    // Icon occupies the upper block; text sits under it.
+    const float pad = th.spacing_md;
+    const float icon_w = size.x - pad * 2.f;
+    const float icon_h = size.y * 0.46f;
+    const ImVec2 icon_at(lo.x + pad, lo.y + pad);
+    if (which == Platform::SNES)
+        draw_snes_icon(dl, icon_at, icon_w, icon_h);
+    else
+        draw_psx_icon(dl, icon_at, icon_w, icon_h);
+
+    const float title_w = ImGui::CalcTextSize(title).x;
+    dl->AddText(ImVec2(lo.x + (size.x - title_w) * 0.5f, icon_at.y + icon_h + pad * 0.5f),
+                ImGui::GetColorU32(th.text), title);
+    const float sub_w = ImGui::CalcTextSize(subtitle).x;
+    dl->AddText(ImVec2(lo.x + (size.x - sub_w) * 0.5f,
+                       icon_at.y + icon_h + pad * 0.5f + ImGui::GetTextLineHeight() + 4.f),
+                ImGui::GetColorU32(th.text_muted), subtitle);
+    ImGui::PopID();
+    (void)model;
+    return clicked;
+}
+
+void draw_platform_picker(StudioModel& model, const Theme& th) {
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float card_w = std::clamp(avail.x * 0.30f, 200.f, 300.f);
+    const float card_h = card_w * 0.86f;
+    const float gap = th.spacing_lg;
+    const float block_w = card_w * 2.f + gap;
+
+    const float head_h = ImGui::GetTextLineHeight() * 3.f + th.spacing_lg;
+    const float block_h = head_h + card_h + th.spacing_lg + ImGui::GetTextLineHeight() * 2.f;
+    if (avail.y > block_h) ImGui::Dummy(ImVec2(0, (avail.y - block_h) * 0.45f));
+
+    auto centered = [&](const char* text, const ImVec4& col) {
+        const float w = ImGui::CalcTextSize(text).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.f, (avail.x - w) * 0.5f));
+        ImGui::TextColored(col, "%s", text);
+    };
+    centered("Choose a platform", th.accent);
+    centered("Each console has its own repo list, framework and scaffolder.", th.text_muted);
+    ImGui::Dummy(ImVec2(0, th.spacing_md));
+
+    const float x0 = ImGui::GetCursorPosX() + std::max(0.f, (avail.x - block_w) * 0.5f);
+    ImGui::SetCursorPosX(x0);
+    // Oldest console first, so the row reads generationally as more are added.
+    Platform chosen = Platform::None;
+    if (platform_card(model, th, Platform::SNES, "Super Nintendo", "snesrecomp",
+                      ImVec2(card_w, card_h)))
+        chosen = Platform::SNES;
+    ImGui::SameLine(0.f, gap);
+    if (platform_card(model, th, Platform::PSX, "PlayStation", "psxrecomp",
+                      ImVec2(card_w, card_h)))
+        chosen = Platform::PSX;
+
+    ImGui::Dummy(ImVec2(0, th.spacing_md));
+    centered("Switch consoles any time from the header.", th.text_muted);
+
+    if (chosen != Platform::None) {
+        model.platform = chosen;
+        model.platform_pending = false;
+        model.append_log(std::string("Platform: ") + platform_display(chosen) + " (" +
+                         platform_framework(chosen) + ")");
+        model.set_status(std::string(platform_display(chosen)) + " — loading repos…");
+        // Catalog flags as well as the list: the startup check that would
+        // normally have fetched them ran before a platform existed.
+        refresh_repos_and_catalog_filters(model, /*reapply_bulk_catalog=*/false);
+    }
+}
+
 void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 88.f;
 
@@ -790,6 +1138,20 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
     ImGui::TextColored(th.accent, "RetComM Studio");
     ImGui::SameLine();
     ImGui::TextDisabled("v%s", model.version.c_str());
+    const bool picked = model.platform != Platform::None;
+    if (picked) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("·");
+        ImGui::SameLine();
+        ImGui::TextColored(th.text, "%s", platform_display(model.platform));
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Change##platform")) model.platform_pending = true;
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Back to the platform picker.\n"
+                "Each console keeps its own repo list, so nothing is lost by switching.");
+        }
+    }
     {
         const float bw = widget_label_width("Check updates");
         ImGui::SameLine(0.f, 0.f);
@@ -806,7 +1168,13 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::EndDisabled();
     }
 
-    // Repo row — size combo from trailing button/checkbox widths.
+    // Repo row — size combo from trailing button/checkbox widths. Absent until
+    // a platform names an index: an empty "(add a repo…)" combo above the
+    // picker invites adding a repo to a list nobody has chosen yet.
+    if (!picked) {
+        text_clipped(model.status.c_str(), th.text_muted);
+        return;
+    }
     left_label("Game repo", kLabelW);
     {
         const ImGuiStyle& st = ImGui::GetStyle();
@@ -893,11 +1261,25 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
 
 void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 110.f;
+    const bool snes = model.is_snes();
+    if (snes) {
+        ImGui::TextColored(th.text_muted,
+                           "Brings a SNES port up to the snesrecomp scaffold: submodules, "
+                           ".gitignore, untracked generated C, regen.sh / packager / CI, and "
+                           "framework_pins.txt. The ROM is read for digests when a file has "
+                           "to be re-emitted and is never copied into the repo — but the path "
+                           "you set here is remembered for this repo, and is what Build's "
+                           "\"Regenerate C from ROM\" hands to tools/regen.sh.");
+        ImGui::Spacing();
+    }
     ImGui::BeginDisabled(model.busy.load() || model.selected_root().empty());
 
-    if (path_row("##disc", "Disc .cue", model.disc_cue, sizeof(model.disc_cue), kLabelW,
-                 "Browse…##disc"))
-        pick_file(model, window, "disc", "CUE files", "cue");
+    bool disc_typed = false;
+    if (path_row("##disc", platform_image_label(model.platform), model.disc_cue,
+                 sizeof(model.disc_cue), kLabelW, "Browse…##disc", &disc_typed))
+        pick_file(model, window, "disc", platform_image_filter_name(model.platform),
+                  platform_image_filter_ext(model.platform));
+    if (disc_typed) persist_selected_image(model);
 
     // Options rows — Players combo (wider than old +/-) + zip field.
     {
@@ -920,9 +1302,15 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
               kLabelW);
     field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo), kLabelW);
 
-    checkbox_wrapped("Netplay", &model.migrate_netplay);
-    checkbox_wrapped("CI", &model.migrate_ci);
-    checkbox_wrapped("Probe disc", &model.migrate_probe);
+    // Netplay and disc probing have no ops in the SNES plan; a checkbox that
+    // reaches nothing is worse than an absent one.
+    if (!snes) {
+        checkbox_wrapped("Netplay", &model.migrate_netplay);
+        checkbox_wrapped("CI", &model.migrate_ci);
+        checkbox_wrapped("Probe disc", &model.migrate_probe);
+    } else {
+        checkbox_wrapped("CI", &model.migrate_ci);
+    }
     checkbox_wrapped("Dry-run", &model.migrate_dry_run);
     checkbox_wrapped("Force", &model.migrate_force);
     end_wrapped_line();
@@ -998,22 +1386,35 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
 
 void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 110.f;
+    const bool snes = model.is_snes();
     // First visit: load default module branch lists (ls-remote).
     if (model.branches_psx.empty() && !model.branches_loading)
         refresh_branches(model, false);
     ImGui::BeginChild("##np_scroll", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_None);
     ImGui::BeginDisabled(model.busy.load());
+    if (snes) {
+        ImGui::TextColored(th.text_muted,
+                           "Drives snesrecomp's tools/new_project/setup_project.sh: probe the "
+                           "ROM, lay out the repo, wire submodules, seed recomp/*.cfg, then "
+                           "generate / build / publish. The ROM is probed where it lies and "
+                           "never enters the repository.");
+        ImGui::Spacing();
+    }
     if (path_row("##np_parent", "Parent folder", model.np_parent, sizeof(model.np_parent),
                  kLabelW, "…##np_parent"))
         pick_folder(model, window, "np_parent");
     field_row("##np_name", "Name", model.np_name, sizeof(model.np_name), kLabelW);
-    if (path_row("##np_disc", "Disc .cue", model.np_disc, sizeof(model.np_disc), kLabelW,
-                 "…##np_disc"))
-        pick_file(model, window, "np_disc", "CUE files", "cue");
-    if (path_row("##np_bios", "BIOS", model.np_bios, sizeof(model.np_bios), kLabelW,
-                 "…##np_bios"))
-        pick_file(model, window, "np_bios", "BIOS", "bin;rom");
+    if (path_row("##np_disc", platform_image_label(model.platform), model.np_disc,
+                 sizeof(model.np_disc), kLabelW, "…##np_disc"))
+        pick_file(model, window, "np_disc", platform_image_filter_name(model.platform),
+                  platform_image_filter_ext(model.platform));
+    // A cartridge boots from its own reset vector: there is no BIOS to supply.
+    if (!snes) {
+        if (path_row("##np_bios", "BIOS", model.np_bios, sizeof(model.np_bios), kLabelW,
+                     "…##np_bios"))
+            pick_file(model, window, "np_bios", "BIOS", "bin;rom");
+    }
 
     left_label("Players", kLabelW);
     if (players_combo("##np_players", &model.np_players, 140.f)) {
@@ -1022,22 +1423,66 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         else
             model.np_netplay = false;
     }
+    if (snes) {
+        // Seats above two need a Super Multitap; the script derives a layout
+        // from the count, and this only overrides it.
+        left_label("Multitap", kLabelW);
+        ImGui::SetNextItemWidth(220.f);
+        ImGui::Combo("##np_multitap", &model.np_multitap,
+                     "Auto (from players)\0Port 1\0Port 2\0Both ports\0Off\0");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Auto: 3–5 seats use the port-2 tap (the layout commercial\n"
+                "titles use), 6–8 use both ports, 1–2 use none.");
+        }
+    }
     field_row("##np_zip", "Zip prefix", model.np_zip, sizeof(model.np_zip), kLabelW);
     field_row("##np_gh_owner", "GitHub owner", model.np_gh_owner, sizeof(model.np_gh_owner),
               kLabelW);
     field_row("##np_gh_repo", "GitHub repo", model.np_gh_repo, sizeof(model.np_gh_repo), kLabelW);
-    field_row("##np_region", "Region", model.np_region, sizeof(model.np_region), kLabelW);
-    field_row("##np_desc", "Description", model.np_desc, sizeof(model.np_desc), kLabelW);
-    field_row("##np_pub", "Publisher", model.np_publisher, sizeof(model.np_publisher), kLabelW);
-    field_row("##np_year", "Year", model.np_year, sizeof(model.np_year), kLabelW);
-    field_row("##np_lobby", "Lobby", model.np_lobby, sizeof(model.np_lobby), kLabelW);
+    // The SNES wizard prompts for these on a terminal, with the probed ROM
+    // identity as each default. Studio runs it with --yes, which takes every
+    // default silently — so the fields are here, and Probe ROM fills them with
+    // the same values the prompts would have offered.
+    if (snes) {
+        field_row("##np_snes_region", "Region", model.np_snes_region,
+                  sizeof(model.np_snes_region), kLabelW);
+        if (model.np_snes_region[0] == '\0') {
+            left_label("", kLabelW);
+            ImGui::TextColored(th.text_muted, "Blank = from the cartridge header.");
+        }
+        field_row("##np_desc", "Description", model.np_desc, sizeof(model.np_desc), kLabelW);
+        field_row("##np_pub", "Publisher", model.np_publisher, sizeof(model.np_publisher),
+                  kLabelW);
+        field_row("##np_year", "Year", model.np_year, sizeof(model.np_year), kLabelW);
+    } else {
+        field_row("##np_region", "Region", model.np_region, sizeof(model.np_region), kLabelW);
+        field_row("##np_desc", "Description", model.np_desc, sizeof(model.np_desc), kLabelW);
+        field_row("##np_pub", "Publisher", model.np_publisher, sizeof(model.np_publisher),
+                  kLabelW);
+        field_row("##np_year", "Year", model.np_year, sizeof(model.np_year), kLabelW);
+        field_row("##np_lobby", "Lobby", model.np_lobby, sizeof(model.np_lobby), kLabelW);
+    }
 
     checkbox_wrapped("recomp-ui", &model.np_ui);
-    checkbox_wrapped("Wizard", &model.np_wizard);
+    if (!snes) checkbox_wrapped("Wizard", &model.np_wizard);
     checkbox_wrapped("Netplay##np", &model.np_netplay);
+    if (snes) {
+        if (ImGui::Checkbox("Rollback", &model.np_rollback)) {
+            if (model.np_rollback) model.np_netplay = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Builds retcomm-rbengine in and implies netplay.\n"
+                "Delay-sync stays the runtime default; SNES_NET_MODE=rollback opts in.");
+        }
+    }
     checkbox_wrapped("CI##np", &model.np_ci);
-    checkbox_wrapped("Boxart", &model.np_boxart);
-    checkbox_wrapped("Stage", &model.np_stage);
+    if (!snes) {
+        checkbox_wrapped("Boxart", &model.np_boxart);
+        checkbox_wrapped("Stage", &model.np_stage);
+    }
     checkbox_wrapped("Generate", &model.np_generate);
     checkbox_wrapped("Build##np", &model.np_build);
     checkbox_wrapped("GitHub", &model.np_github);
@@ -1052,8 +1497,16 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::TextDisabled("Module refs (scrollable)");
     }
     constexpr float kBranchW = 260.f;
-    branch_combo("##np_psx", "psxrecomp ref", model.np_psx_ref, sizeof(model.np_psx_ref),
-                 kLabelW, model.branches_psx, kBranchW);
+    // branches_psx holds whichever framework this session is on — the CLI
+    // returns it under a stable "framework" key precisely so this widget does
+    // not have to know which.
+    if (snes) {
+        branch_combo("##np_snes", "snesrecomp ref", model.np_snes_ref,
+                     sizeof(model.np_snes_ref), kLabelW, model.branches_psx, kBranchW);
+    } else {
+        branch_combo("##np_psx", "psxrecomp ref", model.np_psx_ref, sizeof(model.np_psx_ref),
+                     kLabelW, model.branches_psx, kBranchW);
+    }
     branch_combo("##np_ui", "recomp-ui ref", model.np_ui_ref, sizeof(model.np_ui_ref), kLabelW,
                  model.branches_ui, kBranchW);
     branch_combo("##np_net", "recomp-net ref", model.np_net_ref, sizeof(model.np_net_ref),
@@ -1061,7 +1514,66 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     branch_combo("##np_rb", "rbengine ref", model.np_rb_ref, sizeof(model.np_rb_ref), kLabelW,
                  model.branches_rb, kBranchW);
 
-    if (model.np_disc[0] && ImGui::Button("Autofill meta")) {
+    // The cartridge equivalent of Autofill meta. Not a metadata *lookup* —
+    // there is no Redump entry for a cartridge — but the ROM's own header,
+    // which is exactly what the wizard's prompts offer as defaults.
+    if (snes) {
+        ImGui::BeginDisabled(!model.np_disc[0]);
+        if (ImGui::Button("Probe ROM")) {
+            std::vector<std::string> args = {"probe-rom", "--rom", model.np_disc};
+            retcomm::studio::run_project_studio_async(
+                model, std::move(args),
+                [&model](RunResult r) {
+                    if (!r.ok()) {
+                        model.append_log("[FAIL] Probe failed — is this a SNES ROM?");
+                        model.np_probe_note = "probe failed";
+                        return;
+                    }
+                    try {
+                        auto j = nlohmann::json::parse(r.stdout_text);
+                        auto set = [&](char* buf, size_t n, const char* key) {
+                            if (j.contains(key) && j[key].is_string()) {
+                                const std::string v = j[key].get<std::string>();
+                                if (!v.empty()) std::snprintf(buf, n, "%s", v.c_str());
+                            }
+                        };
+                        set(model.np_name, sizeof(model.np_name), "display_name");
+                        set(model.np_snes_region, sizeof(model.np_snes_region), "region");
+                        set(model.np_zip, sizeof(model.np_zip), "zip_prefix");
+                        set(model.np_gh_repo, sizeof(model.np_gh_repo), "project_name");
+                        const std::string mapping = j.value("mapping", "");
+                        const std::string copro = j.value("coprocessor", "");
+                        const bool ck = j.value("checksum_valid", false);
+                        model.np_probe_note = mapping + ", region " +
+                                              j.value("region_name", "?") + ", coprocessor " +
+                                              (copro.empty() ? "?" : copro) +
+                                              (ck ? ", checksum OK" : ", CHECKSUM BAD");
+                        model.append_log("Probed " + j.value("rom_file", "ROM") + ": " +
+                                         model.np_probe_note);
+                        // A coprocessor the runner may not implement is worth
+                        // saying out loud before a port is scaffolded around it.
+                        if (!copro.empty() && copro != "none")
+                            model.append_log("[WARN] Cartridge uses " + copro +
+                                             " — check snesrecomp supports it before porting.");
+                        if (!ck)
+                            model.append_log(
+                                "[WARN] Header checksum does not validate — the dump may be "
+                                "bad, overdumped, or a hack.");
+                    } catch (const std::exception& ex) {
+                        model.append_log(std::string("Probe parse failed: ") + ex.what());
+                    }
+                },
+                false);
+        }
+        ImGui::EndDisabled();
+        if (!model.np_probe_note.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(th.text_muted, "%s", model.np_probe_note.c_str());
+        }
+        ImGui::SameLine();
+    }
+    // Redump / libretro lookup is disc-keyed; a cartridge has no entry.
+    if (!snes && model.np_disc[0] && ImGui::Button("Autofill meta")) {
         retcomm::studio::run_project_studio_async(
             model, {"lookup-disc-meta", "--disc", model.np_disc, "--json"},
             [&model](RunResult r) {
@@ -1089,11 +1601,84 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             },
             false);
     }
-    ImGui::SameLine();
+    if (!snes) ImGui::SameLine();
     accent_button(th);
     if (ImGui::Button("Create project")) {
         if (!model.np_name[0] || !model.np_parent[0] || !model.np_disc[0]) {
-            model.append_log("[FAIL] Need parent, name, and disc .cue");
+            model.append_log(std::string("[FAIL] Need parent, name, and ") +
+                             platform_image_label(model.platform));
+        } else if (snes) {
+            std::vector<std::string> args = {
+                "new-project",
+                "--name", model.np_name,
+                "--dir", model.np_parent,
+                "--rom", model.np_disc,
+                "--players", std::to_string(model.np_players),
+            };
+            if (model.np_zip[0]) {
+                args.push_back("--zip-prefix");
+                args.push_back(model.np_zip);
+            }
+            if (model.np_gh_owner[0]) {
+                args.push_back("--github-owner");
+                args.push_back(model.np_gh_owner);
+            }
+            if (model.np_gh_repo[0]) {
+                args.push_back("--github-repo");
+                args.push_back(model.np_gh_repo);
+            }
+            if (model.np_desc[0]) {
+                args.push_back("--description");
+                args.push_back(model.np_desc);
+            }
+            if (model.np_publisher[0]) {
+                args.push_back("--publisher");
+                args.push_back(model.np_publisher);
+            }
+            if (model.np_year[0]) {
+                args.push_back("--year");
+                args.push_back(model.np_year);
+            }
+            // Omitted when blank so the cartridge header decides.
+            if (model.np_snes_region[0]) {
+                args.push_back("--region");
+                args.push_back(model.np_snes_region);
+            }
+            static const char* kTaps[] = {"", "port1", "port2", "both", "off"};
+            const int tap = (model.np_multitap < 0 || model.np_multitap > 4) ? 0
+                                                                            : model.np_multitap;
+            if (tap != 0) {
+                args.push_back("--multitap");
+                args.push_back(kTaps[tap]);
+            }
+            if (!model.np_ui) args.push_back("--no-recomp-ui");
+            if (model.np_netplay) args.push_back("--enable-netplay");
+            if (model.np_rollback) args.push_back("--enable-rollback");
+            if (!model.np_ci) args.push_back("--no-ci");
+            if (model.np_generate) args.push_back("--generate");
+            if (model.np_build) args.push_back("--enable-build");
+            if (model.np_github) args.push_back("--create-github");
+            if (model.np_snes_ref[0]) {
+                args.push_back("--snesrecomp-ref");
+                args.push_back(model.np_snes_ref);
+            }
+            if (model.np_ui_ref[0]) {
+                args.push_back("--recomp-ui-ref");
+                args.push_back(model.np_ui_ref);
+            }
+            if (model.np_net_ref[0] && std::strcmp(model.np_net_ref, "(default)") != 0) {
+                args.push_back("--recomp-net-ref");
+                args.push_back(model.np_net_ref);
+            }
+            if (model.np_rb_ref[0] && std::strcmp(model.np_rb_ref, "(default)") != 0) {
+                args.push_back("--rbengine-ref");
+                args.push_back(model.np_rb_ref);
+            }
+            model.append_log("--- New SNES project setup ---");
+            retcomm::studio::run_project_studio_async(model, args, [&model](RunResult r) {
+                model.set_status(r.ok() ? "New project created" : "New project failed");
+                refresh_repos(model);
+            });
         } else {
             std::vector<std::string> args = {
                 "new-project",
@@ -1206,7 +1791,7 @@ void draw_git(StudioModel& model, const Theme& th) {
     if (action("Ensure submodules")) {
         retcomm::studio::run_project_studio_async(
             model,
-            {"git", "ensure-submodules", "--root", root, "--psxrecomp-branch",
+            {"git", "ensure-submodules", "--root", root, "--framework-branch",
              model.git_psx_branch, "--recomp-ui-branch", model.git_ui_branch},
             nullptr);
     }
@@ -1261,8 +1846,8 @@ void draw_git(StudioModel& model, const Theme& th) {
     }
 
     constexpr float kBranchW = 260.f;
-    branch_combo("##git_psx", "psxrecomp", model.git_psx_branch, sizeof(model.git_psx_branch),
-                 kLabelW, model.branches_psx, kBranchW);
+    branch_combo("##git_psx", model.framework(), model.git_psx_branch,
+                 sizeof(model.git_psx_branch), kLabelW, model.branches_psx, kBranchW);
     branch_combo("##git_ui", "recomp-ui", model.git_ui_branch, sizeof(model.git_ui_branch),
                  kLabelW, model.branches_ui, kBranchW);
     branch_combo("##git_net", "recomp-net", model.git_net_branch, sizeof(model.git_net_branch),
@@ -1284,7 +1869,7 @@ void draw_git(StudioModel& model, const Theme& th) {
             }
             if (model.git_tgt_modules) {
                 args.push_back("--modules");
-                args.push_back("--psxrecomp-branch");
+                args.push_back("--framework-branch");
                 args.push_back(model.git_psx_branch);
                 args.push_back("--ui-branch");
                 args.push_back(model.git_ui_branch);
@@ -1484,12 +2069,12 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     ImGui::TextUnformatted("Targets");
     checkbox_wrapped("Game", &model.bulk_tgt_game);
     checkbox_wrapped("Modules", &model.bulk_tgt_modules);
-    checkbox_wrapped("psxrecomp", &model.bulk_tgt_psx);
+    checkbox_wrapped(model.framework(), &model.bulk_tgt_psx);
     checkbox_wrapped("Nested", &model.bulk_tgt_nested);
     end_wrapped_line();
-    ImGui::TextColored(th.text_muted,
-                       "Tick which checkouts Switch branches should move "
-                       "(Game / Modules / psxrecomp / Nested).");
+    ImGui::Text("Tick which checkouts Switch branches should move "
+                "(Game / Modules / %s / Nested).",
+                model.framework());
 
     ImGui::Separator();
     ImGui::TextUnformatted("Submodule / branch assignments");
@@ -1514,8 +2099,8 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     branch_combo("##bulk_game", "game", model.bulk_game_branch, sizeof(model.bulk_game_branch),
                  kLabelW, game_branches, kBranchW);
     ImGui::SameLine();
-    branch_combo("##bulk_psx", "psx", model.bulk_psx_branch, sizeof(model.bulk_psx_branch), 36.f,
-                 psx_branches, kBranchW);
+    branch_combo("##bulk_psx", model.is_snes() ? "snes" : "psx", model.bulk_psx_branch,
+                 sizeof(model.bulk_psx_branch), 36.f, psx_branches, kBranchW);
     branch_combo("##bulk_ui", "ui", model.bulk_ui_branch, sizeof(model.bulk_ui_branch), kLabelW,
                  ui_branches, kBranchW);
     ImGui::SameLine();
@@ -1558,7 +2143,8 @@ void draw_bulk(StudioModel& model, const Theme& th) {
             model.append_log("[FAIL] No repos selected");
         } else if (!(model.bulk_tgt_game || model.bulk_tgt_modules || model.bulk_tgt_psx ||
                      model.bulk_tgt_nested)) {
-            model.append_log("[FAIL] Enable at least one Target (Game / Modules / psxrecomp / Nested)");
+            model.append_log(std::string("[FAIL] Enable at least one Target (Game / Modules / ") +
+                             model.framework() + " / Nested)");
         } else {
             std::vector<std::string> args = {"git", "bulk-switch", "--select", select_csv()};
             if (model.bulk_tgt_game) {
@@ -1568,14 +2154,14 @@ void draw_bulk(StudioModel& model, const Theme& th) {
             }
             if (model.bulk_tgt_modules) {
                 args.push_back("--modules");
-                args.push_back("--psxrecomp-branch");
+                args.push_back("--framework-branch");
                 args.push_back(model.bulk_psx_branch);
                 args.push_back("--ui-branch");
                 args.push_back(model.bulk_ui_branch);
             }
             if (model.bulk_tgt_psx && !model.bulk_tgt_modules) {
-                args.push_back("--psxrecomp");
-                args.push_back("--psxrecomp-branch");
+                args.push_back("--framework");
+                args.push_back("--framework-branch");
                 args.push_back(model.bulk_psx_branch);
             }
             if (model.bulk_tgt_nested) {
@@ -1682,12 +2268,13 @@ void draw_bulk(StudioModel& model, const Theme& th) {
             if (!(model.bulk_tgt_game || model.bulk_tgt_modules || model.bulk_tgt_psx ||
                   model.bulk_tgt_nested)) {
                 model.append_log(
-                    "[FAIL] Enable at least one Target (Game / Modules / psxrecomp / Nested)");
+                    std::string("[FAIL] Enable at least one Target (Game / Modules / ") +
+                    model.framework() + " / Nested)");
                 return;
             }
             if (model.bulk_tgt_game) args.push_back("--game");
             if (model.bulk_tgt_modules) args.push_back("--modules");
-            if (model.bulk_tgt_psx) args.push_back("--psxrecomp");
+            if (model.bulk_tgt_psx) args.push_back("--framework");
             if (model.bulk_tgt_nested) args.push_back("--nested");
         }
         if (std::strcmp(sub, "bulk-pull") == 0) {
@@ -1736,16 +2323,68 @@ void draw_bulk(StudioModel& model, const Theme& th) {
 
 void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 100.f;
+    const bool snes = model.is_snes();
     const std::string root = model.selected_root();
+    // psx-runtime is every PSX port's target; a SNES port names its executable
+    // after the project, so leaving the field blank lets the CLI read
+    // project() out of the repo rather than guessing here.
+    if (snes && std::strcmp(model.build_target, "psx-runtime") == 0)
+        model.build_target[0] = '\0';
+    if (!snes && model.build_target[0] == '\0')
+        std::snprintf(model.build_target, sizeof(model.build_target), "psx-runtime");
     ImGui::BeginChild("##build_scroll", ImVec2(0, 0));
     ImGui::BeginDisabled(model.busy.load() || root.empty());
     field_row("##bdir", "Build dir", model.build_dir, sizeof(model.build_dir), kLabelW);
     field_row("##btype", "Build type", model.build_type, sizeof(model.build_type), kLabelW);
     field_row("##btarget", "Target", model.build_target, sizeof(model.build_target), kLabelW);
-    field_row("##bgen", "Generator", model.build_generator, sizeof(model.build_generator),
-              kLabelW);
+    if (snes && model.build_target[0] == '\0') {
+        left_label("", kLabelW);
+        ImGui::TextColored(th.text_muted, "Blank = the CMake project() name in this repo.");
+    }
+    generator_combo("##bgen", model.build_generator, sizeof(model.build_generator), kLabelW, root,
+                    model.build_dir);
     field_row("##bjobs", "Jobs", model.build_jobs, sizeof(model.build_jobs), kLabelW);
     field_row("##bextra", "Extra cmake", model.build_extra, sizeof(model.build_extra), kLabelW);
+
+    // ---- debug tools -------------------------------------------------------
+    // The Frames tab (and every tools/gpu_*.py capture) needs a runtime that
+    // actually starts its TCP debug server, and a plain Release build does not.
+    // Rather than leave that as folklore, show what the configured build dir
+    // will do and make the flag a control.
+    // SNES has a debug server too — snesrecomp/runner/src/debug_server.c, gated
+    // by SNESRECOMP_ENABLE_TRACE instead of PSX_DEBUG_TOOLS. It used to be
+    // hidden here on the claim that "the SNES runner does not have one".
+    {
+    left_label("Debug tools", kLabelW);
+    ImGui::SetNextItemWidth(240.f);
+    ImGui::Combo("##bdbgtools", &model.build_debug_tools,
+                 snes ? "Leave to build type\0ON  — TCP debug server\0OFF — lean release\0"
+                      : "Leave to build type\0ON  — TCP debug server\0OFF — lean release\0");
+    ImGui::SameLine();
+    if (ImGui::Button("Configure for debugging")) {
+        std::snprintf(model.build_type, sizeof(model.build_type), "Release");
+        model.build_debug_tools = 1;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Sets Build type = Release and Debug tools = ON, then press Configure.\n"
+            "A real Debug build of a recomp is far too slow to reach the frame you\n"
+            "are chasing; Release with the debug server is what you want.");
+    }
+    {
+        const auto dbg = retcomm::studio::probe_debug_tools(root, model.build_dir);
+        left_label("", kLabelW);
+        if (!dbg.configured) {
+            ImGui::TextColored(th.text_muted, "%s", dbg.summary.c_str());
+        } else if (dbg.enabled) {
+            ImGui::TextColored(th.good, "%s", dbg.summary.c_str());
+        } else {
+            ImGui::TextColored(th.warn, "%s", dbg.summary.c_str());
+        }
+    }
+    } // Debug-tools toggle: PSX_DEBUG_TOOLS on psxrecomp,
+      // SNESRECOMP_ENABLE_TRACE on snesrecomp.
+
     field_row("##bexe", "Exe", model.build_exe, sizeof(model.build_exe), kLabelW);
     field_row("##bargs", "Launch args", model.build_launch_args, sizeof(model.build_launch_args),
               kLabelW);
@@ -1764,9 +2403,27 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--generator");
             args.push_back(model.build_generator);
         }
-        if (model.build_extra[0] && std::strcmp(sub, "configure") == 0) {
-            args.push_back("--extra");
-            args.push_back(model.build_extra);
+        if (std::strcmp(sub, "configure") == 0) {
+            // --extra is one shell string, so the flag rides along with
+            // whatever the user typed rather than replacing it.
+            std::string extra = model.build_extra;
+            if (model.build_debug_tools == 1 || model.build_debug_tools == 2) {
+                const bool on = (model.build_debug_tools == 1);
+                if (!extra.empty()) extra += " ";
+                // Different option name per framework; same meaning to the user.
+                if (model.is_snes())
+                    extra += on ? "-DSNESRECOMP_ENABLE_TRACE=ON"
+                                : "-DSNESRECOMP_ENABLE_TRACE=OFF";
+                else
+                    extra += on ? "-DPSX_DEBUG_TOOLS=ON" : "-DPSX_DEBUG_TOOLS=OFF";
+            }
+            if (!extra.empty()) {
+                // "--extra=<value>", not two argv entries: cmake args start
+                // with '-', and argparse rejects a leading-dash value for an
+                // option expecting one argument ("expected one argument").
+                // The '=' form is the only spelling that survives it.
+                args.push_back("--extra=" + extra);
+            }
         }
         if (model.build_target[0] && std::strcmp(sub, "compile") == 0) {
             args.push_back("--target");
@@ -1794,17 +2451,39 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     if (cfg) {
         retcomm::studio::run_project_studio_async(model, base("configure"), nullptr);
     }
-    if (build_btn("Generate ROM + BIOS C")) {
-        model.gen_popup_open = true;
-        ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
-    }
-    if (build_btn("Generate emitters")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"build", "ensure-emitters", "--root", root, "--force"}, nullptr);
-    }
-    if (build_btn("Ensure BIOS")) {
-        retcomm::studio::run_project_studio_async(
-            model, {"build", "ensure-bios", "--root", root}, nullptr);
+    if (snes) {
+        // One button, because there is one step: the project's own
+        // tools/regen.sh, which verifies the ROM against the digests this port
+        // was pinned to before emitting anything. There is no BIOS half and no
+        // separate emitter build on a cartridge.
+        if (build_btn("Regenerate C from ROM")) {
+            if (!model.disc_cue[0]) {
+                model.append_log(
+                    "[FAIL] No ROM set for this repo — set it on the Migrate tab "
+                    "(regen.sh can also find one at the repo root).");
+            }
+            std::vector<std::string> args = {"build", "generate", "--root", root};
+            if (model.disc_cue[0]) {
+                args.push_back("--rom");
+                args.push_back(model.disc_cue);
+            }
+            if (!model.snes_regen_verify) args.push_back("--no-verify");
+            if (model.snes_regen_cfg_roots) args.push_back("--cfg-roots");
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+        }
+    } else {
+        if (build_btn("Generate ROM + BIOS C")) {
+            model.gen_popup_open = true;
+            ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
+        }
+        if (build_btn("Generate emitters")) {
+            retcomm::studio::run_project_studio_async(
+                model, {"build", "ensure-emitters", "--root", root, "--force"}, nullptr);
+        }
+        if (build_btn("Ensure BIOS")) {
+            retcomm::studio::run_project_studio_async(
+                model, {"build", "ensure-bios", "--root", root}, nullptr);
+        }
     }
     if (build_btn("Build")) {
         retcomm::studio::run_project_studio_async(model, base("compile"), nullptr);
@@ -1813,8 +2492,12 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         retcomm::studio::run_project_studio_async(
             model, base("configure"), [&model, root](RunResult r) {
                 if (!r.ok()) return;
-                std::vector<std::string> args = {"build", "compile", "--root", root, "--build-dir",
-                                                 model.build_dir, "--target", model.build_target};
+                std::vector<std::string> args = {"build", "compile", "--root", root,
+                                                 "--build-dir", model.build_dir};
+                if (model.build_target[0]) {
+                    args.push_back("--target");
+                    args.push_back(model.build_target);
+                }
                 if (model.build_jobs[0]) {
                     args.push_back("--jobs");
                     args.push_back(model.build_jobs);
@@ -1837,7 +2520,39 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--args");
             args.push_back(model.build_launch_args);
         }
+        // A cartridge runner takes the ROM as a positional; without it the game
+        // prints its usage and exits 1. This is the same path Migrate recorded
+        // and Regenerate already uses, so a launch cannot run a different ROM
+        // than the C was generated from.
+        if (snes && model.disc_cue[0]) {
+            args.push_back("--rom");
+            args.push_back(model.disc_cue);
+        }
         retcomm::studio::run_project_studio_async(model, args, nullptr);
+    }
+    if (build_btn("Bundle + Export##local_pkg")) {
+        std::vector<std::string> args = {"build", "package", "--root", root, "--build-dir",
+                                         model.build_dir};
+        if (model.build_exe[0]) {
+            args.push_back("--exe");
+            args.push_back(model.build_exe);
+        }
+        retcomm::studio::run_project_studio_async(
+            model, std::move(args), [&model, window](RunResult r) {
+                if (!r.ok()) {
+                    model.set_status("Bundle failed");
+                    return;
+                }
+                const std::string zip = parse_zip_from_output(r.stdout_text);
+                if (zip.empty() || !fs::is_regular_file(zip)) {
+                    model.append_log("[FAIL] Bundle produced no zip under dist/");
+                    model.set_status("Bundle: no zip");
+                    return;
+                }
+                model.append_log("[OK] Packaged " + zip);
+                model.set_status("Choose export location…");
+                begin_export_zip(model, window, zip);
+            });
     }
     // Stop must stay clickable while Launch holds busy (streams game diagnostics).
     ImGui::EndDisabled();
@@ -1848,8 +2563,33 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     ImGui::EndDisabled();
     ImGui::BeginDisabled(model.busy.load() || root.empty());
     end_wrapped_line();
+    if (snes) {
+        checkbox_wrapped("Verify ROM digests", &model.snes_regen_verify);
+        checkbox_wrapped("Seed roots from recomp/*.cfg", &model.snes_regen_cfg_roots);
+        end_wrapped_line();
+        if (!model.snes_regen_verify) {
+            ImGui::TextColored(th.warn,
+                               "Digest verification off — generated C will not match what this "
+                               "port was pinned against, and divergence you then chase will not "
+                               "be in the recompiler.");
+        }
+        ImGui::TextColored(th.text_muted,
+                           "Bundle + Export zips the build dir as it stands into dist/ and "
+                           "opens a save dialog. Build first — it does not rebuild, and it "
+                           "refuses to package ROM data.");
+    } else {
+        ImGui::TextColored(th.text_muted,
+                           "Bundle + Export zips the build dir as it stands (exe + assets + "
+                           "bundled OpenBIOS, no disc) into dist/ and opens a save dialog. "
+                           "Build first — it does not rebuild.");
+    }
 
 #if !defined(_WIN32)
+    // The MinGW cross-build drives psxrecomp's build_windows_mingw.sh, which
+    // knows about PSX_NETPLAY, OpenBIOS staging and the psx-runtime target.
+    // There is no SNES counterpart yet, so the section is absent rather than
+    // present-and-broken.
+    if (!snes) {
     ImGui::Separator();
     ImGui::TextUnformatted("Windows (MinGW)");
     ImGui::TextColored(th.text_muted,
@@ -1895,12 +2635,12 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back(model.build_jobs);
         }
         if (model.build_extra[0]) {
-            args.push_back("--extra");
-            args.push_back(model.build_extra);
+            // Same leading-dash argparse trap as the configure path above.
+            args.push_back(std::string("--extra=") + model.build_extra);
         }
         retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
     }
-    if (build_btn("Bundle + Export")) {
+    if (build_btn("Bundle + Export##mingw_pkg")) {
         std::vector<std::string> args = {"build", "mingw", "--root", root, "--package-only"};
         const std::string bdir = mingw_build_dir_arg();
         if (!bdir.empty()) {
@@ -1915,7 +2655,7 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                     model.set_status("MinGW package failed");
                     return;
                 }
-                const std::string zip = parse_mingw_zip_from_output(r.stdout_text);
+                const std::string zip = parse_zip_from_output(r.stdout_text);
                 if (zip.empty() || !fs::is_regular_file(zip)) {
                     model.append_log("[FAIL] MinGW package produced no zip under dist/");
                     model.set_status("MinGW package: no zip");
@@ -1923,20 +2663,24 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                 }
                 model.append_log("[OK] Packaged " + zip);
                 model.set_status("Choose export location…");
-                begin_export_mingw_zip(model, window, zip);
+                begin_export_zip(model, window, zip);
             });
     }
     end_wrapped_line();
+    } // !snes
 #else
-    ImGui::Separator();
-    ImGui::TextUnformatted("Windows (MinGW)");
-    ImGui::TextColored(th.text_muted,
-                       "MinGW cross-build is for Linux hosts. On Windows use the "
-                       "native Configure / Build buttons above (or CI).");
+    if (!snes) {
+        ImGui::Separator();
+        ImGui::TextUnformatted("Windows (MinGW)");
+        ImGui::TextColored(th.text_muted,
+                           "MinGW cross-build is for Linux hosts. On Windows use the "
+                           "native Configure / Build buttons above (or CI).");
+    }
 #endif
 
     ImGui::EndDisabled();
 
+    if (snes) model.gen_popup_open = false;
     if (model.gen_popup_open) ImGui::OpenPopup("Generate ROM + BIOS C###gen_rom_bios");
     if (ImGui::BeginPopupModal("Generate ROM + BIOS C###gen_rom_bios", &model.gen_popup_open,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -2253,7 +2997,10 @@ int main(int argc, char** argv) {
                     (home && *home) ? fs::path(home) / "Documents" / "GitHub" : fs::path(".");
                 std::snprintf(model.np_parent, sizeof(model.np_parent), "%s",
                               parent.string().c_str());
-                refresh_repos(model);
+                // No refresh_repos() here: which index to read is not known
+                // until the platform picker is answered, and reading the PSX
+                // one "for now" would show a list the user then has to watch
+                // get replaced.
                 // Startup update check uses github.com tag redirects + a local TTL
                 // cache (not api.github.com listing) to avoid rate limits. Also syncs
                 // retcomm-catalog into the shared cache and refreshes filters.
@@ -2282,6 +3029,16 @@ int main(int argc, char** argv) {
 
         apply_pending_picks(model);
         retcomm::studio::pump_async_jobs(model);
+
+        // Honour a "Change platform" click here, between frames — clearing the
+        // model mid-draw would leave a tab holding an index into a list that
+        // no longer exists.
+        if (model.platform_pending && !model.busy.load()) {
+            model.platform_pending = false;
+            model.platform = Platform::None;
+            model.reset_for_platform_switch();
+            model.set_status("Choose a platform");
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -2347,7 +3104,7 @@ int main(int argc, char** argv) {
                                                 : fs::path(".");
                             std::snprintf(model.np_parent, sizeof(model.np_parent), "%s",
                                           parent.string().c_str());
-                            refresh_repos(model);
+                            // Repos load once the platform picker names an index.
                             if (!model.startup_update_started) {
                                 model.startup_update_started = true;
                                 retcomm::studio::run_project_studio_async(
@@ -2368,6 +3125,8 @@ int main(int argc, char** argv) {
             accent_button_pop();
             ImGui::SameLine();
             if (ImGui::Button("Quit", ImVec2(100.f, 0))) model.request_exit.store(true);
+        } else if (model.platform == Platform::None) {
+            draw_platform_picker(model, th);
         } else if (ImGui::BeginTabBar("##tabs")) {
             if (ImGui::BeginTabItem("Migrate")) {
                 draw_migrate(model, th, window);
@@ -2388,6 +3147,19 @@ int main(int argc, char** argv) {
             if (ImGui::BeginTabItem("Build")) {
                 draw_build(model, th, window);
                 ImGui::EndTabItem();
+            }
+            // Functions and Frames read psxrecomp's analysis bundle and speak
+            // its debug protocol. Showing them under SNES would offer tools
+            // that cannot work rather than tools that are merely empty.
+            if (!model.is_snes()) {
+                if (ImGui::BeginTabItem("Functions")) {
+                    draw_functions(model, th, window);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Frames")) {
+                    draw_frames(model, th, window);
+                    ImGui::EndTabItem();
+                }
             }
             ImGui::EndTabBar();
         }

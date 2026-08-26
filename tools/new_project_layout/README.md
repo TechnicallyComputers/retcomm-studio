@@ -4,6 +4,70 @@ Scaffold **new** titles and **migrate** older ones onto the setup-host layout.
 
 **Policy:** public releases are **setup-host only** (no prebuilt generated game C).
 
+## Platforms
+
+Every command takes a global `--platform {psx,snes}` (default `psx`, so every
+pre-SNES invocation is unchanged). It is resolved once per process, before any
+ops module runs, because it decides which repo index, which framework submodule
+and which scaffolder everything below reaches for:
+
+```bash
+python3 -m project_studio --platform snes repos list
+python3 -m project_studio --platform snes audit --root ~/src/ZedSNESRecomp
+python3 -m project_studio --platform snes build generate --root ~/src/ZedSNESRecomp --rom ~/roms/zed.sfc
+```
+
+| | psx | snes |
+|---|---|---|
+| Framework | `psxrecomp` (master) | `snesrecomp` (main) |
+| Index | `project_studio_repos.json` | `project_studio_repos_snes.json` |
+| Migration ops | `ops.py` | `snesops.py` |
+| Scaffolder | `setup_project.sh` / `.ps1` here | snesrecomp `tools/new_project/` (see `snes/`) |
+| `build generate` | `psxrecomp_cli generate` | the project's `tools/regen.sh` |
+
+Two migration implementations rather than one parametrised one: the PSX plan is
+about `game.toml`, disc probing, BIOS backends and a CMake rewrite, none of
+which exists on SNES.
+
+Where a flag named a console, the platform-neutral spelling is the alias to
+prefer — `--framework`, `--framework-branch`, `--framework-ref`, `--rom`. The
+old names still work.
+
+`build ensure-bios`, `build ensure-emitters` and `build mingw` are psxrecomp-only
+and refuse under `--platform snes` rather than failing inside cmake.
+
+`probe-rom --rom <file.sfc>` prints the cartridge identity as JSON — mapping,
+title, region, coprocessor, digests, plus a `zip_prefix` and `project_name`.
+It is the non-interactive half of the scaffolder's prompts: snesrecomp's wizard
+asks for name / region / description with these as defaults, and any caller
+passing `--yes` needs to see them beforehand.
+
+`--region` carries no parser default. On PSX an unset region resolves to `USA`
+as before; on SNES it stays blank so the cartridge header decides.
+
+### Where the ROM is
+
+A SNES port never contains its ROM — the scaffold gitignores `*.sfc`/`*.smc`,
+and the wizard bakes the dump's *filename* into `tools/regen.sh` while
+recording its directory nowhere. So a project scaffolded from `~/roms` indexes
+with no image, and both the Migrate field and "Regenerate C from ROM" come up
+empty until something says where it went.
+
+`repos set-cue --path <repo> --rom <file.sfc>` records it; Studio now does that
+for you whenever you pick or type a ROM on the Migrate tab, so it survives a
+restart. Failing that, `repo_index.discover_rom()` looks in this order:
+
+1. `SNESRECOMP_ROM` — the same variable `regen.sh` itself honours.
+2. A dump parked in the tree: repo root, `rom/`, `roms/`.
+3. A filename `tools/regen.sh` names, sitting in a known ROM directory —
+   `RETCOMM_SNES_ROM_DIRS` (`os.pathsep`-separated), or the directory another
+   indexed title's ROM was already found in.
+
+Step 3 accepts a file only when its CRC32 matches the digest the port is pinned
+to. A matching name in a library folder is a guess; a matching digest is the
+ROM, and a port with no pinned digest gets no answer rather than a plausible
+one.
+
 ## New project
 
 ```bash
@@ -77,6 +141,27 @@ python3 tools/new_project_layout/migrate_project.py git push \
 python3 tools/new_project_layout/migrate_project.py git release \
   --root /path/to/ApeEscapeRecomp --bump patch
 ```
+
+### Bundle a local build (Studio "Bundle + Export")
+
+Zip the host build exactly as it stands — exe + staged `assets/` + bundled
+OpenBIOS + `game.toml` / `VERSION`, never a disc image or retail BIOS dump:
+
+```bash
+python3 tools/new_project_layout/migrate_project.py build package \
+  --root /path/to/MotK --build-dir build-release
+```
+
+Writes `dist/<prefix>-<VERSION>-<host-tag>.zip` (e.g. `motk-0.1.0-linux-x64.zip`)
+and prints a `BUNDLE_ZIP=` / JSON trailer. When the repo ships
+`scripts/package_release.sh` that script is used (CI-parity payload and name);
+otherwise a built-in stager produces the same layout, so this also works on
+Windows without bash or `zip`. Add `--no-repo-script` to force the built-in
+stager, `--tag` to override the platform tag.
+
+Studio's **Build** tab runs this from the **Bundle + Export** button next to
+Launch, then opens the native OS save dialog to copy the zip anywhere. It does
+not rebuild — Build first.
 
 ### Local Windows builds (MinGW cross, no CI)
 

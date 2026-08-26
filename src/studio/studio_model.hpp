@@ -12,6 +12,46 @@ namespace retcomm::studio {
 
 namespace fs = std::filesystem;
 
+// ---------------------------------------------------------------------------
+// Which console this window is working on.
+//
+// `None` is a real state, not a placeholder: it is what the platform picker
+// renders on, and returning to it is how you switch consoles. Every repo list,
+// framework submodule and scaffolder Studio reaches for follows from this one
+// value, which is why it is chosen before anything else is shown.
+// ---------------------------------------------------------------------------
+enum class Platform { None, PSX, SNES };
+
+inline const char* platform_key(Platform p) {
+    return p == Platform::SNES ? "snes" : "psx";
+}
+
+inline const char* platform_display(Platform p) {
+    switch (p) {
+    case Platform::SNES: return "Super Nintendo";
+    case Platform::PSX: return "PlayStation";
+    default: return "(none)";
+    }
+}
+
+// The framework submodule a port of this platform carries.
+inline const char* platform_framework(Platform p) {
+    return p == Platform::SNES ? "snesrecomp" : "psxrecomp";
+}
+
+// UI label for the game image, and the file-dialog filter that matches it.
+inline const char* platform_image_label(Platform p) {
+    return p == Platform::SNES ? "ROM" : "Disc .cue";
+}
+
+inline const char* platform_image_filter_name(Platform p) {
+    return p == Platform::SNES ? "SNES ROM" : "CUE files";
+}
+
+inline const char* platform_image_filter_ext(Platform p) {
+    return p == Platform::SNES ? "sfc;smc" : "cue";
+}
+
 struct RepoEntry {
     std::string path;
     std::string name;
@@ -36,8 +76,502 @@ struct PlanStep {
     bool selected = true;
 };
 
+// ---------------------------------------------------------------------------
+// Functions tab — static function discovery
+//
+// These mirror psxrecomp's analysis.json / edges.json / indirect.json schemas.
+// Studio is a VIEWER over those artifacts: the analysis itself always runs
+// out-of-process in psxrecomp-analyze, so a headless or CI run produces exactly
+// what the tab shows, and Studio never links the emulator runtime either. That
+// is what keeps the tab's central claim — everything here was proven from the
+// executable alone — true rather than merely intended.
+// ---------------------------------------------------------------------------
+struct FnRow {
+    uint32_t addr = 0;
+    uint32_t end = 0;
+    uint32_t size = 0;
+    uint32_t instructions = 0;
+    std::string name;
+    std::string status;
+    std::string note;
+    std::string confidence;
+    std::string confidence_reason;
+    std::string prototype;
+    std::string bios_call;
+    std::string saved;
+    bool user_named = false;
+    bool reachable = false;
+    bool address_taken = false;
+    bool partial = false;
+    bool is_data = false;
+    bool leaf = false;
+    bool gte = false;
+    bool mmio = false;
+    bool syscall = false;
+    bool returns = false;
+    bool sig_confident = true;
+    int  args = 0;
+    int  stack_frame = 0;
+    uint32_t in_degree = 0;
+    uint32_t out_degree = 0;
+    uint32_t unresolved_indirect = 0;
+    uint32_t blocks = 0;
+    int  conf_rank = 3;  // 0 verified .. 4 data; drives sorting and colour
+    // Times this address was OBSERVED entering, from the live trace. Lives on
+    // the row so the table can sort by it; it is not part of the analysis
+    // bundle and is never written back to one. Provenance stays separate:
+    // in_degree is proven, live_calls is watched.
+    uint64_t live_calls = 0;
+};
+
+struct FnEdge {
+    uint32_t from = 0;
+    uint32_t pc = 0;
+    uint32_t to = 0;
+    std::string kind;
+};
+
+struct FnIndirect {
+    uint32_t func = 0;
+    uint32_t pc = 0;
+    uint32_t reg = 0;
+    uint32_t table_base = 0;
+    uint32_t table_count = 0;
+    std::string kind;
+    std::string classification;
+    std::vector<uint32_t> targets;
+    std::vector<std::string> context;
+};
+
+// One [widescreen.cull] site candidate from psxrecomp-analyze --scan-widescreen.
+struct WsSite {
+    uint32_t pc = 0;
+    uint32_t func = 0;
+    uint32_t partner = 0;
+    int      confidence = 0;
+    std::string kind;        // the game.toml key: bias_sites, range_sites, …
+    std::string instr;
+    std::string evidence;
+};
+
+// ---------------------------------------------------------------------------
+// Frames tab — live GP0 capture, attribution, diff, and per-function layers
+//
+// Mirror of the artifacts psxrecomp/tools/gpu_frame_*.py write. Studio reads
+// the compact *.summary.json / diff.json / layers.json, never the raw frame
+// dump: a busy frame's dump is tens of megabytes of primitives and nothing in
+// this tab wants them individually.
+//
+// The provenance rule from the Functions tab applies here too, and matters
+// more. Everything on this tab is OBSERVED from one execution of one frame. A
+// function that issued primitives is proof that code ran; it says nothing
+// about the call graph, and it must never be folded into a static claim.
+// ---------------------------------------------------------------------------
+struct FrameFuncRow {
+    std::string func;              // "0x8004ABCD" as the tools emit it
+    uint32_t addr = 0;
+    uint32_t packets = 0;
+    uint32_t drawing = 0;
+    uint32_t semi = 0;
+    uint32_t textured = 0;
+    int      ot_min = -1;          // -1 when no primitive carried an OT rank
+    int      ot_max = -1;
+    std::string ops;               // "PolyG4+semi x12, Rect x3"
+    std::string stp;               // "0.5B+0.5F x12"
+    std::string name;              // from analysis.json, when the address is known
+    std::vector<uint32_t> ras;
+    int bbox[4] = {0, 0, 0, 0};
+    bool has_bbox = false;
+};
+
+struct FrameSummary {
+    bool        loaded = false;
+    std::string path;              // the .summary.json this came from
+    std::string dump;              // sibling raw dump filename
+    std::string label;
+    std::string error;
+    uint32_t    frame = 0;
+    uint32_t    packets = 0;
+    uint32_t    drawing = 0;
+    uint32_t    truncated = 0;
+    bool        capped = false;
+    int         area[4] = {0, 0, 0, 0};
+    std::vector<FrameFuncRow> funcs;
+    std::vector<std::pair<std::string, uint32_t>> ops;
+    std::vector<std::pair<std::string, uint32_t>> modes;
+};
+
+// State of the machine-wide DuckStation oracle, from
+// `duckstation_oracle.py status --json`.
+//
+// The oracle is deliberately NOT per-repo: it installs into the RetComM data
+// root and one build serves every title. Studio only ever reads this — the tool
+// owns the install, so a headless setup and this row cannot disagree about what
+// exists.
+struct OracleStatus {
+    bool valid = false;
+    std::string state;            // absent|fetched|built|installed|port-busy|answering
+    std::string root, app, launcher;
+    std::string upstream_base;
+    std::string running_detail;
+    std::string container_engine, container_reason;
+    int  port = 4371;
+    bool installed = false;
+    bool built = false;
+    bool running = false;
+    bool answering = false;
+    bool container_needed = false;
+    std::string error;
+};
+
+// Reply to {"cmd":"pause_state"}. `auto_resumed` means a park ended because the
+// runtime stopped hearing from us — a Pause button showing "paused" has to be
+// able to correct itself when that happens.
+struct PauseState {
+    bool valid = false;
+    bool paused = false;
+    bool auto_resumed = false;
+    int  stepping = 0;
+    uint32_t run_to = 0;
+    uint64_t frame = 0;
+    uint32_t timeout_ms = 0;
+    bool supported = true;   // false when the runtime predates the command
+    std::string error;
+};
+
+// One (opcode, blend mode) class that moved between two consecutive frames.
+struct ScanChange {
+    std::string key;          // "PolyG3+semi|B+F"
+    int a = 0, b = 0, delta = 0;
+    int cmax_a = 0, cmax_b = 0;
+    std::string bbox_a, bbox_b;   // pre-rendered, they are only ever displayed
+    std::string src_lo, src_hi;   // guest packet buffer — hand this to wtrace
+    bool outside_draw_area = false;
+    bool outside_vram = false;
+    std::string overflow;         // "left 148, top 180, right 140, bottom 196 px over"
+};
+
+struct ScanTransition {
+    int a = 0, b = 0;
+    double score = 0.0;
+    std::vector<ScanChange> changes;
+};
+
+// Result of walking the ring looking for where the picture turns. This is the
+// answer to "which two frames should I diff", which a plain A/B diff assumes
+// you already know — and getting it wrong is how a diff ends up reporting that
+// an effect exists rather than that it broke.
+struct FrameScan {
+    bool loaded = false;
+    std::string path, error;
+    int lo = 0, hi = 0;
+    std::vector<ScanTransition> transitions;
+};
+
+// One code site seen writing into a watched packet buffer. This is the answer
+// function attribution cannot give on a DMA/ordering-table game: the packets
+// exist at a known RAM address, and whoever writes that address builds them.
+struct WtraceWriter {
+    uint32_t pc = 0;
+    uint32_t func = 0;
+    uint32_t ra = 0;
+    int      dma_ch = -1;    // >= 0 when a DMA wrote it, not the CPU
+    int      count = 0;
+};
+
+// Result of comparing a range of guest RAM between the two emulators.
+// The verdict is the point: it says which half of the codebase a rendering bug
+// is in, and it needs no pixels — which matters while the oracle's VRAM
+// readback is unreliable.
+struct RamParity {
+    bool loaded = false;
+    bool identical = false;
+    std::string addr, first_difference, error;
+    int  length = 0, compared = 0;
+    int  differing_words = 0, total_words = 0;
+    uint64_t native_frame = 0, oracle_frame = 0;
+    bool frames_aligned = true;
+};
+
+// One primitive decoded out of an ordering table read from guest RAM.
+// This is a different act from watching the GP0 ring go by: the ring says what
+// was drawn, this says what the game BUILT. The oracle has no ring, so walking
+// RAM is the only way to see what DuckStation was about to draw -- and for
+// decompilation, the buffer a routine fills is what tells you what it is.
+struct DisplayPrim {
+    std::string op;          // "PolyG4+semi"
+    std::string blend;       // "B+F", "opaque", ...
+    std::string src;         // guest address of the packet -- feeds wtrace
+    std::string verts;       // pre-rendered, only ever displayed
+    std::string colors;
+    int cmax = 0;            // brightest channel over this primitive's vertices
+};
+
+struct DisplayList {
+    bool loaded = false;
+    std::string path, error, root;
+    int nodes = 0, drawing = 0;
+    std::vector<std::pair<std::string, int>> classes;   // class -> count
+    std::vector<DisplayPrim> prims;
+};
+
+// Vertex-colour distribution for one emulator, and the verdict comparing two.
+//
+// Deliberately NOT a byte diff: an animating effect sampled at two different
+// phases differs everywhere, which says nothing, and reading such a diff as
+// meaningful is how an earlier attempt at this went wrong. A distribution does
+// not care about phase -- if one side peaks at 199 and the other at 40, that is
+// real regardless of which frame each was on.
+struct ColourStats {
+    bool loaded = false;
+    int vertices = 0, peak = 0, p50 = 0, p90 = 0;
+    double mean = 0.0;
+    std::vector<double> hist;      // normalised, 16 buckets
+};
+
+struct ColourParity {
+    bool loaded = false;
+    std::string path, error, klass, verdict;
+    ColourStats native, oracle;
+    // Histogram intersection, 0..1. The verdict rests on this rather than on
+    // peak: a peak is a maximum, so it grows with sample count, and deciding on
+    // it once reported "differ" for two distributions whose medians agreed.
+    double overlap = 0.0;
+    double sample_ratio = 1.0;
+};
+
+// One instruction seen storing into a primitive's packet, split by which
+// FIELD it wrote. Function attribution cannot answer this on a game that builds
+// an ordering table and DMAs it -- every packet reports the same submit PC --
+// so the handle is the address written, and the useful split is colour vs
+// vertex. An instruction that writes only colour words is the one to read when
+// colours are wrong and geometry is right.
+struct DisasmLine {
+    std::string pc, word, text;
+    bool is_target = false;
+};
+
+struct PacketWriter {
+    std::string pc, func;
+    int colour = 0, vertex = 0, uv = 0;
+    bool colour_only = false;
+    // Captured while the emulator was parked for the trace. These PCs live
+    // above the main EXE, so the code at a given address depends on which
+    // overlay is resident — disassembling later, after the scene moved on,
+    // would decode whatever replaced it and look perfectly plausible.
+    std::vector<DisasmLine> listing;
+};
+
+struct PacketWriters {
+    bool loaded = false;
+    bool absent = false;          // the class was not on screen
+    std::string path, error, klass, note, lo, hi;
+    int packets = 0, colour_words = 0, vertex_words = 0;
+    int writes = 0, unmapped = 0;
+    // True when the buffer moved during the trace. Every row is then
+    // an artefact, and a 50/50 colour:vertex split reads deceptively
+    // like "this instruction writes both".
+    bool aliased = false;
+    int mixed_writers = 0;
+    // The trace ran but recorded nothing. Distinct from `absent`:
+    // the packets ARE on screen, so this means the trace window was
+    // wrong, not that the search finished empty-handed.
+    bool no_writes = false;
+    std::vector<PacketWriter> writers;
+    std::vector<std::pair<std::string,int>> present;   // what WAS on screen
+};
+
+// GTE self-check. Re-derives the depth-cue interpolation from its own recorded
+// inputs against the hardware description, so it needs no oracle: a mismatch is
+// a bug in our GTE, a match means the inputs were already wrong when they
+// arrived and the fault is upstream of it.
+struct GteFrameStat {
+    uint32_t frame = 0, nproj = 0, nsat = 0, nflat = 0;
+    uint32_t nintpl = 0, nintpl_tiny = 0;
+};
+
+struct GteCheck {
+    bool loaded = false;
+    std::string path, error, verdict, note;
+    int checked = 0, bad = 0;
+    uint64_t nintpl_total = 0, nsat_total = 0, nproj_last = 0;
+    std::vector<GteFrameStat> frames;
+};
+
+// Result of comparing the two INPUTS to a packet's colour computation.
+// The code scales a source RGB by a factor, so a wrong colour is either a wrong
+// source or a wrong scale — and this says which, which is the difference
+// between looking upstream and looking at the routine itself.
+struct ColourInputs {
+    bool loaded = false;
+    std::string path, error, verdict, pc, source_addr, first_difference;
+    std::string native_bytes, oracle_bytes;
+    int scale = 0, differing = 0;
+    bool source_identical = false;
+    // Where the SAME table was found on psx-runtime. Addresses do not
+    // carry between the two emulators — their allocators place the same
+    // structures elsewhere — so this is located by content.
+    std::string native_source_addr;
+    int address_delta = 0;
+    // How much of the table WAS found when it is not there whole. An
+    // exact miss cannot tell absence from a different arrangement, and
+    // those point at completely different places.
+    int partial_len = 0, partial_stride = 0;
+    std::vector<std::string> partial_hits;
+    // How the two sides were actually compared. "native-own-pointer" means
+    // psx-runtime's own $s4 was read and its OWN table examined — the direct
+    // answer. Anything else is the content-search fallback, which is weaker
+    // because it cannot know which table psx-runtime's code actually reads.
+    std::string compared_by;
+    // $s4 tracks the animation, so the two sides are rarely at the same
+    // moment. When the scales differ the comparison falls back to the
+    // whole enclosing region, which does not depend on phase.
+    int native_scale = 0, region_differing = 0, region_bytes = 0;
+    bool phase_aligned = false;
+    std::string region_lo, region_hi, region_first_difference;
+    // What KIND of difference: one side unwritten, one writing where the other
+    // does not, or both holding values that disagree. Each points elsewhere.
+    std::string region_shape;
+    struct Cluster { std::string addr, native, oracle; int length = 0; };
+    std::vector<Cluster> region_clusters;
+    std::string native_s4, native_s6, native_block;
+    std::string probe_error;
+};
+
+// Compiled-vs-interpreter comparison, run inside psx-runtime itself.
+//
+// The instrument that needs none of what every cross-emulator comparison here
+// has had to fight: no frame alignment, no address correspondence between two
+// allocators, no getting both emulators to the same point in the game. Each of
+// those produced a confident wrong answer at least once.
+struct Lockstep {
+    bool loaded = false;
+    bool found = false;
+    std::string path, error, verdict, mode, kind, meaning;
+    std::string frame, block, pc, addr, expected, actual;
+    int reg = -1;
+    uint64_t checked = 0, skipped = 0;
+    // Which skip reason dominates. A bare count says how much was
+    // missed but not whether the mode simply cannot cover this game.
+    std::string dominant_skip;
+    int window_lo = 0, window_hi = 0;
+    std::vector<std::string> trace;
+};
+
+// Instructions writing an arbitrary span of RAM. packet_writers without the
+// packet-layout assumption, because the colour investigation reached a REGION
+// rather than a structure.
+struct RangeWriter {
+    std::string pc, lo, hi, common;
+    int writes = 0;
+};
+
+struct RangeWriters {
+    bool loaded = false;
+    std::string path, error, lo, hi;
+    int writes = 0, frames_advanced = 0;
+    std::vector<RangeWriter> writers;
+    std::vector<DisasmLine> listing;   // for the busiest writer
+    std::string listing_pc;
+};
+
+// Does the colour scale animate on each side?
+//
+// Every vertex colour here is source_rgb * $s6 >> 7, so $s6 IS the fade: 128
+// leaves the colour unchanged. This compares VARIATION rather than values,
+// which is why it needs no frame alignment, no matching buffer half and no
+// shared animation phase — the three things that have each produced a
+// confident wrong answer in this investigation.
+struct ScaleSide {
+    bool loaded = false;
+    int samples = 0, distinct = 0, min = 0, max = 0;
+    bool constant = false, neutral_only = false;
+    int median_step = 0, max_step = 0;
+    std::string values;
+};
+
+struct ScaleTrace {
+    bool loaded = false;
+    std::string path, error, verdict, note, pc, reg;
+    // Why a side produced nothing. A bare 'no samples' does not say
+    // whether the emulator was unreachable, never reached the PC, or
+    // refused the breakpoint — and those need different responses.
+    std::string native_error, oracle_error;
+    ScaleSide native, oracle;
+    std::string granularity;
+};
+
+// What each emulator EVER draws, over many captures.
+//
+// A single capture is confounded by phase; maxima are not. Phase can hide a
+// primitive in one frame, not in forty — so a class the runtime never once
+// reaches is genuinely not being submitted.
+struct CensusRow {
+    std::string key;
+    int native_max = 0, oracle_max = 0, native_med = 0, oracle_med = 0;
+};
+
+struct ClassCensus {
+    bool loaded = false;
+    std::string path, error, verdict;
+    int samples = 0;
+    std::vector<CensusRow> rows;
+    std::vector<std::string> absent;
+};
+
+struct FrameDiffRow {
+    std::string func;
+    std::string verdict;
+    uint32_t a_prims = 0, a_semi = 0, b_prims = 0, b_semi = 0;
+};
+
+struct FrameDiff {
+    bool        loaded = false;
+    std::string path;
+    std::string error;
+    std::vector<std::string> headlines;
+    std::vector<FrameDiffRow> rows;
+    std::vector<std::pair<std::string, uint32_t>> modes_a, modes_b;
+    // op name, A count, B count
+    std::vector<std::tuple<std::string, uint32_t, uint32_t>> ops;
+};
+
+struct FrameLayer {
+    std::string func;
+    std::string file;
+    uint32_t prims = 0, semi = 0, textured = 0, pixels = 0;
+    std::string stp;
+    unsigned tex = 0;              // GL texture, 0 until uploaded
+    int tw = 0, th = 0;
+};
+
+struct FrameLayers {
+    bool        loaded = false;
+    std::string dir;
+    std::string error;
+    std::string label;
+    uint32_t    frame = 0;
+    std::vector<FrameLayer> layers;
+    FrameLayer  composite;         // file/tex/tw/th only
+    FrameLayer  sheet;
+};
+
+struct FnStats {
+    uint32_t total = 0, instructions = 0, bytes_covered = 0, bytes_image = 0;
+    uint32_t verified = 0, high = 0, medium = 0, low = 0, data = 0;
+    uint32_t reachable = 0, orphans = 0, named = 0;
+    uint32_t direct_edges = 0, tables = 0, table_targets = 0, unresolved = 0;
+    uint32_t partial_functions = 0, undecoded_words = 0;
+};
+
 struct StudioModel {
     std::mutex mu;
+
+    // Platform::None until the picker is answered; `platform_pending` is set
+    // when the user asks to change consoles mid-session, so the switch happens
+    // between frames rather than while a tab is mid-draw.
+    Platform platform = Platform::None;
+    bool platform_pending = false;
 
     fs::path exe_dir;
     fs::path toolkit_dir;
@@ -103,6 +637,18 @@ struct StudioModel {
     char np_gh_vis[32] = "private";
     char np_gh_owner[128] = "TechnicallyComputers";
     char np_gh_repo[256] = {};
+    // SNES-only scaffolder inputs. `np_disc` carries the ROM path on SNES —
+    // one field for one game image, so the two can never disagree.
+    char np_snes_ref[128] = "main";
+    int  np_multitap = 0;   // 0 auto (from players), 1 port1, 2 port2, 3 both, 4 off
+    bool np_rollback = false;
+    // Separate from np_region, which carries the PSX default "USA". Blank here
+    // means "whatever the cartridge header says" — a habitual USA would
+    // relabel a Japanese cartridge, and the header already knows.
+    char np_snes_region[64] = {};
+    // Set once a probe has run, so the page can say where the defaults on
+    // screen came from rather than presenting guesses as facts.
+    std::string np_probe_note;
 
     // Git
     std::string git_summary;
@@ -153,11 +699,17 @@ struct StudioModel {
     char build_dir[256] = "build-release";
     char build_type[64] = "Release";
     char build_target[128] = "psx-runtime";
+    // Empty = Auto: reuse CMAKE_GENERATOR from the build dir, else Ninja / Unix Makefiles.
     char build_generator[128] = {};
     char build_jobs[32] = {};
     char build_extra[512] = {};
     char build_exe[1024] = {};
     char build_launch_args[512] = {};
+    // Debug tools: 0 = leave to the build type, 1 = force ON, 2 = force OFF.
+    // Injected as -DPSX_DEBUG_TOOLS=... on Configure. "Leave to the build type"
+    // is not the same as OFF: CMake's option() default depends on
+    // CMAKE_BUILD_TYPE, and an existing cache keeps whatever it already has.
+    int  build_debug_tools = 0;
     char build_env[4096] =
         "# KEY=VALUE pairs (space or newline separated)\n"
         "# Example:\n"
@@ -169,13 +721,178 @@ struct StudioModel {
     bool mingw_package = false;
     bool mingw_ensure = false;
     bool mingw_dynamic = false;
-    // Source zip path for Bundle+Export save dialog (set after package-only).
-    std::string mingw_export_src;
+    // Source zip path for Bundle+Export save dialog (local package or MinGW
+    // package-only). Shared by both Build-tab export buttons.
+    std::string export_zip_src;
 
     // Generate ROM + BIOS C dialog (Build tab)
     bool gen_popup_open = false;
     int gen_bios_mode = 0; // 0=OpenBIOS 1=SCPH1001 dump
     char gen_scph_path[1024] = {};
+
+    // SNES regen (Build tab). Verification defaults ON: regen.sh checks the
+    // ROM against the digests this port was pinned to, and skipping that is
+    // how a mismatched dump becomes hours of chasing a divergence that was
+    // never in the recompiler.
+    bool snes_regen_verify = true;
+    bool snes_regen_cfg_roots = false;
+
+    // Functions (static discovery)
+    std::vector<FnRow>      fn_rows;
+    std::vector<FnEdge>     fn_edges;
+    std::vector<FnIndirect> fn_indirect;
+    FnStats                 fn_stats;
+    std::string             fn_image;         // image name from analysis.json
+    std::string             fn_loaded_root;   // repo the loaded data belongs to
+    std::string             fn_error;
+    std::vector<int>        fn_view;          // filtered+sorted indices into fn_rows
+    bool     fn_view_dirty = true;
+    int      fn_selected = -1;                // index into fn_rows
+    char     fn_filter[128] = {};
+    char     fn_exe_override[512] = {};
+    char     fn_rename[128] = {};
+    char     fn_rename_note[256] = {};
+    int      fn_rename_status = 0;            // 0 guessed 1 confirmed 2 hot
+    int      fn_conf_filter = 0;              // 0 all, else conf_rank+1
+    int      fn_sort_col = 0;   // 0 addr 1 name 2 size 3 conf 4 callers 5 live
+    // ds.consumed value already folded into fn_rows[].live_calls, so the sync
+    // is O(rows) per new batch rather than per frame.
+    uint64_t fn_live_applied = UINT64_MAX;
+    bool     fn_sort_desc = false;
+    bool     fn_only_named = false;
+    bool     fn_only_orphans = false;
+    bool     fn_only_unresolved = false;
+    bool     fn_hide_data = true;
+    bool     fn_exact = false;
+    bool     fn_with_refs = false;
+    bool     fn_emit_ghidra = false;
+    bool     fn_emit_symbol_addrs = false;
+    bool     fn_emit_symbols = false;
+    int      fn_min_conf = 1;                 // index into verified|high|medium|low
+    int      fn_pane = 0;                     // 0 detail, 1 indirect, 2 widescreen
+    bool     fn_widescreen = false;           // pass --widescreen to the next run
+
+    // Live runtime connection (Functions tab). The client owns its own thread
+    // and mutex; the UI reads a snapshot each frame.
+    char     dbg_host[64] = "127.0.0.1";
+    int      dbg_port = 4370;
+    bool     dbg_live_trace = false;
+
+    // ---- Frames (live GP0 capture / attribution / layers) ------------------
+    char     frm_host[64] = "127.0.0.1";
+    int      frm_port = 4370;
+    bool     frm_connected = false;
+    char     frm_tag[64] = "bad";
+    char     frm_dir[512] = {};        // resolved to <root>/analysis/frames
+    int      frm_count = 65536;        // gpu_frame_dump packet cap
+    // Which frame to capture: <= 0 means "the newest the ring holds".
+    // There is no run-to-frame: psx-runtime removed pause / step /
+    // run_to_frame, so the ring is reached backwards, not steered forwards.
+    int      frm_at_frame = 0;
+    // GP0 ring span from gpu_ring_stats -- the frames still capturable.
+    bool     frm_ring_valid = false;
+    uint32_t frm_ring_oldest = 0;
+    uint32_t frm_ring_newest = 0;
+    uint64_t frm_ring_total = 0;
+    uint32_t frm_ring_capacity = 0;
+    double   frm_ring_next_poll = 0.0;
+    std::string frm_ring_error;
+    bool     frm_shot = true;
+    bool     frm_tex_tint = false;
+    int      frm_layer_order = 0;      // 0 issue, 1 OT rank
+    int      frm_max_layers = 48;
+    std::vector<std::string> frm_tags; // *.summary.json basenames in frm_dir
+    int      frm_sel_a = -1;           // index into frm_tags (reference / good)
+    int      frm_sel_b = -1;           // index into frm_tags (suspect / bad)
+    FrameSummary frm_a, frm_b;
+    FrameDiff    frm_diff;
+    FrameScan    frm_scan;
+    int          frm_scan_last = 400;   // how many recent frames to walk
+    // Two slots, not one. Walking a list is only half the point; the other
+    // half is "does the oracle build the same one", and a single slot
+    // overwritten by whichever side ran last cannot answer that.
+    DisplayList  frm_dlist;         // psx-runtime
+    DisplayList  frm_dlist_oracle_r; // the oracle
+    char         frm_dlist_addr[32] = {};   // blank means scan for it
+    bool         frm_dlist_oracle = false;  // which side the button reads
+    PacketWriters frm_writers_pkt;
+    ColourInputs  frm_cinputs;
+    Lockstep      frm_lockstep;
+    RangeWriters  frm_range;
+    ScaleTrace    frm_scale;
+    ClassCensus   frm_census;
+    int           frm_census_samples = 40;
+    int           frm_scale_samples = 12;
+    // Step one frame between reads. Free-running samples land ~90
+    // frames apart, so their differences are aliasing rather than the
+    // animation increment.
+    bool          frm_scale_per_frame = true;
+    char          frm_range_lo[24] = {};
+    char          frm_range_hi[24] = {};
+    int           frm_range_frames = 1;
+    int           frm_ls_frames = 120;
+    bool          frm_ls_func = false;
+    GteCheck      frm_gte;
+    char          frm_writer_class[64] = "PolyG4+semi|B+F";
+    int           frm_writer_watch = 5;      // seconds of tracing
+    int           frm_writer_sel = -1;
+    std::string   frm_writer_disasm;
+    ColourParity frm_cparity;
+    char         frm_cparity_class[64] = "PolyG4+semi|B+F";
+    int          frm_cparity_samples = 20;
+    std::vector<WtraceWriter> frm_writers;
+    RamParity   frm_ram;
+    std::string frm_disasm;        // output of disasm_ram.py, shown verbatim
+    uint32_t    frm_disasm_pc = 0;
+    std::string  frm_watch_lo, frm_watch_hi;   // the range currently watched
+    std::string  frm_scan_note;
+    FrameLayers  frm_layers;
+    // One-shot pane request from a finished job: -1 none, 0 attribution,
+    // 1 diff, 2 layers, 3 opcodes. Consumed and cleared once per draw.
+    int      frm_pane = -1;
+    int      frm_func_sel = -1;        // index into the shown summary's funcs
+    int      frm_layer_sel = -1;
+    char     frm_rename[128] = {};
+    char     frm_rename_note[256] = {};
+    bool     frm_capture_pending = false;
+    std::string frm_capture_label;     // debug-client request label in flight
+    std::string frm_status;
+
+    // Game launched from this tab. Deliberately NOT a job slot: the process
+    // lives as long as you play, and holding a lock for that whole time is what
+    // disabled Capture at exactly the moment it would have worked.
+    long        frm_launch_pid = 0;
+    std::string frm_launch_log;      // <root>/frames.log
+    std::string frm_launch_error;
+    int         frm_slot = 1;        // savestate slot
+    PauseState  frm_pause;           // from {"cmd":"pause_state"}
+    int         frm_step_n = 1;
+    int         frm_run_to = 0;
+    double      frm_pause_next_poll = 0.0;
+    bool        frm_turbo = false;
+
+    // DuckStation oracle (machine-wide, not per-repo). Refreshed on demand
+    // rather than polled: asking costs a python subprocess, and the answer only
+    // changes when you press one of these buttons.
+    OracleStatus frm_oracle;
+    // Screenshots of both emulators. The oracle runs offscreen, so a captured
+    // frame is the only way to see what it is doing at all.
+    FrameLayer  frm_shot_native;
+    FrameLayer  frm_shot_oracle;
+    bool        frm_shot_auto = false;
+    double      frm_shot_next = 0.0;
+    std::string frm_shot_error;
+    uint32_t    frm_pad_mask = 0xFFFFu;   // PS1 pad, active-low
+    int         frm_oracle_run_to = 0;
+    bool     frm_oracle_queried = false;
+    std::string frm_oracle_note;
+
+    // Widescreen site scan
+    std::vector<WsSite>   ws_sites;
+    std::vector<uint32_t> ws_w_imms, ws_h_imms, ws_extent_funcs;
+    bool ws_discovered = false;
+    bool ws_loaded = false;
+    std::string ws_toml_path;
 
     // Log (ring)
     static constexpr size_t kMaxLogLines = 4000;
@@ -184,7 +901,25 @@ struct StudioModel {
     bool log_expanded = true;
     float log_h_pref = 160.f;
 
+    // Two job slots, because they guard different things.
+    //
+    // `busy` is the PROJECT slot: configure, build, analyze, git — everything
+    // scoped to the selected repo, where letting two run at once would race the
+    // same build dir or the same working tree.
+    //
+    // `busy_global` is the MACHINE slot: work that belongs to the toolbox
+    // rather than to a game, and that takes long enough to be intolerable as a
+    // whole-app lock. Building the DuckStation oracle is ~10 minutes; sharing
+    // one flag would freeze Configure, Git and everything else for its whole
+    // duration for no reason — the two touch nothing in common.
     std::atomic<bool> busy{false};
+    std::atomic<bool> busy_global{false};
+    // `busy_frames` is the OBSERVATION slot: capture / diff / layer render.
+    // They read a running game and write only under analysis/frames, so they
+    // race nothing the project slot guards — and crucially, they must stay
+    // usable while a game is running, which is precisely when the project slot
+    // is held by Launch.
+    std::atomic<bool> busy_frames{false};
     std::atomic<bool> request_exit{false};
 
     // Pending file/folder picks from SDL dialogs (applied on main thread).
@@ -202,6 +937,12 @@ struct StudioModel {
     void coerce_catalog_only_selection();
     // Apply detected player count from the selected repo to the Migrate UI.
     void apply_selected_players();
+
+    bool is_snes() const { return platform == Platform::SNES; }
+    const char* framework() const { return platform_framework(platform); }
+    // Clear per-project state that belongs to the platform being left, so a
+    // PSX repo path or branch list can never survive into a SNES session.
+    void reset_for_platform_switch();
 };
 
 } // namespace retcomm::studio
