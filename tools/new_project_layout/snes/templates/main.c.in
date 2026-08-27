@@ -222,6 +222,256 @@ static int open_audio(void)
     return 0;
 }
 
+/* ── Gamepads ───────────────────────────────────────────────────────────────
+ *
+ * The scaffold shipped keyboard-only: read_keyboard() below was the whole
+ * input path, and snesrecomp_sdl_init() never asked for the gamepad subsystem.
+ * A pad mapped in the launcher therefore did nothing once the game started —
+ * the launcher has its own SDL context and its own input handling, and none of
+ * that survives into the frame loop.
+ *
+ * Mapping comes from config.ini's [GamepadMap] Controls line, which is what the
+ * launcher writes, in the order the runner's own config uses:
+ *
+ *   Up, Down, Left, Right, Select, Start, A, B, X, Y, L, R
+ *
+ * Note the default maps SNES A onto the pad's B and SNES B onto the pad's A —
+ * the usual Nintendo/Xbox face swap — so on a DualSense, cross is B and circle
+ * is A. Reading the file rather than hardcoding that keeps the launcher's
+ * screen honest: whatever it shows is what the game uses.
+ *
+ * Polled once per frame rather than event-driven. Buttons are level state, not
+ * edges, so polling cannot drop or double a press the way an event queue can if
+ * a frame is slow, and it needs no per-pad bookkeeping. */
+
+#define GAME_PAD_BUTTONS 12
+
+/* SNES bit order of the runner's input word, indexed by [GamepadMap] position. */
+static const uint8_t kGameControlBit[GAME_PAD_BUTTONS] = {
+    4,  /* Up     */ 5,  /* Down   */ 6,  /* Left  */ 7,  /* Right */
+    2,  /* Select */ 3,  /* Start  */ 8,  /* A     */ 0,  /* B     */
+    9,  /* X      */ 1,  /* Y      */ 10, /* L     */ 11, /* R     */
+};
+
+/* Launcher button names -> SDL. Negative values are axis pseudo-buttons: the
+ * triggers report as axes, not buttons, on every modern pad. */
+#define GAME_AXIS_L2 (-1)
+#define GAME_AXIS_R2 (-2)
+
+struct GamePadName { const char *name; int button; };
+
+static const struct GamePadName kGamePadNames[] = {
+    {"DpadUp", SDL_CONTROLLER_BUTTON_DPAD_UP},
+    {"DpadDown", SDL_CONTROLLER_BUTTON_DPAD_DOWN},
+    {"DpadLeft", SDL_CONTROLLER_BUTTON_DPAD_LEFT},
+    {"DpadRight", SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
+    {"A", SDL_CONTROLLER_BUTTON_A},
+    {"B", SDL_CONTROLLER_BUTTON_B},
+    {"X", SDL_CONTROLLER_BUTTON_X},
+    {"Y", SDL_CONTROLLER_BUTTON_Y},
+    {"Back", SDL_CONTROLLER_BUTTON_BACK},
+    {"Start", SDL_CONTROLLER_BUTTON_START},
+    {"Guide", SDL_CONTROLLER_BUTTON_GUIDE},
+    {"Lb", SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
+    {"Rb", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
+    {"L3", SDL_CONTROLLER_BUTTON_LEFTSTICK},
+    {"R3", SDL_CONTROLLER_BUTTON_RIGHTSTICK},
+    {"Lt", GAME_AXIS_L2},
+    {"Rt", GAME_AXIS_R2},
+    {"None", -100},
+};
+
+/* Defaults match config.ini's shipped [GamepadMap] Controls line. */
+static int g_pad_map[GAME_PAD_BUTTONS] = {
+    SDL_CONTROLLER_BUTTON_DPAD_UP,    SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+    SDL_CONTROLLER_BUTTON_DPAD_LEFT,  SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+    SDL_CONTROLLER_BUTTON_BACK,       SDL_CONTROLLER_BUTTON_START,
+    SDL_CONTROLLER_BUTTON_B,          SDL_CONTROLLER_BUTTON_A,
+    SDL_CONTROLLER_BUTTON_Y,          SDL_CONTROLLER_BUTTON_X,
+    SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+};
+
+#define GAME_MAX_PADS 2
+#if SNESRECOMP_SDL3
+static SDL_Gamepad *g_pads[GAME_MAX_PADS];
+#else
+static SDL_GameController *g_pads[GAME_MAX_PADS];
+#endif
+
+static int game_pad_name_to_button(const char *name)
+{
+    size_t i;
+    for (i = 0; i < sizeof(kGamePadNames) / sizeof(kGamePadNames[0]); ++i) {
+        if (SDL_strcasecmp(name, kGamePadNames[i].name) == 0)
+            return kGamePadNames[i].button;
+    }
+    return -100;   /* unknown name: leave unbound rather than guess */
+}
+
+/* Parse [GamepadMap] Controls from config.ini beside the executable, then the
+ * working directory. Absent or malformed leaves the defaults in place — a
+ * missing config must not silently unbind the pad. */
+static void game_load_pad_map(void)
+{
+    static const char *paths[] = {"config.ini", "../config.ini"};
+    size_t p;
+    for (p = 0; p < sizeof(paths) / sizeof(paths[0]); ++p) {
+        FILE *f = fopen(paths[p], "rb");
+        char line[512];
+        int in_section = 0;
+        if (!f)
+            continue;
+        while (fgets(line, sizeof(line), f)) {
+            char *s = line, *eq;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '[') {
+                in_section = (SDL_strncasecmp(s, "[GamepadMap]", 12) == 0);
+                continue;
+            }
+            if (!in_section || *s == '#' || *s == ';')
+                continue;
+            eq = strchr(s, '=');
+            if (!eq)
+                continue;
+            *eq = 0;
+            {
+                char *key = s;
+                char *val = eq + 1;
+                char *end = key + strlen(key);
+                int n = 0;
+                while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+                if (SDL_strcasecmp(key, "Controls") != 0)
+                    continue;
+                for (;;) {
+                    char *comma, *tok;
+                    while (*val == ' ' || *val == '\t') val++;
+                    comma = strchr(val, ',');
+                    if (comma) *comma = 0;
+                    tok = val;
+                    end = tok + strlen(tok);
+                    while (end > tok && (end[-1] == ' ' || end[-1] == '\t' ||
+                                         end[-1] == '\r' || end[-1] == '\n'))
+                        *--end = 0;
+                    if (*tok && n < GAME_PAD_BUTTONS)
+                        g_pad_map[n++] = game_pad_name_to_button(tok);
+                    if (!comma)
+                        break;
+                    val = comma + 1;
+                }
+                fprintf(stderr, "[input] gamepad map: %d binding(s) from %s\n",
+                        n, paths[p]);
+                fclose(f);
+                return;
+            }
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "[input] gamepad map: config.ini has no [GamepadMap]; "
+                    "using built-in defaults\n");
+}
+
+static void game_open_pads(void)
+{
+    int slot = 0;
+#if SNESRECOMP_SDL3
+    int count = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&count);
+    int i;
+    for (i = 0; ids && i < count && slot < GAME_MAX_PADS; ++i) {
+        if (g_pads[slot])
+            continue;
+        g_pads[slot] = SDL_OpenGamepad(ids[i]);
+        if (g_pads[slot]) {
+            const char *n = SDL_GetGamepadName(g_pads[slot]);
+            fprintf(stderr, "[input] gamepad %d: %s\n", slot, n ? n : "(unnamed)");
+            slot++;
+        }
+    }
+    if (ids)
+        SDL_free(ids);
+    if (!count)
+        fprintf(stderr, "[input] no gamepads detected\n");
+#else
+    int i;
+    for (i = 0; i < SDL_NumJoysticks() && slot < GAME_MAX_PADS; ++i) {
+        if (!SDL_IsGameController(i))
+            continue;
+        if (g_pads[slot])
+            continue;
+        g_pads[slot] = SDL_GameControllerOpen(i);
+        if (g_pads[slot]) {
+            const char *n = SDL_GameControllerName(g_pads[slot]);
+            fprintf(stderr, "[input] gamepad %d: %s\n", slot, n ? n : "(unnamed)");
+            slot++;
+        }
+    }
+    if (!slot)
+        fprintf(stderr, "[input] no gamepads detected\n");
+#endif
+}
+
+static void game_close_pads(void)
+{
+    int i;
+    for (i = 0; i < GAME_MAX_PADS; ++i) {
+        if (!g_pads[i])
+            continue;
+#if SNESRECOMP_SDL3
+        SDL_CloseGamepad(g_pads[i]);
+#else
+        SDL_GameControllerClose(g_pads[i]);
+#endif
+        g_pads[i] = NULL;
+    }
+}
+
+/* Seat `slot`'s 12 SNES bits. The left stick doubles as the d-pad: a DualSense
+ * player reaching for the stick should not find the game unresponsive. */
+static uint16_t read_gamepad(int slot)
+{
+    uint16_t pad = 0;
+    int i;
+    Sint16 ax, ay;
+    const Sint16 dead = 12000;
+    if (slot < 0 || slot >= GAME_MAX_PADS || !g_pads[slot])
+        return 0;
+    for (i = 0; i < GAME_PAD_BUTTONS; ++i) {
+        int b = g_pad_map[i];
+        int down = 0;
+        if (b == -100)
+            continue;
+#if SNESRECOMP_SDL3
+        if (b == GAME_AXIS_L2)
+            down = SDL_GetGamepadAxis(g_pads[slot], SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 8000;
+        else if (b == GAME_AXIS_R2)
+            down = SDL_GetGamepadAxis(g_pads[slot], SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 8000;
+        else
+            down = SDL_GetGamepadButton(g_pads[slot], (SDL_GamepadButton)b);
+#else
+        if (b == GAME_AXIS_L2)
+            down = SDL_GameControllerGetAxis(g_pads[slot], SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8000;
+        else if (b == GAME_AXIS_R2)
+            down = SDL_GameControllerGetAxis(g_pads[slot], SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000;
+        else
+            down = SDL_GameControllerGetButton(g_pads[slot], (SDL_GameControllerButton)b);
+#endif
+        if (down)
+            pad |= (uint16_t)(1u << kGameControlBit[i]);
+    }
+#if SNESRECOMP_SDL3
+    ax = SDL_GetGamepadAxis(g_pads[slot], SDL_GAMEPAD_AXIS_LEFTX);
+    ay = SDL_GetGamepadAxis(g_pads[slot], SDL_GAMEPAD_AXIS_LEFTY);
+#else
+    ax = SDL_GameControllerGetAxis(g_pads[slot], SDL_CONTROLLER_AXIS_LEFTX);
+    ay = SDL_GameControllerGetAxis(g_pads[slot], SDL_CONTROLLER_AXIS_LEFTY);
+#endif
+    if (ax < -dead) pad |= 1u << 6;   /* Left  */
+    if (ax >  dead) pad |= 1u << 7;   /* Right */
+    if (ay < -dead) pad |= 1u << 4;   /* Up    */
+    if (ay >  dead) pad |= 1u << 5;   /* Down  */
+    return pad;
+}
+
 /* Runner input word: 12 button bits per seat.
  * B, Y, Select, Start, Up, Down, Left, Right, A, X, L, R. */
 static uint16_t read_keyboard(void)
@@ -306,7 +556,8 @@ int main(int argc, char **argv)
 
     /* snesrecomp_sdl_* wrap the SDL2/SDL3 API differences, so this host
      * builds against either backend (-DSNESRECOMP_SDL_BACKEND=SDL2|SDL3). */
-    if (!snesrecomp_sdl_init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+    if (!snesrecomp_sdl_init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
+                             SDL_INIT_GAMECONTROLLER)) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -337,6 +588,12 @@ int main(int argc, char **argv)
      * SnesInit, so the APU exists before the audio thread can pull from it. */
     open_audio();
 
+    /* Input. Without the gamepad subsystem above and these two calls, a pad
+     * mapped in the launcher does nothing once the game starts — the launcher
+     * runs its own SDL context and none of its input state carries over. */
+    game_load_pad_map();
+    game_open_pads();
+
     while (running) {
         SDL_Event event;
         void *pixels = NULL;
@@ -349,12 +606,23 @@ int main(int argc, char **argv)
             if (event.type == SDL_EVENT_KEY_DOWN &&
                 SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE)
                 running = 0;
+            /* Hotplug: a pad connected after launch must still work, and one
+             * unplugged mid-game must not leave a dangling handle. */
+            if (event.type == SDL_EVENT_GAMEPAD_ADDED)
+                game_open_pads();
+            if (event.type == SDL_EVENT_GAMEPAD_REMOVED) {
+                game_close_pads();
+                game_open_pads();
+            }
         }
 
         /* Seat 0 in the low 12 bits, seat 1 in the next 12. Seats 2..7 (with
          * a multitap) go through RtlSetPadState — see
          * snesrecomp/docs/MULTITAP.md. */
-        inputs = read_keyboard();
+        /* Keyboard and pad are OR'd, not exclusive: either drives seat 0, so
+         * plugging a controller never takes the keyboard away. */
+        inputs = read_keyboard() | read_gamepad(0);
+        inputs |= (uint32)read_gamepad(1) << 12;
         RtlRunFrame(inputs);
 
         if (snesrecomp_sdl_lock_texture(texture, NULL, &pixels, &pitch)) {
@@ -366,6 +634,7 @@ int main(int argc, char **argv)
         SDL_RenderPresent(renderer);
     }
 
+    game_close_pads();
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
