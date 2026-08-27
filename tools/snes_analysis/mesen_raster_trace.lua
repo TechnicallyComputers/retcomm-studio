@@ -28,6 +28,21 @@ local TARGET = tonumber(os.getenv("GW_FRAME") or "") or 2500
 local SPAN = tonumber(os.getenv("GW_SPAN") or "") or 1
 local OUT = os.getenv("GW_OUT") or "/tmp/mesen_raster.csv"
 
+-- Trigger mode. A fixed GW_FRAME only works when you already know the frame
+-- number of the thing you want, which you never do for a screen you have to
+-- play to: you would have to guess how long navigating takes and hope the
+-- scene is on screen when the counter arrives. With GW_TRIGGER set, the
+-- script instead waits for that file to appear and captures the next SPAN
+-- frames -- so you drive to the scene first and arm it afterwards, which is
+-- the order that actually matches how a person uses this.
+local TRIGGER = os.getenv("GW_TRIGGER")
+local function triggerPresent()
+  if not TRIGGER then return false end
+  local f = io.open(TRIGGER, "r")
+  if f then f:close(); return true end
+  return false
+end
+
 -- Registers that decide how a scanline is composed, plus the raster-split
 -- timers that schedule the changes.
 local WATCH = {
@@ -65,6 +80,20 @@ local function onWrite(addr, value)
     addr, name, value)
 end
 
+-- Grab the picture as well as the registers. Matching register values prove
+-- the two machines were CONFIGURED the same; they cannot prove the two
+-- machines DREW the same. For a defect reported by eye, the reference frame
+-- is the artifact that settles it, and capturing it here means it is the same
+-- frame the trace describes rather than one taken by hand moments later.
+local function shot(n)
+  local ok, png = pcall(emu.takeScreenshot)
+  if not ok or not png then return end
+  local path = string.gsub(OUT, "%.csv$", "") .. string.format("_f%d.png", n)
+  local f = io.open(path, "wb")
+  if f then f:write(png); f:close()
+          emu.log("mesen_raster_trace: screenshot " .. path) end
+end
+
 local function flush()
   local f = io.open(OUT, "w")
   if not f then
@@ -77,23 +106,47 @@ local function flush()
   emu.log(string.format("mesen_raster_trace: wrote %d rows to %s", #rows, OUT))
 end
 
+local startFrame = nil
+
 local function onFrame()
   frame = frame + 1
   if done then return end
-  if frame == TARGET then
-    armed = true
-    emu.log("mesen_raster_trace: capturing from frame " .. frame)
-  elseif armed and frame > TARGET + SPAN - 1 then
+  if not armed then
+    local go
+    if TRIGGER then
+      -- Only stat the file a few times a second; this runs every frame.
+      go = (frame % 12 == 0) and triggerPresent()
+    else
+      go = (frame == TARGET)
+    end
+    if go then
+      armed = true
+      startFrame = frame
+      emu.log("mesen_raster_trace: capturing from frame " .. frame)
+      shot(frame)
+    elseif (frame % 300) == 0 then
+      emu.log("mesen_raster_trace: at frame " .. frame .. ", waiting for "
+              .. (TRIGGER and ("trigger file " .. TRIGGER) or tostring(TARGET)))
+    end
+    return
+  end
+  shot(frame)
+  if frame > startFrame + SPAN - 1 then
     armed = false
     done = true
     flush()
-  elseif (frame % 300) == 0 and not armed then
-    emu.log("mesen_raster_trace: at frame " .. frame .. ", waiting for " .. TARGET)
   end
 end
 
 emu.addMemoryCallback(onWrite, emu.callbackType.write, 0x2100, 0x213F)
 emu.addMemoryCallback(onWrite, emu.callbackType.write, 0x4200, 0x420F)
 emu.addEventCallback(onFrame, emu.eventType.endFrame)
-emu.log(string.format("mesen_raster_trace: armed for frame %d (+%d), out=%s",
-                      TARGET, SPAN, OUT))
+if TRIGGER then
+  os.remove(TRIGGER)   -- a leftover file would fire the capture immediately
+  emu.log(string.format(
+    "mesen_raster_trace: waiting for trigger %s (+%d frames), out=%s",
+    TRIGGER, SPAN, OUT))
+else
+  emu.log(string.format("mesen_raster_trace: armed for frame %d (+%d), out=%s",
+                        TARGET, SPAN, OUT))
+end
