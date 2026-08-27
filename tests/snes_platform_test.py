@@ -16,6 +16,7 @@ Run:  python3 tests/snes_platform_test.py
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -542,6 +543,94 @@ def test_new_project_command() -> None:
         os.unlink(rom)
 
 
+def test_snes_functions() -> None:
+    """The Functions tab's data layer: read the manifest, edit only symbols.toml.
+
+    The write path is a line scanner, not a TOML round-trip, because the
+    comments in symbols.toml are where the reasons live — "held at emit = false
+    because ..." is the most valuable content in the file, and every TOML
+    writer reflows it away. So the thing worth testing is that an add followed
+    by a remove leaves the file byte-identical.
+    """
+    print("snes functions")
+    from project_studio import snes_analyzeops as sa
+
+    platforms.set_current("snes")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "recomp").mkdir()
+        (root / "src" / "gen").mkdir(parents=True)
+        original = (
+            "# Progressive symbol map.\n"
+            "# Held at emit = false on purpose — see the note.\n"
+            "\n"
+            "[[func]]\n"
+            'name = "I_RESET"\n'
+            'addr = "8000"\n'
+            "bank = 0\n"
+            "emit = false\n"
+            'note = "Emulation RESET vector"\n'
+        )
+        syms = root / "recomp" / "symbols.toml"
+        syms.write_text(original, encoding="utf-8")
+        (root / "src" / "gen" / "program_manifest.json").write_text(
+            json.dumps({
+                "format_version": 3,
+                "roots": [{"pc24": 0x8000, "m": 1, "x": 1}],
+                "nodes": {
+                    "008000:M1X1": {
+                        "key": "008000:M1X1", "min_pc24": 0x8000, "max_pc24": 0x8075,
+                        "disposition": "lle_only", "instruction_count": 51,
+                        "reasons": ["unproven_callee_exit"],
+                        "demands": [{"kind": "direct_call", "resolution": "aot_exact"}],
+                    },
+                    "00828A:M0X0": {
+                        "key": "00828A:M0X0", "min_pc24": 0x828A, "max_pc24": 0x8295,
+                        "disposition": "aot_eligible", "instruction_count": 11,
+                        "reasons": [], "demands": [],
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        man = sa.read_manifest(root)
+        check(man["present"], "the manifest is read")
+        check(len(man["nodes"]) == 2, f"both nodes surface ({len(man['nodes'])})")
+        check(man["counts"] == {"lle_only": 1, "aot_eligible": 1},
+              f"dispositions are counted ({man['counts']})")
+        check(len(man["unproven"]) == 1, "the unproven worklist holds the one with reasons")
+        named = next(n for n in man["nodes"] if n["pc"] == "008000")
+        check(named["name"] == "I_RESET", "a node is joined to its symbols.toml name")
+        check(named["emit"] is False, "and to its emit state")
+        unnamed = next(n for n in man["nodes"] if n["pc"] == "00828A")
+        check(unnamed["emit"] is None, "a node with no symbol reports emit as unset")
+
+        # Promote in place: the entry changes, the comments do not.
+        r = sa.set_symbol(root, "8000", emit=True)
+        check(r.ok, f"emit can be flipped ({r.message})")
+        body = syms.read_text(encoding="utf-8")
+        check("emit = true" in body, "the flag is written")
+        check("# Held at emit = false on purpose" in body, "comments survive the edit")
+        check('note = "Emulation RESET vector"' in body, "so does the note")
+        check(body.count("[[func]]") == 1, "no duplicate entry was appended")
+
+        # Bare hex, 0x-prefixed and bank:offset all name the same function.
+        for form in ("0x8000", "00:8000", "8000"):
+            check(sa._norm_pc(form) == "8000", f"{form} normalises to 8000")
+
+        sa.set_symbol(root, "8000", emit=False)
+        r = sa.set_symbol(root, "828A", name="sub_828A", emit=True)
+        check(r.ok, "a new function can be added")
+        check(len(sa.read_symbols(root)) == 2, "both entries are present")
+        r = sa.clear_symbol(root, "828a")
+        check(r.ok, "and removed again, case-insensitively")
+        check(
+            syms.read_text(encoding="utf-8") == original,
+            "add + remove leaves the file byte-identical",
+        )
+
+
 def main() -> int:
     if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
         print("git not available — skipping")
@@ -563,6 +652,7 @@ def main() -> int:
     test_new_project_command()
     test_launch_rom()
     test_module_targets()
+    test_snes_functions()
     print("FAILED" if failures else "PASSED")
     return 1 if failures else 0
 

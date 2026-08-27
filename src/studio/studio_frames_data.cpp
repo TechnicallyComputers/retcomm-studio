@@ -204,10 +204,43 @@ std::string game_disc_for(const std::string& root) {
     return fs::is_regular_file(p, ec) ? p.string() : std::string();
 }
 
+// beetle_oracle.py answers in its own shape — it manages a different build
+// (a libretro core plus a frontend, no container, no BIOS staging), so it has
+// different things to report. Translated here rather than forced into
+// DuckStation's schema: a manager that has no `state` should not be made to
+// invent one.
+static OracleStatus parse_beetle_status(const json& j) {
+    OracleStatus st;
+    st.kind = OracleKind::Beetle;
+    st.root = j.value("root", "");
+    st.app = st.root;
+    st.port = j.value("port", 4380);
+    st.built = j.value("built", false);
+    st.installed = j.value("installed", false);
+    // `listening` is a bound socket. beetle_oracle.py does not own the process
+    // the way duckstation_oracle.py does (no pidfile, no launcher), so running
+    // and answering are the same observation here and both come from the port.
+    st.running = j.value("listening", false);
+    st.answering = st.running;
+    if (j.contains("known_blocker") && j["known_blocker"].is_array()) {
+        for (const auto& b : j["known_blocker"])
+            if (b.is_string()) st.blockers.push_back(b.get<std::string>());
+    }
+    if (j.contains("manifest") && j["manifest"].is_object())
+        st.upstream_base = j["manifest"].value("upstream_base", "");
+    st.state = st.answering  ? "answering"
+               : st.installed ? "installed"
+               : st.built     ? "built"
+               : j.value("src", false) ? "fetched"
+                                       : "absent";
+    st.valid = true;
+    return st;
+}
+
 OracleStatus parse_oracle_status(const std::string& json_text) {
     OracleStatus st;
     if (json_text.empty()) {
-        st.error = "no reply from duckstation_oracle.py";
+        st.error = "no reply from the oracle manager";
         return st;
     }
     try {
@@ -215,13 +248,14 @@ OracleStatus parse_oracle_status(const std::string& json_text) {
         // object, not the whole stream.
         const size_t brace = json_text.find('{');
         if (brace == std::string::npos) {
-            st.error = "duckstation_oracle.py printed no JSON: " +
+            st.error = "the oracle manager printed no JSON: " +
                        json_text.substr(0, 200);
             return st;
         }
         const json j = json::parse(json_text.substr(brace));
+        if (j.value("oracle", "") == "beetle") return parse_beetle_status(j);
         if (j.value("kind", "") != "psxrecomp-oracle-status") {
-            st.error = "unexpected reply from duckstation_oracle.py";
+            st.error = "unexpected reply from the oracle manager";
             return st;
         }
         st.state = j.value("state", "");
@@ -462,6 +496,67 @@ fs::path studio_analysis_dir() {
     std::error_code ec;
     const fs::path d = fs::path(env).parent_path() / "psx_analysis";
     return fs::is_directory(d, ec) ? d : fs::path{};
+}
+
+// Load the generated capability tables. Failure is not fatal and must not be:
+// an empty table gates nothing, so a missing or unreadable oracle_caps.json
+// costs you the greying, not the buttons.
+void load_oracle_caps(StudioModel& model) {
+    if (model.oracle_caps_loaded) return;
+    model.oracle_caps_loaded = true;
+    const fs::path dir = studio_analysis_dir();
+    if (dir.empty()) {
+        model.oracle_caps_error = "no psx_analysis directory beside the toolkit";
+        return;
+    }
+    const fs::path path = dir / "oracle_caps.json";
+    json j;
+    std::string err;
+    if (!read_json(path.string(), j, err)) {
+        model.oracle_caps_error = err;
+        return;
+    }
+    try {
+        for (auto it = j.at("oracles").begin(); it != j.at("oracles").end(); ++it) {
+            std::set<std::string> cmds;
+            for (const auto& c : it.value().at("commands"))
+                if (c.is_string()) cmds.insert(c.get<std::string>());
+            model.oracle_caps[it.key()] = std::move(cmds);
+        }
+        if (j.contains("tools")) {
+            for (auto it = j.at("tools").begin(); it != j.at("tools").end(); ++it) {
+                std::vector<std::string> needs;
+                for (const char* key : {"duckstation", "beetle"}) {
+                    const std::string field = std::string("needs_") + key;
+                    if (it.value().contains(field) && !it.value()[field].empty())
+                        needs.push_back(key);
+                }
+                if (!needs.empty()) model.oracle_tool_needs[it.key()] = std::move(needs);
+            }
+        }
+    } catch (const std::exception& e) {
+        model.oracle_caps_error = std::string("unreadable oracle_caps.json (") + e.what() + ")";
+    }
+}
+
+// Why `tool` cannot run against the selected oracle, or empty when it can.
+//
+// Only a command that exactly ONE oracle registers and psx-runtime does NOT
+// can decide this — everything else a tool sends may have gone to the runtime,
+// and pinning on a shared command greys out the wrong half. gen_oracle_caps.py
+// does that subtraction; this just reads the answer.
+std::string oracle_tool_blocker(const StudioModel& model, const std::string& tool) {
+    auto it = model.oracle_tool_needs.find(tool);
+    if (it == model.oracle_tool_needs.end()) return {};
+    const std::string want = oracle_key(model.frm_oracle_kind);
+    for (const std::string& need : it->second)
+        if (need == want) return {};
+    if (it->second.empty()) return {};
+    const std::string needed = it->second.front();
+    return std::string(tool) + " needs commands only " +
+           (needed == "beetle" ? "Beetle PSX" : "DuckStation") +
+           " serves — switch the oracle above, or it will fail with "
+           "\"unknown command\"";
 }
 
 std::string gpu_tool_path(const std::string& root, const std::string& tool) {

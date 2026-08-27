@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -208,8 +209,57 @@ struct FrameSummary {
 // root and one build serves every title. Studio only ever reads this — the tool
 // owns the install, so a headless setup and this row cannot disagree about what
 // exists.
+// Which emulator is playing oracle. They are not interchangeable and neither
+// is a superset: DuckStation registers pause/step, read_vram, gpu_state and
+// the breakpoint family; Beetle registers every trace family (wtrace, rtrace,
+// fntrace, sio_trace, cdrom_cmd, devtrace) and none of DuckStation's. Which
+// commands each one actually serves is generated into
+// tools/psx_analysis/oracle_caps.json rather than written down here — see
+// gen_oracle_caps.py for why a hand-kept list is wrong by the next commit.
+enum class OracleKind { DuckStation, Beetle };
+
+inline const char* oracle_key(OracleKind k) {
+    return k == OracleKind::Beetle ? "beetle" : "duckstation";
+}
+inline const char* oracle_display(OracleKind k) {
+    return k == OracleKind::Beetle ? "Beetle PSX" : "DuckStation";
+}
+// Each oracle has its own manager script, with its own subcommands and its own
+// status shape. Studio drives both through the same buttons.
+inline const char* oracle_tool(OracleKind k) {
+    return k == OracleKind::Beetle ? "beetle_oracle.py" : "duckstation_oracle.py";
+}
+
+// One node from src/gen/program_manifest.json — a stretch of ROM snesrecomp's
+// analyzer proved is a function, at one (m, x) flag state. `reasons` is only
+// populated when it could not be proven AOT-eligible, and it is the useful
+// half: it names what discovery could not settle, which is where the fix goes.
+struct SnesFunc {
+    std::string key;          // "008000:M1X1"
+    std::string pc, end;      // 24-bit, hex
+    std::string disposition;  // aot_eligible | lle_only
+    std::string name;         // from recomp/symbols.toml, when it has one
+    std::vector<std::string> reasons;
+    int bank = 0;
+    int instructions = 0;
+    int demands = 0;
+    int unresolved = 0;
+    int emit = -1;            // -1 not in symbols.toml, 0 held, 1 promoted
+};
+
+struct SnesFunctions {
+    bool present = false;     // false before the first tools/regen.sh
+    bool loading = false;
+    std::string path, error, root;
+    std::vector<SnesFunc> funcs;
+    std::vector<std::string> roots;
+    std::map<std::string, int> counts;   // disposition -> n
+    int promoted = 0;
+};
+
 struct OracleStatus {
     bool valid = false;
+    OracleKind kind = OracleKind::DuckStation;
     std::string state;            // absent|fetched|built|installed|port-busy|answering
     std::string root, app, launcher;
     std::string upstream_base;
@@ -221,6 +271,11 @@ struct OracleStatus {
     bool running = false;
     bool answering = false;
     bool container_needed = false;
+    // Beetle only: hooks its pinned beetle-psx tree is missing, named by
+    // beetle_oracle.py rather than left to surface as a wall of C++ errors.
+    // docs/beetle-linux.md records that the committed patches are incomplete;
+    // this is that debt, reported instead of hidden.
+    std::vector<std::string> blockers;
     std::string error;
 };
 
@@ -564,6 +619,92 @@ struct FnStats {
     uint32_t partial_functions = 0, undecoded_words = 0;
 };
 
+// ---- SNES Diagnostics tab --------------------------------------------------
+// Data shapes live here, beside FrameSummary and friends, because StudioModel
+// holds them by value and studio_snes.hpp includes this header.
+
+// Mesen's install state, from `mesen_oracle.py status --json`.
+struct MesenStatus {
+    bool        probed = false;
+    bool        installed = false;
+    std::string binary;
+    std::string root;
+    std::string provider;      // "release" | "system"
+    std::string error;
+    std::string summary;       // one line, ready to show
+};
+
+// 256 BGR555 entries decoded from a dump_cgram reply or a Mesen *_cgram.bin.
+//
+// The census is the point, not the swatches. A real SNES palette repeats a
+// colour a handful of times; a *fill* repeats one across unrelated palettes,
+// which is what a stale or never-uploaded palette block looks like.
+struct CgramView {
+    bool        loaded = false;
+    std::string error;
+    uint16_t    entry[256] = {};
+    int         distinct = 0;
+    uint16_t    top_value = 0;      // most repeated entry
+    int         top_count = 0;
+    int         zero_count = 0;
+};
+
+// A capture written by snes_frame_capture.py, plus whatever the decode and
+// attribute steps have since produced beside it.
+struct SnesBundle {
+    std::string tag;
+    std::string path;          // the <tag>.json manifest
+    uint64_t    frame = 0;
+    bool        decoded = false;
+    bool        attributed = false;
+};
+
+// One visit to a scene, from snes_loop_compare.py. The tool decides what to
+// capture and what counts as a difference; Studio only renders its verdict.
+struct LoopVisit {
+    int         visit = 0;
+    uint64_t    entered_frame = 0;
+    int         frame_lo = 0, frame_hi = 0;
+    std::vector<std::pair<std::string,int>> irq_chain;   // label -> count
+    int         cgram_distinct = 0, cgram_top_count = 0;
+    std::string cgram_top_value;
+    bool        cgram_fill = false;
+    int         shadow_distinct = 0, shadow_top_count = 0;
+    std::string shadow_top_value;
+    bool        shadow_fill = false;
+    bool        top_present_in_shadow = false;
+    int         upload_frames = 0;
+    std::vector<std::string> reg_writers;   // "reg  func  xN"
+    int         block_ring_entries = 0;
+    bool        chain_trustworthy = true;   // false => the zeros mean nothing
+};
+
+struct LoopDiffRow {
+    std::string field, visit1, visit2;
+};
+
+struct LoopCompare {
+    bool        loaded = false;
+    std::string error;
+    std::string path;
+    std::string selector;
+    std::vector<LoopVisit>   visits;
+    std::vector<LoopDiffRow> diffs;
+};
+
+// One row of mesen_raster_trace.lua's CSV: a register write stamped with the
+// beam position. This is the measurement our own runtime cannot make — its
+// trace records (frame, addr, value) with no scanline, and for a title that
+// raster-splits the screen the scanline IS the question.
+struct RasterRow {
+    int         frame = 0;
+    int         scanline = 0;
+    int         hclock = 0;
+    std::string reg;
+    std::string addr;
+    std::string value;
+};
+
 struct StudioModel {
     std::mutex mu;
 
@@ -867,6 +1008,62 @@ struct StudioModel {
     int         frm_slot = 1;        // savestate slot
     PauseState  frm_pause;           // from {"cmd":"pause_state"}
     int         frm_step_n = 1;
+    // ---- SNES Diagnostics tab ------------------------------------------
+    // Two emulators, never one: the runtime under test and the Mesen oracle
+    // run as separate processes on the SAME rom.cfg ROM. Neither is ever
+    // paused to line them up — they are compared by scene, from always-on
+    // history, which is the standing ruling in the workspace rules.
+    char        snes_host[64] = "127.0.0.1";
+    int         snes_port = 4370;
+    long        snes_launch_pid = 0;
+    std::string snes_launch_log;
+    std::string snes_launch_error;
+    std::string snes_rom;            // resolved from <build>/rom.cfg
+    char        snes_rom_override[512] = {};
+    std::string snes_status;
+
+    MesenStatus snes_mesen;
+    bool        snes_mesen_probing = false;
+    long        snes_mesen_pid = 0;
+    std::string snes_mesen_log;
+    std::string snes_mesen_error;
+    int         snes_mesen_script = 0;   // index into the Lua script table
+    int         snes_mesen_provider = 1; // 0 = release, 1 = system
+    bool        snes_mesen_was_running = false;
+    int         snes_lua_frame = 2500;   // GW_FRAME
+    int         snes_lua_span = 1;       // GW_SPAN
+    char        snes_lua_out[512] = {};  // GW_DIR / GW_OUT
+
+    std::string snes_frames_dir;         // <root>/analysis/frames
+    std::vector<SnesBundle> snes_bundles;
+    int         snes_bundle_sel = -1;
+    char        snes_capture_tag[64] = "bad";
+    int         snes_capture_frame = 0;  // 0 = newest in the ring
+    bool        snes_capture_wram = false;
+
+    CgramView   snes_cgram;              // ours, live
+    CgramView   snes_cgram_ref;          // Mesen *_cgram.bin
+    std::string snes_cgram_ref_path;
+    bool        snes_cgram_pending = false;
+
+    std::vector<RasterRow> snes_raster;
+    std::string snes_raster_error;
+    std::string snes_raster_path;
+
+    FrameLayer  snes_shot;               // our screenshot
+    FrameLayer  snes_shot_ref;           // a Mesen screenshot
+    std::string snes_shot_info;
+    std::string snes_shot_ref_info;
+    bool        snes_shot_pending = false;
+
+    std::string snes_apu;                // last get_apu_state reply
+    bool        snes_apu_pending = false;
+    LoopCompare snes_loops;
+    int         snes_loop_visits = 2;
+    char        snes_loop_sel[16] = "0010";
+    int         snes_loop_selval = 2;
+    int         snes_pane = -1;          // a finished job asking for its pane
+
     int         frm_run_to = 0;
     double      frm_pause_next_poll = 0.0;
     bool        frm_turbo = false;
@@ -884,7 +1081,25 @@ struct StudioModel {
     std::string frm_shot_error;
     uint32_t    frm_pad_mask = 0xFFFFu;   // PS1 pad, active-low
     int         frm_oracle_run_to = 0;
+    // SNES Functions tab.
+    SnesFunctions snf;
+    char snf_filter[128] = {};
+    int  snf_show = 0;        // 0 all, 1 lle_only, 2 aot_eligible, 3 named
+    int  snf_sel = -1;
+
     bool     frm_oracle_queried = false;
+    // Which oracle the Frames tab is pointed at. Per-session, not per-project:
+    // it is a statement about what you are investigating right now (traces vs
+    // frames and memory), not a property of the port.
+    OracleKind frm_oracle_kind = OracleKind::DuckStation;
+    // Generated capability tables, loaded once from
+    // tools/psx_analysis/oracle_caps.json. Empty when that file is missing, and
+    // an empty table gates NOTHING — a missing file must not silently grey out
+    // every button and look like an oracle that answers nothing.
+    std::map<std::string, std::set<std::string>> oracle_caps;
+    std::map<std::string, std::vector<std::string>> oracle_tool_needs; // tool -> kind keys
+    std::string oracle_caps_error;
+    bool oracle_caps_loaded = false;
     std::string frm_oracle_note;
 
     // Widescreen site scan

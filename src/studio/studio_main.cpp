@@ -1,6 +1,7 @@
 #include "studio/studio_model.hpp"
 #include "studio/studio_runner.hpp"
 #include "studio/studio_frames.hpp"
+#include "studio/studio_snes.hpp"
 #include "studio/studio_functions.hpp"
 #include "studio/studio_theme.hpp"
 
@@ -3148,18 +3149,22 @@ int main(int argc, char** argv) {
                 draw_build(model, th, window);
                 ImGui::EndTabItem();
             }
-            // Functions and Frames read psxrecomp's analysis bundle and speak
-            // its debug protocol. Showing them under SNES would offer tools
-            // that cannot work rather than tools that are merely empty.
-            if (!model.is_snes()) {
-                if (ImGui::BeginTabItem("Functions")) {
-                    draw_functions(model, th, window);
-                    ImGui::EndTabItem();
-                }
-                if (ImGui::BeginTabItem("Frames")) {
-                    draw_frames(model, th, window);
-                    ImGui::EndTabItem();
-                }
+            // Same two tabs on both consoles, in the same order — find the
+            // functions, then diagnose what they do — but each backed by its
+            // own toolset. PSX reads psxrecomp's analysis bundle and speaks its
+            // debug protocol against DuckStation or Beetle; SNES reads
+            // recomp/symbols.toml and drives tools/snes_analysis over the Mesen
+            // oracle. Different protocols and different tools, not a reskin, so
+            // they stay separate draw functions behind matching labels.
+            if (ImGui::BeginTabItem("Functions")) {
+                if (model.is_snes()) draw_snes_functions(model, th, window);
+                else                 draw_functions(model, th, window);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Diagnostics")) {
+                if (model.is_snes()) draw_snes(model, th, window);
+                else                 draw_frames(model, th, window);
+                ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }

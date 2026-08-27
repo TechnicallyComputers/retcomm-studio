@@ -406,11 +406,27 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (OSError, json.JSONDecodeError):
             doc = {}
     pid = running_pid(lay)
+    # `binary` is what START WILL RUN, resolved through the manifest's provider
+    # — not the unpacked release path.
+    #
+    # These disagreed, and the disagreement was the whole bug: Studio launches
+    # whatever this field names, so a host that had already adopted a system
+    # Mesen (provider = "system") still got the pinned Ubuntu release, which
+    # aborts in static init with std::bad_cast on a rolling distro. The tab
+    # then reported "Mesen exited immediately" and advised switching to the
+    # provider that was already selected. One resolver, used by both start and
+    # status, is the only way those two can't drift again.
+    resolved = lay.resolved_binary()
     if args.json:
         print(json.dumps({
             "root": str(lay.root),
-            "installed": lay.binary.is_file(),
-            "binary": str(lay.binary),
+            "installed": resolved is not None,
+            "binary": str(resolved) if resolved else "",
+            # Kept separate so the pane can say WHICH build it is about to run
+            # rather than leaving the provider to be inferred from a path.
+            "provider": doc.get("provider", "release"),
+            "release_binary": str(lay.binary),
+            "release_present": lay.binary.is_file(),
             "running_pid": pid,
             "manifest": doc,
         }, indent=1))
@@ -420,14 +436,25 @@ def cmd_status(args: argparse.Namespace) -> int:
               "speaks_runtime_protocol", "install_at"):
         if k in doc:
             print(f"  {k:<24} {doc[k]}")
-    print(f"  {'installed':<24} {lay.binary.is_file()}")
+    print(f"  {'resolved':<24} {resolved if resolved else 'nothing runnable'}")
+    print(f"  {'installed':<24} {resolved is not None}")
     print(f"  {'running':<24} {pid if pid else 'no'}")
     return 0
 
 
 def cmd_path(args: argparse.Namespace) -> int:
     lay = Layout(Path(args.root) if args.root else None)
-    print(lay.binary if args.binary else lay.root)
+    if not args.binary:
+        print(lay.root)
+        return 0
+    # Same resolver as start and status: `--binary` answers "what runs", which
+    # under provider = system is not the unpacked release path.
+    resolved = lay.resolved_binary()
+    if resolved is None:
+        print("error: nothing runnable — run `setup`, or `setup --provider system`",
+              file=sys.stderr)
+        return 2
+    print(resolved)
     return 0
 
 

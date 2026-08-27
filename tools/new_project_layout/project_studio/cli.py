@@ -1798,32 +1798,44 @@ def cmd_build_status(args: argparse.Namespace) -> int:
     return 0 if exe else 1
 
 
-def _analyze_is_psx_only() -> bool:
-    """`analyze` wraps psxrecomp-analyze; there is no SNES equivalent yet."""
+def _analyze_run_is_psx_only() -> bool:
+    """Only `analyze run` is psxrecomp-specific.
+
+    It invokes psxrecomp-analyze over a boot executable. snesrecomp has no
+    equivalent step to invoke: its analyzer runs inside tools/regen.sh and
+    leaves src/gen/program_manifest.json behind, so on SNES the discovery has
+    already happened and the other subcommands read its result. Refusing all
+    of `analyze` under --platform snes, as this once did, is what left the
+    console with no Functions tab at all.
+    """
     if platforms.current().key != "snes":
         return False
     print(
-        "error: analyze wraps psxrecomp-analyze (the Functions tab's data source); "
-        "snesrecomp's analysis runs through tools/regen.sh and recomp/*.cfg.",
+        "error: analyze run wraps psxrecomp-analyze. snesrecomp analyses as part "
+        "of code generation — run tools/regen.sh, which writes "
+        "src/gen/program_manifest.json, then `analyze status` reads it.",
         file=sys.stderr,
     )
     return True
 
 
 def cmd_analyze_status(args: argparse.Namespace) -> int:
-    if _analyze_is_psx_only():
-        return 2
-    from project_studio.analyzeops import status
-
     root = _root_or_die(args)
     if root is None:
         return 2
+    if platforms.is_snes():
+        from project_studio.snes_analyzeops import status as snes_status
+
+        print(json.dumps(snes_status(root), indent=2))
+        return 0
+    from project_studio.analyzeops import status
+
     print(json.dumps(status(root), indent=2))
     return 0
 
 
 def cmd_analyze_run(args: argparse.Namespace) -> int:
-    if _analyze_is_psx_only():
+    if _analyze_run_is_psx_only():
         return 2
     from project_studio.analyzeops import run_analysis
 
@@ -1856,13 +1868,28 @@ def _parse_pc(text: str) -> int:
 
 
 def cmd_analyze_set_symbol(args: argparse.Namespace) -> int:
-    if _analyze_is_psx_only():
-        return 2
-    from project_studio.analyzeops import set_symbol
-
     root = _root_or_die(args)
     if root is None:
         return 2
+    if platforms.is_snes():
+        # Not through _parse_pc: it reads a bare "838C" as decimal-or-invalid,
+        # and bare hex is how SNES addresses are written everywhere in this
+        # ecosystem — symbols.toml, bank*.cfg, the manifest keys.
+        # snes_analyzeops normalises the forms it accepts.
+        from project_studio.snes_analyzeops import set_symbol as snes_set
+
+        r = snes_set(
+            root, args.pc,
+            name=getattr(args, "name", "") or "",
+            emit=(None if getattr(args, "emit", "") == "" else args.emit == "true"),
+            note=(getattr(args, "note", "") or None),
+        )
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.detail:
+            print(f"       {r.detail}")
+        return 0 if r.ok else 1
+    from project_studio.analyzeops import set_symbol
+
     try:
         pc = _parse_pc(args.pc)
     except ValueError:
@@ -1881,13 +1908,17 @@ def cmd_analyze_set_symbol(args: argparse.Namespace) -> int:
 
 
 def cmd_analyze_clear_symbol(args: argparse.Namespace) -> int:
-    if _analyze_is_psx_only():
-        return 2
-    from project_studio.analyzeops import clear_symbol
-
     root = _root_or_die(args)
     if root is None:
         return 2
+    if platforms.is_snes():
+        from project_studio.snes_analyzeops import clear_symbol as snes_clear
+
+        r = snes_clear(root, args.pc)
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+        return 0 if r.ok else 1
+    from project_studio.analyzeops import clear_symbol
+
     try:
         pc = _parse_pc(args.pc)
     except ValueError:
@@ -1899,13 +1930,16 @@ def cmd_analyze_clear_symbol(args: argparse.Namespace) -> int:
 
 
 def cmd_analyze_symbols(args: argparse.Namespace) -> int:
-    if _analyze_is_psx_only():
-        return 2
-    from project_studio.analyzeops import read_symbols
-
     root = _root_or_die(args)
     if root is None:
         return 2
+    if platforms.is_snes():
+        from project_studio.snes_analyzeops import read_symbols as snes_read
+
+        print(json.dumps({"symbols": snes_read(root)}, indent=2))
+        return 0
+    from project_studio.analyzeops import read_symbols
+
     print(json.dumps({"symbols": read_symbols(root)}, indent=2))
     return 0
 
@@ -2870,7 +2904,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ass = ana_sub.add_parser("set-symbol", help="Name one function in symbols.toml")
     p_ass.add_argument("--root", required=True)
     p_ass.add_argument("--pc", required=True)
-    p_ass.add_argument("--name", required=True)
+    # Not required: on SNES the common edit is flipping `emit` on a function
+    # that already has a name, and demanding one back would make Studio resend
+    # the name it just read.
+    p_ass.add_argument("--name", default="")
     p_ass.add_argument("--status", default="", help="guessed|confirmed|hot")
     p_ass.add_argument("--note", default="")
     p_ass.add_argument("--emit", default="", choices=["", "true", "false"])

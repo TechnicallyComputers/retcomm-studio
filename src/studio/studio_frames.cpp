@@ -59,6 +59,9 @@ const char* kCensusTool = "class_census.py";
 const char* kDlistTool = "gpu_display_list.py";
 const char* kColourTool = "gpu_colour_parity.py";
 
+// Defined below, beside oracle_port(): refresh_oracle() runs before it.
+std::string oracle_tool_path(const StudioModel& model, const std::string& root);
+
 // The Activity log is collapsible, and a failure nobody can see is a failure
 // that looks like a button doing nothing. Pull the actual message up into the
 // tab so the tail of stderr is on screen where the click happened.
@@ -86,6 +89,20 @@ void left_label(const char* text, float w) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(text);
     ImGui::SameLine(w);
+}
+
+// Colour AND wrap. ImGui has TextColored and TextWrapped but not both, and an
+// unwrapped line widens the content region — the page then scrolls sideways
+// and every control on it shifts. Tool errors, oracle-gating reasons and
+// captured stderr are all long by nature, so they all come through here.
+void wrapped(const ImVec4& col, const char* fmt, ...) IM_FMTARGS(2);
+void wrapped(const ImVec4& col, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextWrappedV(fmt, args);
+    ImGui::PopStyleColor();
+    va_end(args);
 }
 
 void muted(const Theme& th, const char* fmt, ...) IM_FMTARGS(2);
@@ -241,10 +258,11 @@ void poll_pause(StudioModel& model, DebugClient& dbg) {
 // ---- oracle ----------------------------------------------------------------
 
 void refresh_oracle(StudioModel& model, const std::string& root) {
-    const std::string tool = gpu_tool_path(root, kOracleTool);
+    const std::string tool = oracle_tool_path(model, root);
     if (tool.empty()) {
         model.frm_oracle = OracleStatus{};
-        model.frm_oracle.error = "psxrecomp/tools/duckstation_oracle.py not found";
+        model.frm_oracle.error =
+            std::string(oracle_tool(model.frm_oracle_kind)) + " not found";
         model.frm_oracle_queried = true;
         return;
     }
@@ -334,15 +352,55 @@ std::string why_disabled(const StudioModel& model, const std::string& tool,
         return "needs a connected game (launch it, and check the port in Runtime)";
     if (model.busy_frames.load())
         return "another Frames job is still running";
+    // Wrong oracle selected. Checked here rather than at each of the twenty
+    // call sites, so a tool added later cannot forget it — and the message
+    // names the oracle to switch to, because "unknown command" surfacing from
+    // three layers down is the failure this exists to prevent.
+    const std::string blocked = oracle_tool_blocker(model, tool_name ? tool_name : "");
+    if (!blocked.empty()) return blocked;
     return {};
 }
 
-// Arguments for launching the oracle, including the game's memory card when
-// one is present next to the project.
-std::vector<std::string> oracle_start_args(const std::string& root,
+// The BIOS image a project ships for its own runtime. Beetle loads one at
+// startup and refuses without it; DuckStation staged a copy into its portable
+// install at `install` time and needs nothing here.
+std::string game_bios_for(const std::string& root) {
+    if (root.empty()) return {};
+    std::error_code ec;
+    for (const char* rel : {"psxrecomp/bios/SCPH1001.BIN", "bios/SCPH1001.BIN",
+                            "psxrecomp/bios/scph5501.bin", "bios/scph5501.bin"}) {
+        const fs::path b = fs::path(root) / rel;
+        if (fs::is_regular_file(b, ec)) return b.string();
+    }
+    return {};
+}
+
+// Arguments for launching the selected oracle.
+//
+// The two managers take different flags, and this used to build DuckStation's
+// set for both: Beetle was handed a --memcard it does not accept, argparse
+// aborted the whole command, and the retry then failed again on the --bios it
+// does require. Ask the oracle what it needs rather than discovering it from
+// an error message.
+std::vector<std::string> oracle_start_args(const StudioModel& model,
+                                           const std::string& root,
                                            const std::string& disc) {
     std::vector<std::string> a{"start", "--disc", disc, "--wait", "90"};
     std::error_code ec;
+    if (model.frm_oracle_kind == OracleKind::Beetle) {
+        // Required: the core loads a BIOS itself, and psx-beetle exits early
+        // without one. Beetle has no memory-card wiring at all, so there is
+        // nothing to share here — a save-dependent comparison needs
+        // DuckStation.
+        const std::string bios = game_bios_for(root);
+        if (!bios.empty()) {
+            a.push_back("--bios");
+            a.push_back(bios);
+        }
+        return a;
+    }
+    // DuckStation: boot from a COPY of the game's own card so the oracle can
+    // reach the same scene as the runtime it is compared against.
     for (const char* rel : {"saves/card1.mcd", "psxrecomp/card1.mcd"}) {
         const fs::path c = fs::path(root) / rel;
         if (fs::is_regular_file(c, ec)) {
@@ -365,7 +423,7 @@ std::vector<std::string> oracle_start_args(const std::string& root,
 // one that starts from the player's save, but it is far better than none.
 void start_oracle(StudioModel& model, const std::string& tool, const std::string& root,
                   const std::string& disc) {
-    std::vector<std::string> args = oracle_start_args(root, disc);
+    std::vector<std::string> args = oracle_start_args(model, root, disc);
     const bool has_card =
         std::find(args.begin(), args.end(), "--memcard") != args.end();
 
@@ -398,9 +456,10 @@ void start_oracle(StudioModel& model, const std::string& tool, const std::string
                 return;
             }
             model.append_log(
-                "[warn] this port's psxrecomp predates `start --memcard` — retrying "
-                "without the save card. Bump the psxrecomp pin to boot the oracle "
-                "from the player's own save.");
+                "[warn] this oracle manager does not take `start --memcard` — "
+                "retrying without the save card. On DuckStation that means the "
+                "port's psxrecomp predates the flag; bump its pin to boot from "
+                "the player's own save.");
             model.frm_oracle_note = "retrying without the memory card";
             run_python_script_async(model, tool, bare, done, true, JobSlot::Global);
         },
@@ -408,7 +467,18 @@ void start_oracle(StudioModel& model, const std::string& tool, const std::string
 }
 
 int oracle_port(const StudioModel& model) {
-    return model.frm_oracle.port ? model.frm_oracle.port : 4371;
+    if (model.frm_oracle.port) return model.frm_oracle.port;
+    // No status yet: fall back to the port the SELECTED oracle's manager pins,
+    // not DuckStation's, or the first query goes to a socket nothing is bound
+    // to and a healthy Beetle reads as down.
+    return model.frm_oracle_kind == OracleKind::Beetle ? 4380 : 4371;
+}
+
+// The manager script for the selected oracle. Both answer `status --json`,
+// `start` and `stop`; their status shapes differ and parse_oracle_status()
+// tells them apart.
+std::string oracle_tool_path(const StudioModel& model, const std::string& root) {
+    return gpu_tool_path(root, oracle_tool(model.frm_oracle_kind));
 }
 
 // Walk an ordering table out of guest RAM and show what the game BUILT, as
@@ -567,7 +637,7 @@ void draw_dlist_pane(StudioModel& model, const Theme& th, const std::string& roo
     ImGui::EndDisabled();
     if (!blocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", blocked.c_str());
+        wrapped(th.warn, "%s", blocked.c_str());
     }
     if (!model.frm_scan_note.empty()) muted(th, "%s", model.frm_scan_note.c_str());
 
@@ -618,7 +688,7 @@ void draw_dlist_pane(StudioModel& model, const Theme& th, const std::string& roo
 
     const DisplayList& dl = model.frm_dlist_oracle ? orc : nat;
     if (!dl.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", dl.error.c_str());
+        wrapped(th.bad, "%s", dl.error.c_str());
         return;
     }
     if (!dl.loaded) return;
@@ -756,11 +826,11 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
     ImGui::EndDisabled();
     if (!wblocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", wblocked.c_str());
+        wrapped(th.warn, "%s", wblocked.c_str());
     }
 
     const PacketWriters& pw = model.frm_writers_pkt;
-    if (!pw.error.empty()) ImGui::TextColored(th.bad, "%s", pw.error.c_str());
+    if (!pw.error.empty()) wrapped(th.bad, "%s", pw.error.c_str());
     if (pw.loaded && pw.absent) {
         ImGui::TextColored(th.warn,
             "%s is not on screen right now.", pw.klass.c_str());
@@ -933,7 +1003,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
     ImGui::EndDisabled();
     if (!iblocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", iblocked.c_str());
+        wrapped(th.warn, "%s", iblocked.c_str());
     } else if (!sel_ok) {
         ImGui::SameLine();
         muted(th, "select a colour-only row above");
@@ -941,7 +1011,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
 
     const ColourInputs& ci = model.frm_cinputs;
     if (ci.loaded && !ci.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", ci.error.c_str());
+        wrapped(th.bad, "%s", ci.error.c_str());
     } else if (ci.loaded) {
         muted(th, "oracle table at %s, scale = %d (%.3f)",
               ci.source_addr.c_str(), ci.scale, ci.scale / 128.0);
@@ -1116,13 +1186,13 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
         ImGui::EndDisabled();
         if (!cblocked.empty()) {
             ImGui::SameLine();
-            ImGui::TextColored(th.warn, "%s", cblocked.c_str());
+            wrapped(th.warn, "%s", cblocked.c_str());
         }
     }
 
     const ClassCensus& cen = model.frm_census;
     if (cen.loaded && !cen.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", cen.error.c_str());
+        wrapped(th.bad, "%s", cen.error.c_str());
     } else if (cen.loaded) {
         if (ImGui::BeginTable("##cen", 4, ImGuiTableFlags_Borders |
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
@@ -1213,12 +1283,12 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
     ImGui::EndDisabled();
     if (!lsblocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", lsblocked.c_str());
+        wrapped(th.warn, "%s", lsblocked.c_str());
     }
 
     const Lockstep& ls = model.frm_lockstep;
     if (ls.loaded && !ls.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", ls.error.c_str());
+        wrapped(th.bad, "%s", ls.error.c_str());
     } else if (ls.loaded) {
         muted(th, "frames %d..%d — %llu checked, %llu skipped",
               ls.window_lo, ls.window_hi,
@@ -1251,7 +1321,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
                 "compared, so recompilation is not the fault here.",
                 (unsigned long long)ls.checked);
         } else if (ls.found) {
-            ImGui::TextColored(th.bad, "FIRST DIVERGENCE (%s)", ls.kind.c_str());
+            wrapped(th.bad, "FIRST DIVERGENCE (%s)", ls.kind.c_str());
             ImGui::TextWrapped("%s", ls.meaning.empty()
                 ? "the interpreter and the compiled code produced different results"
                 : ls.meaning.c_str());
@@ -1340,7 +1410,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
         ImGui::EndDisabled();
         if (!sblocked.empty()) {
             ImGui::SameLine();
-            ImGui::TextColored(th.warn, "%s", sblocked.c_str());
+            wrapped(th.warn, "%s", sblocked.c_str());
         }
     } else {
         muted(th, "select a colour-only row above");
@@ -1348,7 +1418,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
 
     const ScaleTrace& st = model.frm_scale;
     if (st.loaded && !st.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", st.error.c_str());
+        wrapped(th.bad, "%s", st.error.c_str());
     } else if (st.loaded) {
         const auto side = [&](const char* label, const ScaleSide& s) {
             if (!s.loaded || !s.samples) {
@@ -1485,7 +1555,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
     ImGui::EndDisabled();
     if (!rblocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", rblocked.c_str());
+        wrapped(th.warn, "%s", rblocked.c_str());
     } else if (!have_range) {
         ImGui::SameLine();
         muted(th, "run Compare colour inputs first, or type a range");
@@ -1493,7 +1563,7 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
 
     const RangeWriters& rw = model.frm_range;
     if (rw.loaded && !rw.error.empty()) {
-        ImGui::TextColored(th.warn, "%s", rw.error.c_str());
+        wrapped(th.warn, "%s", rw.error.c_str());
     } else if (rw.loaded) {
         muted(th, "%d write(s) into %s..%s across %d frame(s), from %zu "
                   "instruction(s)",
@@ -1567,11 +1637,11 @@ void draw_shading_pane(StudioModel& model, const Theme& th, const std::string& r
     ImGui::EndDisabled();
     if (!gblocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", gblocked.c_str());
+        wrapped(th.warn, "%s", gblocked.c_str());
     }
 
     const GteCheck& g = model.frm_gte;
-    if (!g.error.empty()) ImGui::TextColored(th.bad, "%s", g.error.c_str());
+    if (!g.error.empty()) wrapped(th.bad, "%s", g.error.c_str());
     if (g.loaded) {
         if (g.verdict == "not-used") {
             ImGui::TextColored(th.good,
@@ -1681,7 +1751,7 @@ void draw_colour_pane(StudioModel& model, const Theme& th, const std::string& ro
     ImGui::EndDisabled();
     if (!blocked.empty()) {
         ImGui::SameLine();
-        ImGui::TextColored(th.warn, "%s", blocked.c_str());
+        wrapped(th.warn, "%s", blocked.c_str());
     }
     // The oracle is the other half of this comparison and it is easy to forget
     // to start it; say so here rather than letting the run come back one-sided.
@@ -1692,7 +1762,7 @@ void draw_colour_pane(StudioModel& model, const Theme& th, const std::string& ro
 
     const ColourParity& cp = model.frm_cparity;
     if (!cp.error.empty()) {
-        ImGui::TextColored(th.bad, "%s", cp.error.c_str());
+        wrapped(th.bad, "%s", cp.error.c_str());
         return;
     }
     if (!cp.loaded) return;
@@ -1790,7 +1860,7 @@ void draw_scan_pane(StudioModel& model, const Theme& th, const std::string& root
 
     const FrameScan& sc = model.frm_scan;
     if (!sc.loaded) {
-        if (!sc.error.empty()) ImGui::TextColored(th.bad, "%s", sc.error.c_str());
+        if (!sc.error.empty()) wrapped(th.bad, "%s", sc.error.c_str());
         return;
     }
     ImGui::Separator();
@@ -2181,7 +2251,7 @@ void draw_oracle_pane(StudioModel& model, const Theme& th, const std::string& ro
         if (orc_live) shoot(orc, "screenshot", orc_path, "shot");
     }
     if (!model.frm_shot_error.empty())
-        ImGui::TextColored(th.bad, "%s", model.frm_shot_error.c_str());
+        wrapped(th.bad, "%s", model.frm_shot_error.c_str());
 
     // side by side, because the whole point is telling them apart
     const float avail = ImGui::GetContentRegionAvail().x;
@@ -2297,7 +2367,7 @@ void draw_attribution(StudioModel& model, const Theme& th, FrameSummary& s) {
             if (!line.empty()) line += "   ";
             line += m + " x" + std::to_string(n);
         }
-        ImGui::TextColored(th.accent, "semi-transparency in use:  %s", line.c_str());
+        wrapped(th.accent, "semi-transparency in use:  %s", line.c_str());
     } else {
         ImGui::TextColored(th.warn,
                            "no semi-transparent primitives in this frame — if the "
@@ -2435,7 +2505,7 @@ void draw_diff_pane(StudioModel& model, const Theme& th) {
                            "No function stopped drawing and no blend mode disappeared.");
     } else {
         for (const auto& hl : d.headlines)
-            ImGui::TextColored(th.bad, "• %s", hl.c_str());
+            wrapped(th.bad, "• %s", hl.c_str());
     }
     ImGui::Separator();
 
@@ -2663,7 +2733,7 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
             ImGui::TextColored(th.text_muted,
                                "%s  —  start the game, then Connect.", dbg.summary.c_str());
         } else {
-            ImGui::TextColored(th.warn, "%s", dbg.summary.c_str());
+            wrapped(th.warn, "%s", dbg.summary.c_str());
             left_label("", 90.f);
             ImGui::TextColored(th.warn,
                                "Build tab -> Debug tools -> \"Configure for debugging\", "
@@ -3050,16 +3120,54 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
     ImGui::SameLine();
     ImGui::Checkbox("tint textures", &model.frm_tex_tint);
 
-    // ---- DuckStation oracle -------------------------------------------------
+    // ---- oracle -------------------------------------------------------------
     // Machine-wide, installed under the RetComM data root — one build serves
     // every title, which is why none of this takes a --root.
+    //
+    // Two of them, and they are not interchangeable. DuckStation answers about
+    // frames and memory (VRAM, GPU/DMA/IRQ state, breakpoints, pause/step);
+    // Beetle answers about traces (wtrace, rtrace, fntrace, SIO, CD commands)
+    // and registers none of DuckStation's. Neither is a superset, so this is a
+    // choice about what you are investigating, not a preference.
+    load_oracle_caps(model);
     if (!model.frm_oracle_queried) refresh_oracle(model, root);
 
     const OracleStatus& orc = model.frm_oracle;
     const bool orc_busy = model.busy_global.load();
-    const std::string orc_tool = gpu_tool_path(root, kOracleTool);
+    const std::string orc_tool = oracle_tool_path(model, root);
 
     left_label("Oracle", 90.f);
+    {
+        ImGui::SetNextItemWidth(140.f);
+        int kind = model.frm_oracle_kind == OracleKind::Beetle ? 1 : 0;
+        ImGui::BeginDisabled(orc_busy);
+        if (ImGui::Combo("##orc_kind", &kind, "DuckStation\0Beetle PSX\0")) {
+            const OracleKind want = kind == 1 ? OracleKind::Beetle
+                                              : OracleKind::DuckStation;
+            if (want != model.frm_oracle_kind) {
+                model.frm_oracle_kind = want;
+                // The old status describes the other emulator on the other
+                // port. Drop it rather than let a stale "answering" survive the
+                // switch and send the next tool at a socket nothing is bound to.
+                model.frm_oracle = OracleStatus{};
+                model.frm_oracle_queried = false;
+                model.frm_oracle_note.clear();
+                model.append_log(std::string("Oracle: ") + oracle_display(want) +
+                                 " (" + oracle_tool(want) + ")");
+            }
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "DuckStation — frames and memory: VRAM, GPU/DMA/IRQ state,\n"
+                "breakpoints, and the pause/step park the display-list tools need.\n\n"
+                "Beetle PSX — traces: write/read/function/SIO/CD-command traces\n"
+                "and the SPU rings. No pause and no VRAM readback.\n\n"
+                "Neither is a superset. A tool that needs the other one is greyed\n"
+                "out below with the reason.");
+        }
+        ImGui::SameLine();
+    }
     if (!orc.valid) {
         muted(th, "%s", orc.error.empty() ? "checking…" : orc.error.c_str());
     } else if (orc.answering) {
@@ -3084,13 +3192,33 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         ImGui::TextColored(th.text_muted, "installed, not running  ·  %s",
                            orc.root.c_str());
     } else {
-        ImGui::TextColored(th.warn, "not installed  (%s)", orc.state.c_str());
+        wrapped(th.warn, "not installed  (%s)", orc.state.c_str());
+    }
+    if (!orc.blockers.empty()) {
+        // Beetle's pinned beetle-psx tree is missing hooks that the committed
+        // patches do not carry (docs/beetle-linux.md says so outright). Naming
+        // them here is the difference between "the build failed" and a wall of
+        // C++ errors nobody traces back to a patch that was never complete.
+        std::string names;
+        for (const std::string& b : orc.blockers) {
+            if (!names.empty()) names += ", ";
+            names += b;
+        }
+        wrapped(th.warn, "missing upstream hooks: %s", names.c_str());
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "The committed beetle_*.patch files do not carry these hooks —\n"
+                "docs/beetle-linux.md records that they have to be re-landed by\n"
+                "hand from a prior beetle-psx tree. Traces that depend on them\n"
+                "will not fire.");
+        }
     }
 
     ImGui::SameLine();
     ImGui::BeginDisabled(orc_tool.empty() || orc_busy);
     if (!orc.installed) {
-        if (accent_button(th, "Set up DuckStation")) {
+        if (accent_button(th, (std::string("Set up ") +
+                              oracle_display(model.frm_oracle_kind)).c_str())) {
             model.frm_oracle_note =
                 "building the oracle — this takes about ten minutes; the rest of "
                 "Studio stays usable";
@@ -3105,7 +3233,9 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         }
     } else if (!orc.answering) {
         const std::string disc = game_disc_for(root);
-        ImGui::BeginDisabled(disc.empty());
+        const bool need_bios = model.frm_oracle_kind == OracleKind::Beetle;
+        const std::string bios = need_bios ? game_bios_for(root) : std::string();
+        ImGui::BeginDisabled(disc.empty() || (need_bios && bios.empty()));
         if (accent_button(th, "Start oracle")) {
             model.frm_oracle_note = "starting the oracle on " + disc;
             // Boots from a COPY of the game's memory card, so the oracle can
@@ -3119,6 +3249,10 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
             ImGui::SameLine();
             muted(th, "no [game] disc in game.toml — the oracle must boot the "
                       "same image psx-runtime does");
+        } else if (need_bios && bios.empty()) {
+            ImGui::SameLine();
+            muted(th, "no BIOS under psxrecomp/bios/ — Beetle loads one itself "
+                      "and exits without it");
         }
     } else {
         if (ImGui::Button("Stop oracle")) {

@@ -96,6 +96,14 @@ std::string frames_dir_for(const std::string& root);
 // tools must match the runtime that produced the dump.
 std::string gpu_tool_path(const std::string& root, const std::string& tool);
 
+// Generated oracle capability tables (tools/psx_analysis/oracle_caps.json).
+// Loaded once; a failure leaves the tables empty, which gates nothing.
+void load_oracle_caps(StudioModel& model);
+
+// Why `tool` cannot run against the currently selected oracle, or empty when
+// it can. Decided from the generated tables, never from a hand-kept list.
+std::string oracle_tool_blocker(const StudioModel& model, const std::string& tool);
+
 // Artifact loaders. Each fills `.error` and returns false rather than throwing,
 // because a half-written capture from a crashed run is a normal thing to open.
 bool load_frame_summary(FrameSummary& out, const std::string& path);

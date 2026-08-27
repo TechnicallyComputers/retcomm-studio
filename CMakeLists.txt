@@ -135,6 +135,9 @@ set(RETCOMM_STUDIO_SOURCES
     src/studio/studio_frames.cpp
     src/studio/studio_frames_data.cpp
     src/studio/studio_debug.cpp
+    src/studio/studio_snes.cpp
+    src/studio/studio_snes_functions.cpp
+    src/studio/studio_snes_data.cpp
 )
 
 # Windows .exe icon (explorer / taskbar) from assets/retcomm-studio.ico
@@ -239,6 +242,24 @@ add_executable(frames_load_test
 target_include_directories(frames_load_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(frames_load_test PRIVATE nlohmann_json::nlohmann_json)
+
+# ---- SNES Diagnostics data-path test ----------------------------------------
+# studio_snes_data.cpp is ImGui-free for the same reason the other data layers
+# are. With no argument it checks embedded fixtures; with a host and port it
+# also drives a live snesrecomp debug server over the bare line protocol, which
+# is what catches protocol drift between the runtime and this viewer:
+#   ./build/snes_load_test 127.0.0.1 4370
+add_executable(snes_load_test
+    tests/snes_load_test.cpp
+    src/studio/studio_snes_data.cpp
+    src/studio/studio_model.cpp
+)
+target_include_directories(snes_load_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(snes_load_test PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+    target_link_libraries(snes_load_test PRIVATE ws2_32)
+endif()
 
 # ---- detached-launch test ----------------------------------------------------
 # No GPU, no window, no game: spawns /bin/sh and checks the log redirection and

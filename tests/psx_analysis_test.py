@@ -140,6 +140,80 @@ def test_tools_import_only_siblings() -> None:
     check(not unresolved, f"every import resolves to a sibling or the stdlib ({unresolved[:4]})")
 
 
+def test_oracle_caps() -> None:
+    """The generated capability table, and that it still matches its sources."""
+    print("oracle capabilities")
+    import json
+    import subprocess
+
+    caps = TOOLS / "oracle_caps.json"
+    check(caps.is_file(), "oracle_caps.json is committed")
+    if not caps.is_file():
+        return
+    doc = json.loads(caps.read_text(encoding="utf-8"))
+    ds = set(doc["oracles"]["duckstation"]["commands"])
+    be = set(doc["oracles"]["beetle"]["commands"])
+    check(bool(ds) and bool(be), f"both tables are populated ({len(ds)} / {len(be)})")
+    # The split the Frames selector exists to expose. If either of these ever
+    # becomes false the two oracles are interchangeable and the selector is
+    # pointless — which would be worth knowing.
+    check("pause" in ds and "pause" not in be, "pause is DuckStation-only")
+    check("read_vram" in ds and "read_vram" not in be, "VRAM readback is DuckStation-only")
+    check("wtrace_dump" in be and "wtrace_dump" not in ds, "wtrace is Beetle-only")
+    check("rtrace_dump" in be and "rtrace_dump" not in ds, "rtrace is Beetle-only")
+    check("ping" in ds and "ping" in be, "both answer ping")
+
+    for key, want in (("duckstation", "duckstation_oracle.py"), ("beetle", "beetle_oracle.py")):
+        check((TOOLS / want).is_file(), f"{key} has its manager ({want})")
+        port = doc["oracles"][key]["port"]
+        pin = TOOLS / key / "pin.json"
+        if pin.is_file():
+            check(
+                json.loads(pin.read_text(encoding="utf-8"))["oracle_port"] == port,
+                f"{key} port {port} matches its manager's pin",
+            )
+
+    # Drift: regenerate into a compare and fail if the committed file is stale.
+    r = subprocess.run(
+        [sys.executable, str(TOOLS / "gen_oracle_caps.py"), "--check"],
+        capture_output=True, text=True,
+    )
+    check(r.returncode == 0, f"oracle_caps.json is current ({r.stderr.strip()[:90]})")
+
+
+def test_oracle_gating_is_sound() -> None:
+    """A tool is pinned to an oracle only by a command the RUNTIME lacks.
+
+    psx-runtime registers pause/step/wtrace_*/gpu_state too. Pinning on those
+    would grey out range_writers.py — a wtrace tool whose whole point is Beetle
+    — the moment DuckStation was selected, for a command that never went to an
+    oracle at all.
+    """
+    print("oracle gating")
+    import json
+
+    doc = json.loads((TOOLS / "oracle_caps.json").read_text(encoding="utf-8"))
+    check(doc.get("native_commands", 0) > 100,
+          f"the runtime's table was used as the exclusion set ({doc.get('native_commands')})")
+    pinned = {
+        name: v for name, v in doc["tools"].items()
+        if v["needs_duckstation"] or v["needs_beetle"]
+    }
+    check(bool(pinned), f"some tools are pinned ({len(pinned)})")
+    shared = {"pause", "continue", "step", "run_to_frame", "wtrace_dump",
+              "wtrace_reset", "gpu_state", "read_ram", "screenshot"}
+    leaked = {
+        name: sorted(set(v["needs_duckstation"] + v["needs_beetle"]) & shared)
+        for name, v in pinned.items()
+        if set(v["needs_duckstation"] + v["needs_beetle"]) & shared
+    }
+    check(not leaked, f"no tool is pinned by a command the runtime also serves ({leaked})")
+    check(
+        "range_writers.py" not in pinned,
+        "range_writers.py (a wtrace tool) is not pinned to DuckStation by its pause",
+    )
+
+
 def main() -> int:
     if not TOOLS.is_dir():
         print(f"FAIL  {TOOLS} is missing")
@@ -148,6 +222,8 @@ def main() -> int:
     test_sibling_layout()
     test_oracle_carries_its_patch()
     test_tools_import_only_siblings()
+    test_oracle_caps()
+    test_oracle_gating_is_sound()
     print("FAILED" if failures else "PASSED")
     return 1 if failures else 0
 
