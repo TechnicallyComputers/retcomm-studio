@@ -670,6 +670,8 @@ def op_merge_gitignore(root: Path, options: MigrateOptions) -> ApplyResult:
         "/saves/",
         "*.bin",
         "*.cue",
+        # Capture bundles embed disc-derived VRAM/RAM dumps.
+        "/analysis/",
     ]
     additions = []
     for pat in required:

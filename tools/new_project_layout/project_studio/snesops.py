@@ -83,6 +83,9 @@ GITIGNORE_RULES: tuple[str, ...] = (
     "/keybinds.ini",
     "/config.ini",
     "/input.ini",
+    # Capture bundles from tools/snes_analysis embed ROM-derived
+    # VRAM/CGRAM dumps — evidence, not source.
+    "/analysis/",
 )
 
 FRAMEWORK = "snesrecomp"
