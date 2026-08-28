@@ -55,6 +55,7 @@ const char* kDecodeTool = "snes_asset_decode.py";
 const char* kAttributeTool = "snes_frame_attribute.py";
 const char* kOracleTool = "mesen_oracle.py";
 const char* kLoopTool = "snes_loop_compare.py";
+const char* kSpriteDiffTool = "snes_sprite_diff.py";
 
 // The Lua probes. Each answers a different question and they are NOT
 // interchangeable, so the tab names the question rather than the file.
@@ -66,6 +67,11 @@ struct LuaScript {
 };
 
 const LuaScript kScripts[] = {
+    {"mesen_frames.lua", "Frame run (watch-triggered)",
+     "a RUN of consecutive frames, started when a WRAM marker matches "
+     "(GW_WATCH=ADDR=VAL) rather than at a frame number, because Mesen's "
+     "frame counter drifts by hundreds of frames between launches. Drive the "
+     "emulator by hand; it captures itself. GW_OAM=1 adds the sprite table", true},
     {"mesen_scene_sample.lua", "Scene sample",
      "periodic PPU state + screenshots, so a run can be aligned by picture "
      "rather than by frame number", true},
@@ -1014,6 +1020,39 @@ void draw_oracle_pane(StudioModel& model, const Theme& th) {
     }
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Sprite diff against the oracle");
+    {
+        const std::string sd = snes_tool_path(kSpriteDiffTool);
+        if (sd.empty()) {
+            wrapped(th.bad, "tools/snes_analysis/%s not found beside the toolkit.",
+                    kSpriteDiffTool);
+        } else {
+            ImGui::TextWrapped(
+                "For \"a sprite is wrong and I cannot say why\". Captures the "
+                "live runtime, gates on both being on the SAME screen, aligns "
+                "on pixels rather than frame numbers, and for each differing "
+                "frame says whether a sprite is MISSING from OAM (never "
+                "emitted) or MISPLACED (emitted at the wrong coordinates).");
+            ImGui::Spacing();
+            ImGui::TextWrapped(
+                "1. Drive Mesen by hand to the screen, capturing itself:");
+            ImGui::TextUnformatted(
+                "   GW_WATCH=0012=14 GW_COUNT=200 GW_OAM=1 GW_DIR=<dir> \\");
+            ImGui::TextUnformatted(
+                "     mesen-ce <rom> tools/snes_analysis/mesen_frames.lua");
+            ImGui::TextWrapped(
+                "2. Put snesrecomp on the same screen, then run:");
+            ImGui::Text("   python3 %s --oracle <dir> --count 300", sd.c_str());
+            ImGui::Spacing();
+            wrapped(th.text_muted,
+                "GW_WATCH is a WRAM marker, ADDR=VALUE in hex; 0012=14 is "
+                "Gundam Wing's pre-fight screen. Capture more than one full "
+                "animation cycle: a defect sitting at one phase of a long loop "
+                "is invisible to a short sample AND to a periodicity check.");
+        }
+    }
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Before a Lua script can write anything");
     ImGui::TextWrapped(
         "Set Debug > Script Window > AllowIoOsAccess = true, and set it while "
@@ -1104,7 +1143,7 @@ void draw_snes(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         if (!running && model.snes_launch_pid > 0) model.snes_launch_pid = 0;
 
         left_label("Game", 90.f);
-        const std::string exe = find_runtime_exe(bdir);
+        const std::string exe = selected_game_exe(model, root);
         if (running) {
             ImGui::TextColored(th.good, "running (pid %ld)", model.snes_launch_pid);
             ImGui::SameLine();
@@ -1123,6 +1162,10 @@ void draw_snes(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
                 std::vector<std::string> args;
                 const std::string rom = effective_rom(model);
                 if (!rom.empty()) args.push_back(rom);
+                // A ROM on the argv preloads the launcher; it no longer skips
+                // it. Ask for it explicitly anyway, so this keeps showing the
+                // launcher against a host built before that changed.
+                args.push_back("--launcher");
                 std::vector<std::pair<std::string, std::string>> env = {
                     {"SNESRECOMP_DEBUG_PORT", std::to_string(model.snes_port)},
                 };

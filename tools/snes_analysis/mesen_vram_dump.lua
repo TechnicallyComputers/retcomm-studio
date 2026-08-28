@@ -25,6 +25,18 @@ local DIR = os.getenv("GW_DIR") or "/tmp/mesen_dump"
 local FRAME = tonumber(os.getenv("GW_FRAME") or "") or 7500
 local EVERY = tonumber(os.getenv("GW_EVERY") or "") or 0
 
+-- Trigger mode. GW_FRAME only works when the frame number of the thing you
+-- want is known in advance, which it never is for a screen you have to play
+-- to. With GW_TRIGGER set, the script waits for that file to appear and dumps
+-- then -- so the scene is reached first and the capture armed afterwards.
+local TRIGGER = os.getenv("GW_TRIGGER")
+local function triggerPresent()
+  if not TRIGGER then return false end
+  local f = io.open(TRIGGER, "r")
+  if f then f:close(); return true end
+  return false
+end
+
 os.execute('mkdir -p "' .. DIR .. '"')
 
 local frame = 0
@@ -60,6 +72,12 @@ local function doDump(tag)
   os.remove(base .. "_oam.bin")
 
   dumpRegion(emu.memType.snesVideoRam, 0x10000, base .. "_vram.bin")
+  -- WRAM too: when VRAM differs, the next question is always whether the
+  -- bytes were already wrong in the staging buffer the DMA copies from, or
+  -- whether the buffer was right and the transfer read it at the wrong
+  -- moment. Without this the diff cannot tell those apart.
+  os.remove(base .. "_wram.bin")
+  dumpRegion(emu.memType.snesWorkRam, 0x20000, base .. "_wram.bin")
   dumpRegion(emu.memType.snesCgRam, 0x200, base .. "_cgram.bin")
   dumpRegion(emu.memType.snesSpriteRam, 0x220, base .. "_oam.bin")
 
@@ -99,6 +117,18 @@ end
 
 local function onFrame()
   frame = frame + 1
+  if TRIGGER then
+    -- Stat a few times a second, not every frame; a VRAM dump is expensive
+    -- enough that firing it twice would be worse than firing it late.
+    if (frame % 12) == 0 and triggerPresent() then
+      os.remove(TRIGGER)
+      doDump(string.format("f%06d", frame))
+    elseif (frame % 1200) == 0 then
+      emu.log("mesen_vram_dump: frame " .. frame ..
+              " (waiting for trigger " .. TRIGGER .. ")")
+    end
+    return
+  end
   if frame == FRAME then
     doDump(string.format("f%06d", frame))
   elseif EVERY > 0 and frame > FRAME and ((frame - FRAME) % EVERY) == 0 then
@@ -115,7 +145,11 @@ emu.addEventCallback(onFrame, emu.eventType.endFrame)
 -- never loaded" apart from "script loaded but never reached the frame".
 local hb = io.open(DIR .. "/loaded.txt", "w")
 if hb then
-  hb:write(string.format("loaded, target frame %d, every %d\n", FRAME, EVERY))
+  if TRIGGER then
+    hb:write(string.format("loaded, waiting for trigger %s\n", TRIGGER))
+  else
+    hb:write(string.format("loaded, target frame %d, every %d\n", FRAME, EVERY))
+  end
   hb:close()
 end
 

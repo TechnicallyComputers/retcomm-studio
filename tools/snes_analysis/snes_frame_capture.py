@@ -111,7 +111,11 @@ def capture(conn: DebugConn, outdir: str, tag: str, frame: int | None,
     # Attribution windows. Sized generously; the joiner filters by frame.
     oam_writes = conn.query(f"oam_write_get {trace_entries}")
     try:
-        vram_trace = conn.query("get_vram_trace")
+        # nostack keeps rows small so the newest window covers more frames.
+        # The server defaults to the NEWEST slice; older builds walked from the
+        # oldest and silently truncated, which returned boot-time rows for a
+        # capture taken thousands of frames later.
+        vram_trace = conn.query("get_vram_trace nostack")
     except DebugError as exc:
         vram_trace = {"unavailable": str(exc)}
     try:

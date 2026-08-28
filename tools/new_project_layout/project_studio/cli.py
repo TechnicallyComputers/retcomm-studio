@@ -1746,7 +1746,11 @@ def cmd_build_run(args: argparse.Namespace) -> int:
         if not rom_p.is_file():
             print(f"error: ROM not found: {rom_p}", file=sys.stderr)
             return 2
-        extra.append(str(rom_p))
+        # FIRST, not appended. Both the scaffolded host and the runner's
+        # snesrecomp_launcher_resolve_rom_sha256() read the ROM from argv[1],
+        # so a flag ahead of it (e.g. --args "--launcher") makes the ROM
+        # invisible to both and the host falls through to a file picker.
+        extra.insert(0, str(rom_p))
 
     def _log(line: str) -> None:
         # Piped into Studio — must flush or activity log stalls until buffer fill.

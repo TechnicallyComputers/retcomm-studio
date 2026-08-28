@@ -75,9 +75,25 @@ local function n(st, k)
   return v
 end
 
+local stopped = false
+
 local function onFrame()
   frame = frame + 1
-  if frame > UNTIL then return end
+  if frame > UNTIL then
+    -- Say so, once. This used to return silently, so a script left running
+    -- past GW_UNTIL looked identical to one that was recording: the window
+    -- stayed open, the game kept playing, and the CSV simply stopped growing
+    -- an hour earlier. Someone then drove to the exact scene they wanted and
+    -- captured nothing, with no indication anything was wrong.
+    if not stopped then
+      stopped = true
+      emu.log(string.format(
+        "mesen_scene_sample: STOPPED at GW_UNTIL=%d — no further rows or "
+        .. "screenshots will be written. Restart with a larger GW_UNTIL.",
+        UNTIL))
+    end
+    return
+  end
 
   if (frame % EVERY) == 0 then
     local st = emu.getState()

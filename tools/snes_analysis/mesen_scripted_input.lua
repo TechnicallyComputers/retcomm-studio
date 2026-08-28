@@ -100,6 +100,36 @@ local function dump(tag)
                           distinct, topv, topn))
     f:close()
   end
+  -- Full CGRAM, not just the census. A palette that ANIMATES per frame is
+  -- invisible in "distinct/top/topCount" -- those can be identical while
+  -- every entry has shifted one step along a glow ramp, which is exactly the
+  -- failure this was added to catch. The recomp side reads the same bytes
+  -- from get_frame_extended, so the two are directly comparable.
+  local cg = {}
+  for i = 0, 511 do cg[#cg + 1] = string.char(emu.read(i, emu.memType.snesCgRam) % 256) end
+  local cf = io.open(string.format("%s/%s_cgram.bin", DIR, tag), "wb")
+  if cf then cf:write(table.concat(cg)); cf:close() end
+
+  -- OAM as well, so each signal's frame alignment can be measured SEPARATELY.
+  -- A uniform one-frame shift of everything is invisible on screen; a shift of
+  -- the palette RELATIVE to the sprites is the visible defect. Only per-signal
+  -- offsets can tell those apart.
+  local oa = {}
+  for i = 0, 543 do oa[#oa + 1] = string.char(emu.read(i, emu.memType.snesSpriteRam) % 256) end
+  local af = io.open(string.format("%s/%s_oam.bin", DIR, tag), "wb")
+  if af then af:write(table.concat(oa)); af:close() end
+
+  -- Low WRAM ($7E:0000-1FFF), where the game's per-frame variables live.
+  -- When the two emulators disagree about what is ON SCREEN, this is the
+  -- fork: if guest WRAM matches, the divergence is downstream in the PPU/DMA
+  -- path; if it does not, the guest is executing differently and nothing in
+  -- the renderer will explain it. Only the low 8K -- 128K of emu.read per
+  -- frame is far too slow to run every frame.
+  local wr = {}
+  for i = 0, 0x1FFF do wr[#wr + 1] = string.char(emu.read(i, emu.memType.snesWorkRam) % 256) end
+  local wf = io.open(string.format("%s/%s_wram.bin", DIR, tag), "wb")
+  if wf then wf:write(table.concat(wr)); wf:close() end
+
   local png = emu.takeScreenshot()
   if png then
     local g = io.open(string.format("%s/%s.png", DIR, tag), "wb")
@@ -108,6 +138,11 @@ local function dump(tag)
   emu.log("dumped " .. tag .. " at frame " .. frame)
 end
 
+-- Per-frame trace of the handful of variables that decide what the game does
+-- each frame, written every frame rather than only at dump points. Finding
+-- the FIRST frame where the two runs disagree needs a continuous timeline;
+-- sampling only at the frames you already suspect cannot find it.
+--   $0A = NMI counter, $0E = vblank flag, $10 = NMI dispatch index
 emu.addEventCallback(function()
   frame = frame + 1
   if dumpAt[frame] then dump(string.format("f%06d", frame)) end

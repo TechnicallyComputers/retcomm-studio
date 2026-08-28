@@ -42,6 +42,11 @@ disc.cfg
 rom.cfg
 settings.toml
 
+# Diagnostic capture bundles (Frames tab / tools/psx_analysis). These embed
+# VRAM and RAM dumps taken from a running game — data derived from the disc,
+# for the same reason /generated/ is never committed. Evidence, not source.
+/analysis/
+
 # Ghidra / local analysis
 /ghidra/projects/
 *.gpr
