@@ -72,6 +72,12 @@ local function doDump(tag)
   os.remove(base .. "_oam.bin")
 
   dumpRegion(emu.memType.snesVideoRam, 0x10000, base .. "_vram.bin")
+  -- WRAM too: when VRAM differs, the next question is always whether the
+  -- bytes were already wrong in the staging buffer the DMA copies from, or
+  -- whether the buffer was right and the transfer read it at the wrong
+  -- moment. Without this the diff cannot tell those apart.
+  os.remove(base .. "_wram.bin")
+  dumpRegion(emu.memType.snesWorkRam, 0x20000, base .. "_wram.bin")
   dumpRegion(emu.memType.snesCgRam, 0x200, base .. "_cgram.bin")
   dumpRegion(emu.memType.snesSpriteRam, 0x220, base .. "_oam.bin")
 
