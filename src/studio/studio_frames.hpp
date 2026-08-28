@@ -88,6 +88,11 @@ std::string game_disc_for(const std::string& root);
 // exactly what the Build tab would.
 std::string find_runtime_exe(const std::string& build_dir);
 
+// The executable the Build tab would run: its Exe override when set, else the
+// ranked scan of its build directory. Use this for anything that launches the
+// game, so Build and both Diagnostics pages cannot disagree.
+std::string selected_game_exe(const StudioModel& model, const std::string& root);
+
 // <root>/analysis/frames — where captures land, next to the analyzer bundle.
 std::string frames_dir_for(const std::string& root);
 

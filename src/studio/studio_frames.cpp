@@ -2764,8 +2764,7 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         if (!running && model.frm_launch_pid > 0) model.frm_launch_pid = 0;
 
         left_label("Game", 90.f);
-        const std::string exe = find_runtime_exe(
-            (fs::path(root) / model.build_dir).string());
+        const std::string exe = selected_game_exe(model, root);
         if (running) {
             ImGui::TextColored(th.good, "running (pid %ld)", model.frm_launch_pid);
             ImGui::SameLine();

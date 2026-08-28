@@ -1143,7 +1143,7 @@ void draw_snes(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         if (!running && model.snes_launch_pid > 0) model.snes_launch_pid = 0;
 
         left_label("Game", 90.f);
-        const std::string exe = find_runtime_exe(bdir);
+        const std::string exe = selected_game_exe(model, root);
         if (running) {
             ImGui::TextColored(th.good, "running (pid %ld)", model.snes_launch_pid);
             ImGui::SameLine();
@@ -1162,6 +1162,10 @@ void draw_snes(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
                 std::vector<std::string> args;
                 const std::string rom = effective_rom(model);
                 if (!rom.empty()) args.push_back(rom);
+                // A ROM on the argv preloads the launcher; it no longer skips
+                // it. Ask for it explicitly anyway, so this keeps showing the
+                // launcher against a host built before that changed.
+                args.push_back("--launcher");
                 std::vector<std::pair<std::string, std::string>> env = {
                     {"SNESRECOMP_DEBUG_PORT", std::to_string(model.snes_port)},
                 };

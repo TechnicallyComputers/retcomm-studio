@@ -2517,9 +2517,22 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--env");
             args.push_back(model.build_env);
         }
-        if (model.build_launch_args[0]) {
+        // One --args, built here. Pushing a second one would silently win and
+        // drop whatever the user typed in the Launch args field.
+        std::string extra = model.build_launch_args;
+        if (snes) {
+            // Launching from Studio is a person pressing a button, so the
+            // pre-boot launcher belongs on screen. A ROM on the argv used to
+            // suppress it, which meant it never appeared from here at all.
+            if (extra.find("--launcher") == std::string::npos &&
+                extra.find("--no-launcher") == std::string::npos) {
+                if (!extra.empty()) extra += " ";
+                extra += "--launcher";
+            }
+        }
+        if (!extra.empty()) {
             args.push_back("--args");
-            args.push_back(model.build_launch_args);
+            args.push_back(extra);
         }
         // A cartridge runner takes the ROM as a positional; without it the game
         // prints its usage and exits 1. This is the same path Migrate recorded

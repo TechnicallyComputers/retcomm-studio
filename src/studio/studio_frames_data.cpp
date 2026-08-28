@@ -450,6 +450,29 @@ bool is_executable_file(const fs::path& p) {
 
 } // namespace
 
+// The executable the BUILD TAB would run, for this project.
+//
+// Both Diagnostics pages used to call find_runtime_exe() on the build
+// directory and stop there, which quietly ignored the Build tab's explicit
+// Exe override: you would point Build at one binary, launch from Diagnostics,
+// and get whichever one the directory scan happened to rank first. Same
+// resolution order as buildops.launch() (`exe_path = Path(exe) if exe else
+// find_runtime_exe(bdir)`), so all three launch paths agree on what "the
+// build" means.
+std::string selected_game_exe(const StudioModel& model, const std::string& root) {
+    std::error_code ec;
+    if (model.build_exe[0]) {
+        fs::path e(model.build_exe);
+        if (!e.is_absolute() && !root.empty()) e = fs::path(root) / e;
+        if (fs::is_regular_file(e, ec)) return e.string();
+        // A stale override is worth falling back from rather than failing on:
+        // the directory scan still finds a real binary, and the Build tab is
+        // where that field gets corrected.
+    }
+    if (root.empty()) return {};
+    return find_runtime_exe((fs::path(root) / model.build_dir).string());
+}
+
 std::string find_runtime_exe(const std::string& build_dir) {
     if (build_dir.empty()) return {};
     std::error_code ec;
