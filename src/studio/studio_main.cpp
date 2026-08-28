@@ -673,6 +673,12 @@ void apply_pending_picks(StudioModel& model) {
             persist_selected_image(model);
         } else if (target == "np_disc") {
             std::snprintf(model.np_disc, sizeof(model.np_disc), "%s", file.c_str());
+        } else if (target.rfind("np_disc", 0) == 0 && target.size() == 8 &&
+                   target[7] >= '2' && target[7] <= '0' + StudioModel::kMaxDiscs) {
+            // "np_disc2".."np_disc<kMaxDiscs>" — discs 2..N of a PSX set.
+            const int idx = (target[7] - '0') - 2;
+            std::snprintf(model.np_disc_extra[idx], sizeof(model.np_disc_extra[idx]),
+                          "%s", file.c_str());
         } else if (target == "np_bios") {
             std::snprintf(model.np_bios, sizeof(model.np_bios), "%s", file.c_str());
         } else if (target == "build_scph") {
@@ -1406,10 +1412,59 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                  kLabelW, "…##np_parent"))
         pick_folder(model, window, "np_parent");
     field_row("##np_name", "Name", model.np_name, sizeof(model.np_name), kLabelW);
-    if (path_row("##np_disc", platform_image_label(model.platform), model.np_disc,
-                 sizeof(model.np_disc), kLabelW, "…##np_disc"))
-        pick_file(model, window, "np_disc", platform_image_filter_name(model.platform),
-                  platform_image_filter_ext(model.platform));
+    // A cartridge is one image, so the whole disc-set group is PSX-only. On
+    // SNES np_disc carries the ROM and the count is pinned to 1.
+    if (snes) model.np_disc_count = 1;
+    if (!snes) {
+        left_label("Discs", kLabelW);
+        char disc_preview[8];
+        std::snprintf(disc_preview, sizeof(disc_preview), "%d", model.np_disc_count);
+        ImGui::SetNextItemWidth(140.f);
+        if (ImGui::BeginCombo("##np_disc_count", disc_preview)) {
+            for (int n = 1; n <= StudioModel::kMaxDiscs; ++n) {
+                char lab[8];
+                std::snprintf(lab, sizeof(lab), "%d", n);
+                const bool sel = (model.np_disc_count == n);
+                if (ImGui::Selectable(lab, sel)) {
+                    model.np_disc_count = n;
+                    // Clear the rows this hides: a path the user can no longer
+                    // see must not still be submitted.
+                    for (int i = n - 1; i < StudioModel::kMaxDiscs - 1; ++i)
+                        model.np_disc_extra[i][0] = '\0';
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (model.np_disc_count > 1) {
+            ImGui::SameLine();
+            ImGui::TextColored(th.text_muted, "in disc order, boot disc first");
+        }
+    }
+    {
+        // With a set, the first field is "Disc 1" rather than just "Disc .cue".
+        const char* disc1_label = (!snes && model.np_disc_count > 1)
+                                      ? "Disc 1 (.cue)"
+                                      : platform_image_label(model.platform);
+        if (path_row("##np_disc", disc1_label, model.np_disc, sizeof(model.np_disc),
+                     kLabelW, "…##np_disc"))
+            pick_file(model, window, "np_disc", platform_image_filter_name(model.platform),
+                      platform_image_filter_ext(model.platform));
+    }
+    if (!snes) {
+        for (int i = 0; i + 1 < model.np_disc_count && i < StudioModel::kMaxDiscs - 1; ++i) {
+            char row_id[32], browse_id[32], label[32], target[32];
+            std::snprintf(row_id, sizeof(row_id), "##np_disc%d", i + 2);
+            std::snprintf(browse_id, sizeof(browse_id), "…##np_disc%d", i + 2);
+            std::snprintf(label, sizeof(label), "Disc %d (.cue)", i + 2);
+            std::snprintf(target, sizeof(target), "np_disc%d", i + 2);
+            if (path_row(row_id, label, model.np_disc_extra[i],
+                         sizeof(model.np_disc_extra[i]), kLabelW, browse_id))
+                pick_file(model, window, target,
+                          platform_image_filter_name(model.platform),
+                          platform_image_filter_ext(model.platform));
+        }
+    }
     // A cartridge boots from its own reset vector: there is no BIOS to supply.
     if (!snes) {
         if (path_row("##np_bios", "BIOS", model.np_bios, sizeof(model.np_bios), kLabelW,
@@ -1605,9 +1660,19 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     if (!snes) ImGui::SameLine();
     accent_button(th);
     if (ImGui::Button("Create project")) {
+        int blank_disc = 0;
+        if (!snes) {
+            for (int i = 0; i + 1 < model.np_disc_count &&
+                            i < StudioModel::kMaxDiscs - 1; ++i) {
+                if (!model.np_disc_extra[i][0]) { blank_disc = i + 2; break; }
+            }
+        }
         if (!model.np_name[0] || !model.np_parent[0] || !model.np_disc[0]) {
             model.append_log(std::string("[FAIL] Need parent, name, and ") +
                              platform_image_label(model.platform));
+        } else if (blank_disc) {
+            model.append_log("[FAIL] Disc " + std::to_string(blank_disc) +
+                             " is empty — pick it, or lower the disc count");
         } else if (snes) {
             std::vector<std::string> args = {
                 "new-project",
@@ -1692,6 +1757,13 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "--players",
                 std::to_string(model.np_players),
             };
+            // Discs 2..N, in order. The toolkit verifies the set and refuses
+            // one that needs N programs, so this only has to pass them along.
+            for (int i = 0; i + 1 < model.np_disc_count &&
+                            i < StudioModel::kMaxDiscs - 1; ++i) {
+                args.push_back("--disc");
+                args.push_back(model.np_disc_extra[i]);
+            }
             if (model.np_bios[0]) {
                 args.push_back("--bios");
                 args.push_back(model.np_bios);

@@ -509,9 +509,13 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         validate_options,
     )
 
+    # --disc / --rom both append, so args.disc is a list in disc order.
+    _np_discs = [d.strip() for d in (args.disc or []) if (d or "").strip()]
+
     opts = NewProjectOptions(
         name=(args.name or "").strip(),
-        disc=(args.disc or "").strip(),
+        disc=_np_discs[0] if _np_discs else "",
+        extra_discs=_np_discs[1:],
         parent_dir=(args.dir or ".").strip(),
         bios=(getattr(args, "bios", None) or "").strip(),
         boot_exe=(getattr(args, "boot_exe", None) or "").strip(),
@@ -2116,14 +2120,25 @@ def build_parser() -> argparse.ArgumentParser:
     # Not argparse-required: --rom is a second action on the same dest, and
     # argparse enforces required per action, so --rom alone would still fail.
     # validate_options() reports the missing image with a platform-correct name.
+    # Repeatable, so args.disc is always a list. On PSX the repeats are discs
+    # 2..N of a set; SNES still takes exactly one image and validate_options
+    # rejects extras there.
     p_np.add_argument(
         "--disc",
-        default="",
-        help="Game image: Redump .cue (psx) or ROM .sfc/.smc (snes)",
+        action="append",
+        default=None,
+        metavar="IMAGE",
+        help="Game image: Redump .cue (psx) or ROM .sfc/.smc (snes). "
+             "Repeatable on PSX for a multi-disc title — pass in disc order, "
+             "boot disc first (max 4).",
     )
     # --rom reads better for a cartridge and writes the same field. One field,
     # because a project has one game image and two would let them disagree.
-    p_np.add_argument("--rom", dest="disc", help="Alias for --disc (SNES)")
+    # It must append too: mixing a store action into an append dest would make
+    # args.disc a string on one path and a list on the other.
+    p_np.add_argument(
+        "--rom", dest="disc", action="append", help="Alias for --disc (SNES)"
+    )
     p_np.add_argument(
         "--dir",
         default=".",

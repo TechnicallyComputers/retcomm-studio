@@ -8,12 +8,18 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import platforms, snes_paths
 from .gitops import CmdResult, switch_modules
 from .paths import toolkit_dir
+
+# Upper bound on a PSX disc set. Four covers every PS1 release we know of; the
+# setup scripts have no limit of their own, so this is the one place that
+# decides how many rows the UI offers. SNES has no equivalent — a cartridge is
+# one image.
+MAX_DISCS = 4
 
 
 @dataclass
@@ -22,6 +28,11 @@ class NewProjectOptions:
 
     name: str = ""
     disc: str = ""
+    # PSX only: discs 2..N of a multi-disc set, in disc order. `disc` stays the
+    # boot disc (and the ROM path on SNES), so every single-image caller is
+    # unaffected. setup_project verifies the set before creating anything and
+    # refuses one that needs N programs.
+    extra_discs: list[str] = field(default_factory=list)
     parent_dir: str = ""
     bios: str = ""
     boot_exe: str = ""
@@ -63,6 +74,21 @@ class NewProjectOptions:
     enable_rollback: bool = False
 
     dry_run: bool = False
+
+
+def all_discs(opts: NewProjectOptions) -> list[str]:
+    """Boot disc first, then discs 2..N. Blank rows are dropped."""
+    out = []
+    for d in [opts.disc, *(opts.extra_discs or [])]:
+        d = (d or "").strip()
+        if d:
+            out.append(d)
+    return out
+
+
+def resolved_discs(opts: NewProjectOptions) -> list[str]:
+    """all_discs() as absolute paths, ready to hand to the setup script."""
+    return [str(Path(d).expanduser().resolve()) for d in all_discs(opts)]
 
 
 def setup_script_paths() -> tuple[Path, Path]:
@@ -122,6 +148,36 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
             errs.append(f"{'ROM' if snes else 'Disc'} not found: {disc}")
         elif snes and p.suffix.lower() not in profile.image_exts:
             errs.append(f"Not a SNES ROM (expected .sfc / .smc): {p.name}")
+
+    # Multi-disc is a PSX-only notion: a cartridge is one image.
+    extras = [d for d in (opts.extra_discs or [])]
+    if extras and snes:
+        errs.append("A SNES project has one ROM — extra discs do not apply")
+    elif extras:
+        if len(extras) + 1 > MAX_DISCS:
+            errs.append(f"At most {MAX_DISCS} discs are supported")
+        for i, raw in enumerate(extras, start=2):
+            d = (raw or "").strip()
+            if not d:
+                errs.append(
+                    f"Disc {i} .cue path is required (or reduce the disc count)"
+                )
+                continue
+            if not Path(d).expanduser().is_file():
+                errs.append(f"Disc {i} not found: {d}")
+        seen: dict[str, int] = {}
+        for i, raw in enumerate([disc, *extras], start=1):
+            d = (raw or "").strip()
+            if not d:
+                continue
+            try:
+                key = str(Path(d).expanduser().resolve())
+            except OSError:
+                key = d
+            if key in seen:
+                errs.append(f"Disc {i} is the same file as disc {seen[key]}: {d}")
+            else:
+                seen[key] = i
     if opts.bios and not snes:
         bp = Path(opts.bios).expanduser()
         if not bp.is_file():
@@ -273,8 +329,15 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
             "Bypass",
             "-File",
             str(ps1),
+            # -Disc is [string[]], but an array cannot be passed reliably
+            # through `powershell -File`: subprocess quotes any argument
+            # containing a space, and PowerShell then binds the whole quoted
+            # token as ONE element. Disc paths routinely contain spaces, so a
+            # comma-joined list would silently become a single bogus path.
+            # The script splits a lone argument on "|", which is one of the
+            # characters Windows forbids in a path, so it cannot be ambiguous.
             "-Disc",
-            str(Path(opts.disc).expanduser().resolve()),
+            "|".join(resolved_discs(opts)),
             "-Name",
             opts.name.strip(),
             "-Yes",
@@ -331,8 +394,10 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
         "sh",
         str(sh),
         "--yes",
-        "--disc",
-        str(Path(opts.disc).expanduser().resolve()),
+    ]
+    for _d in resolved_discs(opts):
+        cmd += ["--disc", _d]
+    cmd += [
         "--name",
         opts.name.strip(),
         "--players",

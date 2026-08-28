@@ -754,6 +754,12 @@ struct StudioModel {
     char np_name[256] = {};
     char np_parent[1024] = {};
     char np_disc[1024] = {};
+    // PSX multi-disc. np_disc stays disc 1 (and the ROM path on SNES); these
+    // are discs 2..kMaxDiscs, shown only when np_disc_count says so. A SNES
+    // cartridge is one image, so the whole group is hidden there.
+    static constexpr int kMaxDiscs = 4;
+    char np_disc_extra[kMaxDiscs - 1][1024] = {};
+    int np_disc_count = 1;
     char np_bios[1024] = {};
     char np_zip[128] = {};
     char np_desc[512] = {};
