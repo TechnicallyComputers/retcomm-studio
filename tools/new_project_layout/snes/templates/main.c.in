@@ -312,6 +312,86 @@ static int game_pad_name_to_button(const char *name)
 /* Parse [GamepadMap] Controls from config.ini beside the executable, then the
  * working directory. Absent or malformed leaves the defaults in place — a
  * missing config must not silently unbind the pad. */
+/* ── Video pacing ─────────────────────────────────────────────────────────
+ *
+ * The SNES field rate is 60.0988 Hz, and a desktop display is almost never
+ * exactly that. With vsync on, SDL_RenderPresent blocks on the monitor and
+ * the guest advances one frame per refresh, so the two rates beat: measured
+ * here at 59.9985 fps against a 60.00 Hz panel, which duplicates one frame
+ * every 10.0 seconds. On a screen whose animation loops on a 128-frame cycle
+ * that reads as an intermittent stutter -- and it is invisible to every
+ * framebuffer capture, because the composited frame is correct and simply
+ * gets shown twice.
+ *
+ * So vsync is a setting rather than a constant. Absent from config.ini it
+ * stays on (the previous behaviour); this game ships it off, because the
+ * title is known to pace badly against vsync on hardware emulators too.
+ * With it off the loop must pace itself -- otherwise it free-runs. */
+#define GAME_FPS 60.0988
+
+static int g_vsync = 1;
+
+static int game_config_int(const char *section, const char *key, int fallback)
+{
+    static const char *paths[] = {"config.ini", "../config.ini"};
+    size_t p;
+    for (p = 0; p < sizeof(paths) / sizeof(paths[0]); ++p) {
+        FILE *f = fopen(paths[p], "rb");
+        char line[512];
+        int in_section = 0;
+        if (!f)
+            continue;
+        while (fgets(line, sizeof(line), f)) {
+            char *s = line, *eq;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '[') {
+                in_section = (SDL_strncasecmp(s, section, strlen(section)) == 0);
+                continue;
+            }
+            if (!in_section || *s == '#' || *s == ';')
+                continue;
+            eq = strchr(s, '=');
+            if (!eq)
+                continue;
+            *eq = 0;
+            {
+                char *k = s, *v = eq + 1, *end = k + strlen(k);
+                while (end > k && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+                if (SDL_strcasecmp(k, key) == 0) {
+                    int out = atoi(v);
+                    fclose(f);
+                    return out;
+                }
+            }
+        }
+        fclose(f);
+    }
+    return fallback;
+}
+
+/* Pace the loop on the SNES clock when the display is not doing it for us.
+ * Accumulates in floating point so the 0.0988 does not get truncated away --
+ * rounding to a whole 16 ms would reintroduce the same beat this exists to
+ * avoid. Resynchronises rather than spiralling if a frame runs long. */
+static void game_frame_limit(void)
+{
+    static double next_ms = 0.0;
+    double now = (double)SDL_GetTicks();
+    if (next_ms == 0.0)
+        next_ms = now;
+    next_ms += 1000.0 / GAME_FPS;
+    if (next_ms > now) {
+        double wait = next_ms - now;
+        if (wait > 100.0) {          /* clock jumped; do not sleep for ever */
+            next_ms = now;
+            return;
+        }
+        SDL_Delay((Uint32)wait);
+    } else if (now - next_ms > 100.0) {
+        next_ms = now;               /* fell far behind; drop the debt */
+    }
+}
+
 static void game_load_pad_map(void)
 {
     static const char *paths[] = {"config.ini", "../config.ini"};
@@ -659,8 +739,11 @@ int main(int argc, char **argv)
     }
     window = snesrecomp_sdl_create_window("@WINDOW_TITLE@", GAME_WIDTH * 3,
                                           GAME_HEIGHT * 3, 0);
-    renderer = window ? snesrecomp_sdl_create_renderer(window, false, true)
+    g_vsync = game_config_int("[Video]", "Vsync", 1) != 0;
+    renderer = window ? snesrecomp_sdl_create_renderer(window, false, g_vsync)
                       : NULL;
+    fprintf(stderr, "[video] vsync %s (config.ini [Video] Vsync)\n",
+            g_vsync ? "on" : "off - pacing on the 60.0988 Hz SNES clock");
     texture = renderer
         ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
                             SDL_TEXTUREACCESS_STREAMING,
@@ -741,6 +824,8 @@ int main(int argc, char **argv)
         }
         RtlRunFrame(inputs);
         game_present(renderer, texture, 1);
+        if (!g_vsync)
+            game_frame_limit();
     }
 
     game_close_pads();
