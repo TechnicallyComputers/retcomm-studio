@@ -60,7 +60,7 @@
       "display": "Beetle PSX",
       "port": 4380,
       "blurb": "Traces: write, read, function, SIO, CD-command and device traces, plus SPU/audio rings. No pause and no VRAM readback.",
-      "source": "/home/alex/Documents/GitHub/psxrecomp/runtime/src/beetle_debug_server.c",
+      "source": "runtime/src/beetle_debug_server.c@origin/master",
       "commands": [
         "audio_events",
         "audio_stats",
@@ -126,8 +126,8 @@
       ]
     }
   },
-  "native_commands": 295,
-  "native_source": "/home/alex/Documents/GitHub/psxrecomp/runtime/src/debug_server.c",
+  "native_commands": 297,
+  "native_source": "runtime/src/debug_server.c@origin/master",
   "tools": {
     "cd_diff.py": {
       "oracle_facing": true,

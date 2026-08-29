@@ -34,14 +34,24 @@ from pathlib import Path
 
 # Fields that together identify the *program* a disc boots. If these agree
 # across every disc, one recompiled program covers the whole set.
+#
+# `serial` and `boot_exe` are deliberately NOT here. They name the DISC, not
+# the program: Final Fantasy VII ships ONE byte-identical executable on three
+# discs as SCUS_941.63/.64/.65 under serials SCUS-94163/64/65, so comparing
+# those strings reported three programs where there is one, and refused a set
+# the framework can already build. `boot_exe_sha256` is the program's own
+# identity and answers the question the refusal is actually asking.
 PROGRAM_FIELDS = (
-    "serial",
-    "boot_exe",
+    "boot_exe_sha256",
     "entry_pc",
     "load_address",
     "text_size",
     "stack_base",
 )
+
+# Per-disc identity. Recorded in disc_set.json and shown in the summary, but
+# never used to decide how many programs a set needs.
+DISC_IDENTITY_FIELDS = ("serial", "boot_exe")
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -181,6 +191,24 @@ def main() -> int:
 
     # --- data-only vs N-programs -------------------------------------------
     first = probes[0]
+
+    # A missing hash must not read as "these agree". Empty compares equal to
+    # empty, so a probe that failed to extract the executable would silently
+    # turn N programs into one -- the exact silent-wrong-answer this gate is
+    # here to prevent. Refuse to judge instead.
+    missing = [i for i, p in enumerate(probes, start=1)
+               if not str(p.get("boot_exe_sha256") or "").strip()]
+    if missing:
+        print()
+        sys.stdout.flush()
+        print("error: cannot tell how many programs this set needs.", file=sys.stderr)
+        print(f"  disc(s) {', '.join(str(i) for i in missing)} have no "
+              f"boot_exe_sha256 — the probe could not read the boot executable.",
+              file=sys.stderr)
+        print("  Re-probe with a current probe_disc.py; refusing to guess.",
+              file=sys.stderr)
+        return EXIT_INCOHERENT
+
     differing: list[str] = []
     for field in PROGRAM_FIELDS:
         values = {str(p.get(field) or "") for p in probes}
@@ -255,9 +283,18 @@ def main() -> int:
 
     if verdict == "data-only":
         print()
+        serials = [str(p.get("serial") or "?") for p in probes]
+        if len(set(serials)) > 1:
+            print(
+                f"  note: {len(set(serials))} serials in this set "
+                f"({', '.join(serials)}) carrying one identical executable — "
+                "normal for a multi-disc title, and why the program hash and "
+                "not the serial decides this."
+            )
         print(
-            f"  all {count} discs boot {first.get('boot_exe')} "
-            f"({first.get('serial')}) — one program covers the set."
+            f"  all {count} discs boot the same program "
+            f"(sha256 {str(first.get('boot_exe_sha256') or '')[:12]}…) — one "
+            f"program covers the set."
         )
         print(
             "  Scaffolding that program now. Mounting the later discs at "

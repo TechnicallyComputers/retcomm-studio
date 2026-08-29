@@ -866,6 +866,25 @@ else
     echo "  will extract boot EXE only into disc/"
 fi
 
+# game.toml carries every image of a data-only set, not just the boot disc.
+# The loader has accepted `discs = [...]` all along; nothing was writing it, so
+# a verified three-disc set still described one disc and the other two lived
+# only in disc_set.json.
+#
+# Passed as a FILE, one path per line, not as repeated flags: these filenames
+# routinely contain spaces and parentheses ("Final Fantasy VII (USA) (Disc
+# 2).cue"), and an unquoted expansion of accumulated flags word-splits every
+# one of them.
+EXTRA_DISC_LIST=""
+if [ -n "$EXTRA_DISCS" ]; then
+    EXTRA_DISC_LIST="$SET_TMP/extra_discs.txt"
+    : > "$EXTRA_DISC_LIST"
+    printf '%s\n' "$EXTRA_DISCS" | while IFS= read -r _extra; do
+        [ -n "$_extra" ] || continue
+        printf '%s\n' "disc/$(basename "$_extra")" >> "$EXTRA_DISC_LIST"
+    done
+fi
+
 case "$DISC_BASENAME" in
     *.cue|*.CUE)
         echo "== Probing disc (identity + seeds + TOC fp) =="
@@ -876,6 +895,7 @@ case "$DISC_BASENAME" in
             --write-seeds "$ROOT/seeds/ghidra_funcs.txt" \
             --write-boot-exe "$ROOT/disc" \
             --disc-rel "$DISC_TOML_PATH" \
+            ${EXTRA_DISC_LIST:+--extra-disc-list "$EXTRA_DISC_LIST"} \
             --out-dir disc \
             --players "$PLAYERS" \
             --display-name "$GAME_NAME" \

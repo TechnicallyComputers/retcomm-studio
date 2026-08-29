@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -88,8 +89,9 @@ def find_psxrecomp(explicit: str | None) -> Path | None:
 def beetle_commands(root: Path | None) -> tuple[list[str], str]:
     if root is None:
         return [], ""
-    src = root / "runtime" / "src" / "beetle_debug_server.c"
-    text = src.read_text(encoding="utf-8", errors="replace")
+    text, src = _read_pinned(root, "runtime/src/beetle_debug_server.c")
+    if not text:
+        return [], ""
     m = _BEETLE_TABLE.search(text)
     if not m:
         raise SystemExit(
@@ -97,7 +99,27 @@ def beetle_commands(root: Path | None) -> tuple[list[str], str]:
             "  The dispatch table moved or changed shape. Fix this parser rather\n"
             "  than hand-writing the list it produces."
         )
-    return sorted(set(_BEETLE_CMD.findall(m.group(1)))), str(src)
+    return sorted(set(_BEETLE_CMD.findall(m.group(1)))), src
+
+
+def _read_pinned(root: Path, rel: str) -> tuple[str, str]:
+    """File contents from a FIXED ref, falling back to the working tree.
+
+    The psxrecomp checkout is shared, and other sessions switch branches in it
+    while this runs — which silently changed the native command count and made
+    `--check` fail for reasons that had nothing to do with this repo. Reading a
+    pinned ref makes the generated table reproducible no matter what anyone has
+    checked out.
+    """
+    for ref in ("origin/master", "master"):
+        r = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{rel}"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout:
+            return r.stdout, f"{rel}@{ref}"
+    path = root / rel
+    if path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace"), f"{rel}@working-tree"
+    return "", ""
 
 
 def native_commands(root: Path | None) -> tuple[list[str], str]:
@@ -114,13 +136,13 @@ def native_commands(root: Path | None) -> tuple[list[str], str]:
     """
     if root is None:
         return [], ""
-    src = root / "runtime" / "src" / "debug_server.c"
-    if not src.is_file():
+    text, src = _read_pinned(root, "runtime/src/debug_server.c")
+    if not text:
         return [], ""
-    m = _NATIVE_TABLE.search(src.read_text(encoding="utf-8", errors="replace"))
+    m = _NATIVE_TABLE.search(text)
     if not m:
         return [], ""
-    return sorted(set(_BEETLE_CMD.findall(m.group(1)))), str(src)
+    return sorted(set(_BEETLE_CMD.findall(m.group(1)))), src
 
 
 # What each oracle is FOR, in one line, shown beside the selector. Editorial,

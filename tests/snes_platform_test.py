@@ -177,6 +177,102 @@ def test_plan_and_apply(root: Path) -> None:
     check(ids["generated"] == "pass", "re-audit: generated C now passes")
 
 
+def test_parity_checks(root: Path) -> None:
+    """The PSX-parity additions: identity, codegen_setup, boxart, README,
+    legacy classification, checkout repair diagnosis, and probe gating."""
+    print("parity checks")
+    from project_studio import snesops
+
+    # make_repo committed generated C → the legacy layout class.
+    before = snesops.audit_project(root)
+    check(before.layout.value == "legacy-packaging",
+          "committed generated C classifies as legacy-packaging")
+
+    by_id = {c.id: c for c in before.checks}
+    check(by_id["rom_identity"].status.value == "warn",
+          "no recoverable digests → ROM identity warns")
+    check(by_id["rom_identity"].fix_op == "snes_probe_rom_refresh",
+          "identity warn names the probe op")
+    check(by_id["codegen_setup"].status.value == "fail",
+          "missing codegen_setup fails")
+    check(by_id["codegen_setup"].fix_op is None,
+          "codegen_setup is NOT offered as a fix without digests")
+    check(by_id["boxart"].status.value == "warn", "no boxart warns (optional)")
+    check(by_id["readme_metrics"].status.value == "warn",
+          "bare README warns with the metrics op")
+
+    # Digest recovery unlocks codegen emission.
+    (root / "src" / "codegen_setup.c").write_text(
+        '#include "codegen_setup.h"\n'
+        "const GameCodegenIdentity kGameCodegenIdentity = {\n"
+        '    .display_name   = "Zed",\n'
+        '    .rom_file       = "Zed (World).sfc",\n'
+        '    .expected_crc32 = "12345678",\n'
+        '    .expected_sha256= "aa" ,\n'
+        '    .mapping        = "lorom",\n'
+        '    .region         = "NTSC",\n'
+        "};\n",
+        encoding="utf-8",
+    )
+    ident = snesops.rom_identity(root)
+    check(ident.get("crc32") == "12345678", "digests recover from codegen_setup.c")
+    check(ident.get("mapping") == "lorom", "mapping recovers from codegen_setup.c")
+    mid = {c.id: c for c in snesops.audit_project(root).checks}
+    check(mid["rom_identity"].status.value == "pass",
+          "identity passes once recoverable")
+    check(mid["codegen_setup"].status.value == "fail",
+          "codegen_setup.c without its header still fails (build needs both)")
+    check(mid["codegen_setup"].fix_op == "snes_emit_codegen_setup",
+          "and now names the emit op")
+
+    # Probe gating: never planned without a ROM, planned with one.
+    plan = snesops.build_plan(root, MigrateOptions(dry_run=True, probe_disc=True))
+    check("snes_probe_rom_refresh" not in [st.op_id for st in plan.steps],
+          "probe never planned without a ROM path")
+    (root / "src" / "codegen_setup.c").unlink()
+
+    # Boxart relocation: legacy file moves to launcher_assets/img/.
+    (root / "assets").mkdir(exist_ok=True)
+    (root / "assets" / "boxart.png").write_bytes(b"\x89PNG fake")
+    box = {c.id: c for c in snesops.audit_project(root).checks}["boxart"]
+    check(box.fix_op == "snes_relocate_boxart", "legacy boxart names relocate")
+    res = snesops._op_relocate_boxart(root, MigrateOptions())
+    check(res.ok and (root / "launcher_assets" / "img" / "boxart.png").is_file(),
+          "relocate moves the file into launcher_assets/img/")
+    check(not (root / "assets" / "boxart.png").is_file(),
+          "and removes the legacy copy")
+
+    # Broken-checkout diagnosis: a .git file pointing nowhere is named.
+    (root / "snesrecomp" / ".git").write_text(
+        "gitdir: ../.git/modules/gone\n", encoding="utf-8")
+    reason = snesops.diagnose_framework_checkout(root)
+    check(reason is not None and "missing gitdir" in reason,
+          "stale gitdir pointer is diagnosed")
+    fw_check = {c.id: c for c in snesops.audit_project(root).checks}["framework"]
+    check(fw_check.fix_op == "snes_repair_framework_submodule",
+          "broken checkout names the repair op")
+    (root / "snesrecomp" / ".git").unlink()
+
+
+def test_version_stamp(root: Path) -> None:
+    print("lobby pin stamp")
+    from project_studio import snesops
+
+    build = root / "build-release"
+    build.mkdir(exist_ok=True)
+    (build / "snes_game_version.txt").write_text("0.9.9\n", encoding="utf-8")
+    stamp = {c.id: c for c in snesops.audit_project(root).checks}.get(
+        "version_stamp_match")
+    check(stamp is not None and stamp.status.value == "fail",
+          "stamp drift against VERSION fails")
+    (build / "snes_game_version.txt").write_text("0.2.0\n", encoding="utf-8")
+    stamp = {c.id: c for c in snesops.audit_project(root).checks}.get(
+        "version_stamp_match")
+    check(stamp is not None and stamp.status.value == "pass",
+          "matching stamp passes")
+    (build / "snes_game_version.txt").unlink()
+
+
 def test_digest_recovery(root: Path) -> None:
     print("template tokens")
     from project_studio import snesops
@@ -642,6 +738,8 @@ def main() -> int:
         make_repo(root)
         test_repo_recognition(root)
         test_audit(root)
+        test_parity_checks(root)
+        test_version_stamp(root)
         test_plan_and_apply(root)
         test_digest_recovery(root)
         test_probe_rom(root)

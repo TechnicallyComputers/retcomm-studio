@@ -37,6 +37,7 @@ from .models import (
 # Ordered for apply: submodules first (later ops read their contents), pins
 # last (they record what everything above settled on).
 OP_ORDER: tuple[str, ...] = (
+    "snes_repair_framework_submodule",
     "snes_ensure_framework_submodule",
     "snes_ensure_recomp_ui_submodule",
     "snes_ensure_nested_modules",
@@ -44,9 +45,14 @@ OP_ORDER: tuple[str, ...] = (
     "snes_untrack_generated",
     "snes_ensure_src_gen",
     "snes_emit_version",
+    "snes_probe_rom_refresh",
+    "snes_emit_codegen_setup",
     "snes_emit_regen",
+    "snes_relocate_boxart",
+    "snes_emit_boxart_stub",
     "snes_emit_packager",
     "snes_emit_ci_workflow",
+    "snes_patch_readme_metrics",
     "snes_record_framework_pins",
 )
 
@@ -62,6 +68,13 @@ OP_TITLES: dict[str, str] = {
     "snes_emit_packager": "Emit scripts/package_release.sh",
     "snes_emit_ci_workflow": "Emit .github/workflows/release.yml",
     "snes_record_framework_pins": "Write framework_pins.txt",
+    "snes_repair_framework_submodule": "Repair broken snesrecomp/ git checkout",
+    "snes_probe_rom_refresh": "Refresh ROM identity via probe_rom.py",
+    "snes_emit_codegen_setup": "Emit src/codegen_setup.c / .h",
+    "snes_relocate_boxart": "Relocate boxart → launcher_assets/img/",
+    "snes_emit_boxart_stub": "Create launcher_assets/img stub dir",
+    "snes_patch_readme_metrics":
+        "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
 }
 
 # Matches snesrecomp's tools/new_project/templates/gitignore.in. The launcher
@@ -203,6 +216,8 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
                     ("crc32", "crc32"),
                     ("sha256", "sha256"),
                     ("display_name", "display_name"),
+                    ("mapping", "mapping"),
+                    ("region", "region"),
                 ):
                     val = str(data.get(key) or "").strip()
                     if val:
@@ -211,6 +226,26 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
         if "rom_file" not in out:
             out["rom_file"] = rom_path.name
         return out
+
+    # codegen_setup.c is the richest recovery source: it carries mapping and
+    # region alongside the digests, which regen.sh does not.
+    cg = root / "src" / "codegen_setup.c"
+    if cg.is_file():
+        try:
+            text = cg.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for field, key in (
+            ("display_name", "display_name"),
+            ("rom_file", "rom_file"),
+            ("expected_crc32", "crc32"),
+            ("expected_sha256", "sha256"),
+            ("mapping", "mapping"),
+            ("region", "region"),
+        ):
+            m = re.search(r"\." + field + r"\s*=\s*\"([^\"]*)\"", text)
+            if m and m.group(1) and "@" not in m.group(1):
+                out.setdefault(key, m.group(1))
 
     regen = root / "tools" / "regen.sh"
     if regen.is_file():
@@ -221,10 +256,10 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
         for pattern, key in _DIGEST_PATTERNS:
             m = pattern.search(text)
             if m:
-                out[key] = m.group(1)
+                out.setdefault(key, m.group(1))
         m = re.search(r'for cand in "([^"]+\.s[fm]c)"', text)
         if m:
-            out["rom_file"] = m.group(1)
+            out.setdefault("rom_file", m.group(1))
     return out
 
 
@@ -281,6 +316,38 @@ def _submodule_present(root: Path, path: str, marker: str = "") -> tuple[bool, b
     return declared, live
 
 
+def diagnose_framework_checkout(root: Path) -> str | None:
+    """A human reason when snesrecomp/ has the marker but git cannot use it.
+
+    Same failure family the PSX audit repairs: a .git file pointing at a
+    deleted gitdir (renamed submodule), or a tree absorbed into the parent.
+    Returns None when the checkout is healthy or simply absent.
+    """
+    dest = root / FRAMEWORK
+    if not dest.is_dir() or not (dest / "runner" / "runner.cmake").is_file():
+        return None
+    code, out = _git(dest, "rev-parse", "--is-inside-work-tree")
+    if code == 0 and out.strip() == "true":
+        return None
+    git_file = dest / ".git"
+    if git_file.is_file():
+        try:
+            text = git_file.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text.lower().startswith("gitdir:"):
+            rel = text.split(":", 1)[1].strip()
+            target = (dest / rel).resolve() if rel else None
+            if target is not None and not target.exists():
+                return (f"{FRAMEWORK}/.git points at missing gitdir ({rel}) — "
+                        "broken submodule metadata.")
+            return f"{FRAMEWORK}/.git gitdir is unusable ({rel or text})."
+    if git_file.is_dir():
+        return f"{FRAMEWORK}/.git exists but git rev-parse fails."
+    return (f"{FRAMEWORK}/ has runner/runner.cmake but is not a git checkout "
+            "(absorbed into the parent tree or missing .git).")
+
+
 # ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
@@ -310,7 +377,12 @@ def audit_project(root: Path) -> AuditReport:
 
     # --- framework -----------------------------------------------------------
     declared, live = _submodule_present(root, FRAMEWORK, "runner/runner.cmake")
-    if live:
+    broken = diagnose_framework_checkout(root) if live else None
+    if live and broken:
+        add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.FAIL, Severity.REQUIRED,
+            broken + " Repair re-clones it as a real submodule.",
+            "snes_repair_framework_submodule")
+    elif live:
         add("framework", f"{FRAMEWORK}/ checkout", CheckStatus.PASS, Severity.REQUIRED,
             str(root / FRAMEWORK))
     elif declared:
@@ -414,6 +486,151 @@ def audit_project(root: Path) -> AuditReport:
             None if blocked else op,
         )
 
+    # --- ROM / catalog identity ---------------------------------------------
+    ident = rom_identity(root)
+    if ident.get("sha256") and ident.get("crc32"):
+        src = "src/codegen_setup.c" if (root / "src" / "codegen_setup.c").is_file() \
+            else "tools/regen.sh"
+        add("rom_identity", "ROM identity (digests)", CheckStatus.PASS,
+            Severity.RECOMMENDED,
+            f"crc32 {ident['crc32']} recovered from {src}.")
+    else:
+        # Refresh needs the ROM (--disc) — the plan gates the op on it.
+        add("rom_identity", "ROM identity (digests)", CheckStatus.WARN,
+            Severity.RECOMMENDED,
+            "No ROM digests recoverable — probe with a ROM path to seed "
+            "regen.sh / codegen_setup.", "snes_probe_rom_refresh")
+
+    # --- codegen_setup.c/.h ---------------------------------------------------
+    cg_c = root / "src" / "codegen_setup.c"
+    cg_h = root / "src" / "codegen_setup.h"
+    if cg_c.is_file() and cg_h.is_file():
+        try:
+            cg_text = cg_c.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            cg_text = ""
+        if "kGameCodegenIdentity" not in cg_text:
+            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.WARN,
+                Severity.REQUIRED,
+                "codegen_setup.c missing kGameCodegenIdentity.",
+                "snes_emit_codegen_setup")
+        elif "@" in cg_text and re.search(r"@[A-Z0-9_]+@", cg_text):
+            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.WARN,
+                Severity.REQUIRED,
+                "codegen_setup.c still has unfilled @TOKEN@ placeholders.",
+                "snes_emit_codegen_setup")
+        else:
+            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.PASS,
+                Severity.REQUIRED, "Identity present with digests.")
+    else:
+        blocked_cg = not (ident.get("sha256") and ident.get("crc32"))
+        add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.FAIL,
+            Severity.REQUIRED,
+            "Missing — ROM digests unknown, so it cannot be emitted without a "
+            "--disc ROM path." if blocked_cg
+            else "Missing codegen identity sources.",
+            None if blocked_cg else "snes_emit_codegen_setup")
+
+    # --- boxart ---------------------------------------------------------------
+    modern_box = root / "launcher_assets" / "img"
+    modern_hit = next(
+        (p for p in (modern_box / "boxart.tga", modern_box / "boxart.png")
+         if p.is_file()), None)
+    legacy_candidates = [
+        root / "assets" / "boxart.tga", root / "assets" / "boxart.png",
+        root / "boxart.tga", root / "boxart.png",
+    ]
+    legacy_box = next((p for p in legacy_candidates if p.is_file()), None)
+    if modern_hit is not None:
+        add("boxart", "launcher_assets boxart", CheckStatus.PASS, Severity.OPTIONAL,
+            str(modern_hit.relative_to(root)))
+    elif legacy_box is not None:
+        add("boxart", "launcher_assets boxart", CheckStatus.WARN, Severity.OPTIONAL,
+            f"Boxart at {legacy_box.relative_to(root)} — relocate to "
+            "launcher_assets/img/.", "snes_relocate_boxart")
+    else:
+        add("boxart", "launcher_assets boxart", CheckStatus.WARN, Severity.OPTIONAL,
+            "No boxart found (optional; README patch can fetch libretro art).",
+            "snes_emit_boxart_stub")
+
+    # --- README metrics / launcher / RAID ------------------------------------
+    from .readme_metrics import (
+        boxart_png_present,
+        readme_has_boxart,
+        readme_has_launcher,
+        readme_has_metrics,
+        readme_has_raid,
+    )
+    readme_path = root / "README.md"
+    try:
+        readme_text = readme_path.read_text(encoding="utf-8", errors="replace") \
+            if readme_path.is_file() else ""
+    except OSError:
+        readme_text = ""
+    missing_readme: list[str] = []
+    if not readme_path.is_file():
+        missing_readme.append("README.md")
+    else:
+        if not readme_has_metrics(readme_text):
+            missing_readme.append("download badges")
+        if not readme_has_boxart(readme_text):
+            missing_readme.append("libretro boxart")
+        if not readme_has_launcher(readme_text):
+            missing_readme.append("RetComM Launcher section")
+        if not readme_has_raid(readme_text):
+            missing_readme.append("R.A.I.D. Discord footer")
+    if not (root / ".github" / "raid-discord.png").is_file():
+        missing_readme.append(".github/raid-discord.png")
+    if not boxart_png_present(root):
+        missing_readme.append("launcher_assets/img/boxart.png")
+    if missing_readme:
+        add("readme_metrics", "README download metrics / launcher / RAID / boxart",
+            CheckStatus.WARN, Severity.RECOMMENDED,
+            "Missing: " + ", ".join(missing_readme), "snes_patch_readme_metrics")
+    else:
+        add("readme_metrics", "README download metrics / launcher / RAID / boxart",
+            CheckStatus.PASS, Severity.RECOMMENDED,
+            "Badges, boxart, RetComM Launcher, and R.A.I.D. footer present.")
+
+    # --- lobby pin stamp vs VERSION ------------------------------------------
+    # Fires only when a build tree carries a version stamp; drift between the
+    # stamp and VERSION splits netplay lobbies onto different pins.
+    ver_path = root / "VERSION"
+    ver_text = ""
+    if ver_path.is_file():
+        try:
+            ver_text = ver_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            ver_text = ""
+    stamp_hits: list[tuple[str, str]] = []
+    for build in sorted(root.glob("build*")):
+        if not build.is_dir():
+            continue
+        for stamp in (build / "snes_game_version.txt",
+                      build / "Release" / "snes_game_version.txt"):
+            if stamp.is_file():
+                try:
+                    stamp_hits.append(
+                        (str(stamp.relative_to(root)).replace("\\", "/"),
+                         stamp.read_text(encoding="utf-8",
+                                         errors="replace").strip()))
+                except OSError:
+                    pass
+    if ver_text and stamp_hits:
+        bad = [(pth, st) for pth, st in stamp_hits
+               if st and st.lstrip("vV") != ver_text.lstrip("vV")]
+        if bad:
+            detail = "; ".join(f"{pth}={st} (VERSION={ver_text})"
+                               for pth, st in bad[:3])
+            add("version_stamp_match", "Lobby pin stamp", CheckStatus.FAIL,
+                Severity.REQUIRED,
+                "snes_game_version.txt disagrees with VERSION — rebuild with "
+                "-DSNES_GAME_VERSION matching VERSION before releasing. "
+                + detail)
+        else:
+            add("version_stamp_match", "Lobby pin stamp", CheckStatus.PASS,
+                Severity.RECOMMENDED, "Build stamp matches VERSION.")
+
     pins = root / "framework_pins.txt"
     if pins.is_file():
         stale = _stale_pins(root, pins)
@@ -443,6 +660,10 @@ def _classify(checks: list[CheckResult], have_framework: bool) -> LayoutClass:
     fails = sum(1 for c in checks if c.status == CheckStatus.FAIL)
     if not have_framework:
         return LayoutClass.UNKNOWN
+    # Committed ROM-derived C is the pre-scaffold layout: the repo was built
+    # by checking generator output in rather than regenerating from the ROM.
+    if any(c.id == "generated" and c.status == CheckStatus.FAIL for c in checks):
+        return LayoutClass.LEGACY_PACKAGING
     if fails == 0:
         return LayoutClass.SCAFFOLD_COMPLETE
     return LayoutClass.SETUP_HOST_PARTIAL
@@ -506,6 +727,12 @@ def build_plan(
         wanted.discard("snes_merge_gitignore")
     if not options.enable_recomp_ui:
         wanted.discard("snes_ensure_recomp_ui_submodule")
+    # The probe rewrites identity files from a real ROM: never planned without
+    # one, always planned when the user asked for it and supplied one.
+    if options.probe_disc and options.disc:
+        wanted.add("snes_probe_rom_refresh")
+    else:
+        wanted.discard("snes_probe_rom_refresh")
 
     if options.only:
         wanted = {o for o in wanted if o in options.only} | set(options.only)
@@ -668,7 +895,8 @@ def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
     if ident.get("display_name"):
         values["DISPLAY_NAME"] = ident["display_name"]
     for token, key in (("ROM_CRC32", "crc32"), ("ROM_SHA256", "sha256"),
-                       ("ROM_FILE", "rom_file")):
+                       ("ROM_FILE", "rom_file"), ("ROM_MAPPING", "mapping"),
+                       ("REGION", "region")):
         if ident.get(key):
             values[token] = ident[key]
     if values.get("ROM_FILE"):
@@ -755,6 +983,200 @@ def _op_record_pins(root: Path, opts: MigrateOptions) -> ApplyResult:
     return ApplyResult(op, True, f"Wrote {len(pins)} pin(s)", ["framework_pins.txt"])
 
 
+def _op_repair_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "snes_repair_framework_submodule"
+    broken = diagnose_framework_checkout(root)
+    if broken is None:
+        return ApplyResult(op, True, "snesrecomp/ checkout is healthy")
+    if _dry(opts):
+        return ApplyResult(op, True, f"[dry-run] would move {FRAMEWORK}/ aside and re-clone")
+    import time as _time
+
+    aside = root / f"{FRAMEWORK}.broken-{_time.strftime('%Y%m%d-%H%M%S')}"
+    try:
+        (root / FRAMEWORK).rename(aside)
+    except OSError as exc:
+        return ApplyResult(op, False, f"Could not move broken tree aside: {exc}")
+    # Drop the stale index entry so ensure_submodule re-adds cleanly.
+    _git(root, "rm", "-r", "--cached", "-q", "--", FRAMEWORK)
+    res = _ensure_submodule(root, opts, FRAMEWORK)
+    msg = (f"Moved broken tree to {aside.name}; " + res.message)
+    return ApplyResult(op, res.ok, msg,
+                       ([FRAMEWORK, aside.name] if res.ok else [aside.name]))
+
+
+def _op_emit_codegen_setup(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "snes_emit_codegen_setup"
+    r_c = _fill_template(root, opts, op, "codegen_setup.c.in", "src/codegen_setup.c")
+    if not r_c.ok:
+        return r_c
+    r_h = _fill_template(root, opts, op, "codegen_setup.h.in", "src/codegen_setup.h")
+    changed = list(r_c.changed_paths) + list(r_h.changed_paths)
+    ok = r_c.ok and r_h.ok
+    return ApplyResult(op, ok, f"{r_c.message}; {r_h.message}", changed)
+
+
+def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Probe the ROM and re-emit the identity carriers with fresh digests."""
+    op = "snes_probe_rom_refresh"
+    if not opts.disc:
+        return ApplyResult(op, False, "No ROM path (--disc) supplied")
+    ident = rom_identity(root, opts.disc)
+    if not (ident.get("sha256") and ident.get("crc32")):
+        return ApplyResult(op, False, f"probe_rom.py produced no digests for {opts.disc}")
+    # Re-emit with force: refreshing identity is the whole point of this op,
+    # and _fill_template re-reads rom_identity(root, opts.disc) itself.
+    import dataclasses as _dc
+
+    forced = _dc.replace(opts, force=True)
+    results = [
+        _fill_template(root, forced, op, "codegen_setup.c.in", "src/codegen_setup.c"),
+        _fill_template(root, forced, op, "codegen_setup.h.in", "src/codegen_setup.h"),
+        _fill_template(root, forced, op, "regen.sh.in", "tools/regen.sh"),
+    ]
+    changed = [pth for r in results for pth in r.changed_paths]
+    ok = all(r.ok for r in results)
+    detail = f"crc32 {ident['crc32']}, sha256 {ident['sha256'][:12]}…"
+    msgs = "; ".join(r.message for r in results if not r.ok) or detail
+    return ApplyResult(op, ok, ("Refreshed identity: " + detail) if ok else msgs, changed)
+
+
+def _op_relocate_boxart(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "snes_relocate_boxart"
+    dst_dir = root / "launcher_assets" / "img"
+    for name in ("boxart.tga", "boxart.png"):
+        if (dst_dir / name).is_file():
+            return ApplyResult(op, True, "Modern boxart already present")
+    candidates = [
+        root / "assets" / "boxart.tga", root / "assets" / "boxart.png",
+        root / "boxart.tga", root / "boxart.png",
+    ]
+    src = next((c for c in candidates if c.is_file()), None)
+    if src is None:
+        return ApplyResult(op, False, "No legacy boxart found")
+    if _dry(opts):
+        return ApplyResult(op, True, f"[dry-run] would move {src.name} → launcher_assets/img/")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / src.name
+    shutil.move(str(src), str(dst))
+    rel = str(dst.relative_to(root)).replace("\\", "/")
+    return ApplyResult(op, True, f"Moved {src.name} → {rel}", [rel])
+
+
+def _op_emit_boxart_stub(root: Path, opts: MigrateOptions) -> ApplyResult:
+    op = "snes_emit_boxart_stub"
+    img = root / "launcher_assets" / "img"
+    if img.is_dir():
+        return ApplyResult(op, True, "launcher_assets/img already exists")
+    if _dry(opts):
+        return ApplyResult(op, True, "[dry-run] mkdir launcher_assets/img")
+    img.mkdir(parents=True, exist_ok=True)
+    keep = img / ".gitkeep"
+    keep.write_text("", encoding="utf-8")
+    return ApplyResult(op, True, "Created launcher_assets/img/",
+                       ["launcher_assets/img/.gitkeep"])
+
+
+_SNES_LIBRETRO_SYSTEM = "Nintendo - Super Nintendo Entertainment System"
+
+
+def _ensure_boxart_png(root: Path, opts: MigrateOptions) -> list[str]:
+    """Fetch libretro SNES boxart when the README PNG is missing. Never raises."""
+    import sys as _sys
+
+    png = root / "launcher_assets" / "img" / "boxart.png"
+    tga = root / "launcher_assets" / "img" / "boxart.tga"
+    if png.is_file():
+        return []
+    if _dry(opts):
+        return ["launcher_assets/img/boxart.png"]
+    ident = rom_identity(root, opts.disc)
+    rom_stem = Path(ident["rom_file"]).stem if ident.get("rom_file") else ""
+    display = ident.get("display_name") or display_name(root)
+    if not rom_stem and not display:
+        return []
+    try:
+        from .paths import toolkit_dir
+
+        _sys.path.insert(0, str(toolkit_dir()))
+        from fetch_boxart import fetch_to_paths  # type: ignore
+    except ImportError:
+        return []
+    try:
+        fetch_to_paths(tga, cue_stem=rom_stem, display_name=display,
+                       system=_SNES_LIBRETRO_SYSTEM)
+    except Exception:
+        return []
+    changed: list[str] = []
+    for rel in ("boxart.png", "boxart.tga", "BOXART_SOURCE.txt"):
+        if (tga.parent / rel).is_file():
+            changed.append(f"launcher_assets/img/{rel}")
+    return changed
+
+
+def _op_patch_readme_metrics(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Upsert download badges, boxart, RetComM Launcher, and R.A.I.D. footer."""
+    op = "snes_patch_readme_metrics"
+    from .paths import templates_dir as _toolkit_templates
+    from .readme_metrics import (
+        apply_github_about,
+        boxart_png_present,
+        render_boxart_block,
+        render_launcher_block,
+        render_metrics_block,
+        render_raid_block,
+        resolve_github_slug,
+        upsert_readme_blocks,
+    )
+
+    owner, repo = resolve_github_slug(root, opts.github_owner, opts.github_repo)
+    zp = opts.zip_prefix or _zip_prefix(root)
+    fetched = _ensure_boxart_png(root, opts)
+    display = opts.window_title or display_name(root)
+    boxart_block = None
+    if boxart_png_present(root) or (
+        opts.dry_run and "launcher_assets/img/boxart.png" in fetched
+    ):
+        boxart_block = render_boxart_block(display)
+
+    path = root / "README.md"
+    if path.is_file():
+        old_text = path.read_text(encoding="utf-8", errors="replace")
+    else:
+        old_text = f"# {display}\n"
+    new_text = upsert_readme_blocks(
+        old_text,
+        render_metrics_block(owner, repo, zp),
+        render_launcher_block(),
+        render_raid_block(),
+        boxart=boxart_block,
+    )
+    changed: list[str] = list(fetched)
+    if new_text != old_text:
+        if not _dry(opts):
+            path.write_text(new_text, encoding="utf-8", newline="\n")
+        if "README.md" not in changed:
+            changed.append("README.md")
+
+    src_img = _toolkit_templates() / "raid-discord.png"
+    dst_img = root / ".github" / "raid-discord.png"
+    if src_img.is_file() and not dst_img.is_file():
+        if not _dry(opts):
+            dst_img.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_img, dst_img)
+        changed.append(".github/raid-discord.png")
+
+    about_ok, about_msg = apply_github_about(owner, repo, dry_run=_dry(opts))
+    parts: list[str] = []
+    if changed:
+        parts.append(f"Patched README blocks ({owner}/{repo})")
+    else:
+        parts.append("README already complete")
+    if about_msg:
+        parts.append(about_msg if about_ok else f"[about] {about_msg}")
+    return ApplyResult(op, True, "; ".join(parts), changed)
+
+
 # Public aliases for the two ops gitops.install_and_push_release_ci reaches
 # for directly — it installs CI outside a full plan.
 op_emit_packager = _op_emit_packager
@@ -773,4 +1195,10 @@ _OPS = {
     "snes_emit_packager": _op_emit_packager,
     "snes_emit_ci_workflow": _op_emit_ci,
     "snes_record_framework_pins": _op_record_pins,
+    "snes_repair_framework_submodule": _op_repair_framework,
+    "snes_probe_rom_refresh": _op_probe_rom_refresh,
+    "snes_emit_codegen_setup": _op_emit_codegen_setup,
+    "snes_relocate_boxart": _op_relocate_boxart,
+    "snes_emit_boxart_stub": _op_emit_boxart_stub,
+    "snes_patch_readme_metrics": _op_patch_readme_metrics,
 }

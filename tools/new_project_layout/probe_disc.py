@@ -67,6 +67,11 @@ class DiscProbe:
     stack_base: str = ""
     require_cue: bool = True
     required_disc_fp: str = ""
+    # Content hash of the boot executable itself. `serial` and `boot_exe` name
+    # the DISC; this names the PROGRAM, and the two are not the same thing --
+    # Final Fantasy VII ships one byte-identical executable on three discs
+    # under three serials (SCUS-94163/64/65).
+    boot_exe_sha256: str = ""
     seed_count: int = 0
     seed_addrs: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -488,6 +493,7 @@ def probe(cue_path: Path, *, identity_only: bool = False) -> DiscProbe:
         warnings=warnings,
         notes=notes,
         boot_exe_bytes=exe,
+        boot_exe_sha256=hashlib.sha256(exe).hexdigest() if exe else "",
     )
 
 
@@ -495,7 +501,8 @@ def toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def render_game_toml(p: DiscProbe, *, disc_rel: str, out_dir: str, players: int) -> str:
+def render_game_toml(p: DiscProbe, *, disc_rel: str, out_dir: str, players: int,
+                     extra_discs: list[str] | None = None) -> str:
     exe_rel = f"{out_dir.rstrip('/')}/{p.boot_exe}"
     lines = [
         "# Autofilled by tools/new_project_layout/probe_disc.py from your legal dump.",
@@ -506,7 +513,21 @@ def render_game_toml(p: DiscProbe, *, disc_rel: str, out_dir: str, players: int)
         f'id = "{toml_escape(p.serial)}"' if p.serial else '# id = "SLUS-XXXXX"',
         f"players = {players}",
         f'exe = "{toml_escape(exe_rel)}"',
-        f'disc = "{toml_escape(disc_rel)}"',
+        # One program, N images: the loader already accepts `discs`, and a set
+        # verified data-only is exactly that case. `disc` stays for a single
+        # image so a one-disc title is byte-identical to before.
+        *(
+            [f'disc = "{toml_escape(disc_rel)}"']
+            if not extra_discs
+            else [
+                "# Verified as one program on N images (verify_disc_set.py).",
+                "# Disc 1 boots; the rest are data. The runtime mounts the boot",
+                "# disc today — docs/MULTI_DISC.md P1 + P3 add the rest.",
+                "discs = [",
+                *[f'    "{toml_escape(d)}",' for d in [disc_rel, *extra_discs]],
+                "]",
+            ]
+        ),
         f'load_address = "{p.load_address}"',
         f'entry_pc = "{p.entry_pc}"',
         f'text_size = "{p.text_size}"',
@@ -629,6 +650,21 @@ def main() -> int:
         help="game.disc path in game.toml (relative or absolute; default: disc/<cue>)",
     )
     ap.add_argument(
+        "--extra-disc",
+        action="append",
+        default=[],
+        help="another image for game.toml `discs`, repeatable, in disc order "
+             "after the boot disc. Only for a set verify_disc_set.py reported "
+             "as data-only — one program, N images.",
+    )
+    ap.add_argument(
+        "--extra-disc-list",
+        default="",
+        help="file of additional disc paths, one per line, in disc order. "
+             "Preferred over repeated --extra-disc from a shell: PS1 dump "
+             "filenames contain spaces and parentheses.",
+    )
+    ap.add_argument(
         "--out-dir",
         default="disc",
         help="prepare_disc.out_dir / exe parent (default: disc)",
@@ -677,6 +713,13 @@ def main() -> int:
         print(f"  warning: {w}", file=sys.stderr)
 
     disc_rel = args.disc_rel or f"{args.out_dir.rstrip('/')}/{p.cue_name}"
+    extra_discs = [d for d in (args.extra_disc or []) if d.strip()]
+    if args.extra_disc_list:
+        lp = Path(args.extra_disc_list)
+        if lp.is_file():
+            extra_discs += [ln.strip()
+                            for ln in lp.read_text(encoding="utf-8").splitlines()
+                            if ln.strip()]
 
     # Drop bulky / binary fields from JSON dumps
     payload = asdict(p)
@@ -692,7 +735,8 @@ def main() -> int:
 
     if args.write_game_toml:
         text = render_game_toml(
-            p, disc_rel=disc_rel, out_dir=args.out_dir, players=args.players
+            p, disc_rel=disc_rel, out_dir=args.out_dir, players=args.players,
+            extra_discs=extra_discs
         )
         Path(args.write_game_toml).write_text(text, encoding="utf-8")
         print(f"  wrote {args.write_game_toml}", file=sys.stderr)

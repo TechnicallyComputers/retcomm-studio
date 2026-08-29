@@ -24,11 +24,22 @@ import urllib.request
 import zlib
 from pathlib import Path
 
-LIBRETRO_HOST = "https://thumbnails.libretro.com/Sony%20-%20PlayStation/Named_Boxarts/"
-GITHUB_RAW = (
-    "https://raw.githubusercontent.com/libretro-thumbnails/"
-    "Sony_-_PlayStation/master/Named_Boxarts/"
-)
+# Default system is PS1 (this tool predates the SNES platform); callers pass
+# `system=` with the libretro-thumbnails system name to fetch for another
+# console, e.g. "Nintendo - Super Nintendo Entertainment System".
+DEFAULT_SYSTEM = "Sony - PlayStation"
+
+
+def _system_bases(system: str) -> tuple[str, str]:
+    import urllib.parse
+    host = ("https://thumbnails.libretro.com/"
+            + urllib.parse.quote(system) + "/Named_Boxarts/")
+    raw = ("https://raw.githubusercontent.com/libretro-thumbnails/"
+           + system.replace(" ", "_") + "/master/Named_Boxarts/")
+    return host, raw
+
+
+LIBRETRO_HOST, GITHUB_RAW = _system_bases(DEFAULT_SYSTEM)
 INVALID = '&*/:`<>?\\|"'
 
 
@@ -110,10 +121,10 @@ def http_get(url: str, timeout: float = 60.0) -> bytes:
         return data
 
 
-def try_fetch(names: list[str]) -> tuple[bytes, str, str]:
+def try_fetch(names: list[str], system: str = DEFAULT_SYSTEM) -> tuple[bytes, str, str]:
     last_err: Exception | None = None
     for name in names:
-        for base in (LIBRETRO_HOST, GITHUB_RAW):
+        for base in _system_bases(system):
             url = url_for(base, name)
             try:
                 data = http_get(url)
@@ -249,12 +260,13 @@ def fetch_to_paths(
     display_name: str = "",
     extra_names: list[str] | None = None,
     png_path: Path | None = None,
+    system: str = DEFAULT_SYSTEM,
 ) -> tuple[Path, Path, str]:
     """Fetch libretro Named_Boxarts PNG, write PNG + TGA + BOXART_SOURCE.txt."""
     names = candidate_names(cue_stem, display_name, *(extra_names or []))
     if not names:
         raise ValueError("pass cue_stem and/or display_name")
-    png, url, matched = try_fetch(names)
+    png, url, matched = try_fetch(names, system)
     tga_path = Path(tga_path)
     png_path = Path(png_path) if png_path else tga_path.with_suffix(".png")
     png_path.parent.mkdir(parents=True, exist_ok=True)

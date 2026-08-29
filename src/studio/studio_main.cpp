@@ -475,7 +475,14 @@ void text_clipped(const char* text, const ImVec4& col) {
 
 struct DialogCtx {
     StudioModel* model = nullptr;
-    const char* target = nullptr;
+    // Owns its target, deliberately. This was a `const char*`, which is safe
+    // only while every caller passes a string literal — and the multi-disc
+    // rows do not: they build "np_disc2".."np_discN" in a `char[32]` local
+    // that dies with the loop iteration. The dialog callback then read a
+    // dangling pointer whose stack slot the NEXT iteration had overwritten,
+    // so picking a file for Disc 2 filed it under the last disc rendered.
+    // Copying here fixes every present and future caller instead of that one.
+    std::string target;
 };
 
 void SDLCALL folder_callback(void* userdata, const char* const* filelist, int /*filter*/) {
@@ -485,7 +492,7 @@ void SDLCALL folder_callback(void* userdata, const char* const* filelist, int /*
         std::lock_guard<std::mutex> lock(ctx->model->pick_mu);
         if (filelist && filelist[0]) {
             ctx->model->pending_folder = filelist[0];
-            ctx->model->pending_pick_target = ctx->target ? ctx->target : "";
+            ctx->model->pending_pick_target = ctx->target;
         }
     }
     delete ctx;
@@ -499,7 +506,7 @@ void SDLCALL file_callback(void* userdata, const char* const* filelist, int /*fi
         ctx->model->file_pick_busy = false;
         if (filelist && filelist[0]) {
             ctx->model->pending_file = filelist[0];
-            ctx->model->pending_pick_target = ctx->target ? ctx->target : "";
+            ctx->model->pending_pick_target = ctx->target;
         }
     }
     delete ctx;
@@ -1309,14 +1316,17 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
               kLabelW);
     field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo), kLabelW);
 
-    // Netplay and disc probing have no ops in the SNES plan; a checkbox that
-    // reaches nothing is worse than an absent one.
+    // Netplay has no op in the SNES plan; a checkbox that reaches nothing is
+    // worse than an absent one. Probe DOES reach one now: with a ROM path in
+    // the image field, snes_probe_rom_refresh re-derives the identity digests
+    // and re-emits codegen_setup + regen.sh from them.
     if (!snes) {
         checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe disc", &model.migrate_probe);
     } else {
         checkbox_wrapped("CI", &model.migrate_ci);
+        checkbox_wrapped("Probe ROM", &model.migrate_probe);
     }
     checkbox_wrapped("Dry-run", &model.migrate_dry_run);
     checkbox_wrapped("Force", &model.migrate_force);
@@ -2603,8 +2613,12 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             }
         }
         if (!extra.empty()) {
-            args.push_back("--args");
-            args.push_back(extra);
+            // One argv element, `--args=<value>`. Passed as two elements,
+            // argparse reads a value that begins with '-' as the NEXT option
+            // and fails with "argument --args: expected one argument" — which
+            // is exactly what "--args" "--launcher" did. The = form has no
+            // such ambiguity.
+            args.push_back("--args=" + extra);
         }
         // A cartridge runner takes the ROM as a positional; without it the game
         // prints its usage and exits 1. This is the same path Migrate recorded

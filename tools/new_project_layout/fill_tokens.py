@@ -8,10 +8,26 @@ import re
 import sys
 from pathlib import Path
 
-GITHUB_ABOUT_DESCRIPTION = (
-    "Made with PSXrecomp, a Sony PlayStation game static recompiler ecosystem · "
-    "Part of the R.A.I.D. community"
-)
+def github_about_description(framework: str = "psxrecomp",
+                             console: str = "Sony PlayStation") -> str:
+    """The GitHub About line, for the console the port is actually built on.
+
+    This used to be a single hardcoded PSX string, and BOTH migrations set it —
+    so migrating a SNES port stamped "Made with PSXrecomp, a Sony PlayStation
+    game static recompiler ecosystem" onto a Super Nintendo repository. The
+    README got this right all along (it cites snesrecomp/LICENSE); only the
+    About was wrong, which is exactly the field nobody re-reads after the first
+    time it is set.
+    """
+    return (
+        f"Made with {framework}, a {console} game static recompiler ecosystem · "
+        "Part of the R.A.I.D. community"
+    )
+
+
+# PSX-shaped default: setup_project.sh (the PSX scaffolder) reads this constant
+# directly, and that scaffolder only ever builds PlayStation projects.
+GITHUB_ABOUT_DESCRIPTION = github_about_description()
 GITHUB_ABOUT_HOMEPAGE = "https://discord.gg/Ad9BwSzctP"
 
 
