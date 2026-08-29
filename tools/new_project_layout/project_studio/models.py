@@ -89,6 +89,7 @@ class MigrateOptions:
     enable_recomp_ui: bool = True
     enable_wizard: bool = True
     enable_netplay: bool = False
+    disable_netplay: bool = False   # remove the netplay wiring from the build
     lobby_url: str = "ws://netplay.retcomm.net:8765"
     enable_ci: bool = True
     relocate_boxart: bool = True

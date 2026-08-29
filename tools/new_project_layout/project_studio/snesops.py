@@ -41,6 +41,8 @@ OP_ORDER: tuple[str, ...] = (
     "snes_ensure_framework_submodule",
     "snes_ensure_recomp_ui_submodule",
     "snes_ensure_nested_modules",
+    "snes_enable_netplay",
+    "snes_disable_netplay",
     "snes_merge_gitignore",
     "snes_untrack_generated",
     "snes_ensure_src_gen",
@@ -75,6 +77,8 @@ OP_TITLES: dict[str, str] = {
     "snes_emit_boxart_stub": "Create launcher_assets/img stub dir",
     "snes_patch_readme_metrics":
         "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
+    "snes_enable_netplay": "Wire netplay (snesrecomp_enable_recomp_net)",
+    "snes_disable_netplay": "Unwire netplay (comment the call out)",
 }
 
 # Matches snesrecomp's tools/new_project/templates/gitignore.in. The launcher
@@ -592,6 +596,27 @@ def audit_project(root: Path) -> AuditReport:
             CheckStatus.PASS, Severity.RECOMMENDED,
             "Badges, boxart, RetComM Launcher, and R.A.I.D. footer present.")
 
+    # --- netplay wiring -------------------------------------------------------
+    # Report-only: netplay is opt-in, so the plan adds the enable/disable op
+    # from --enable-netplay / --disable-netplay, never from a failing check.
+    cml = root / "CMakeLists.txt"
+    cml_text = ""
+    if cml.is_file():
+        try:
+            cml_text = cml.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            cml_text = ""
+    if _netplay_wired(cml_text):
+        add("netplay", "Netplay (recomp-net) wiring", CheckStatus.PASS,
+            Severity.INFO,
+            "snesrecomp_enable_recomp_net() wired in CMakeLists.txt.")
+    elif cml_text:
+        add("netplay", "Netplay (recomp-net) wiring", CheckStatus.WARN,
+            Severity.INFO,
+            "Not wired — apply with --enable-netplay to add the "
+            "snesrecomp_enable_recomp_net() call (host code must also wire "
+            "the launcher; see MetalWarriorsSNESRecomp src/main.c).")
+
     # --- lobby pin stamp vs VERSION ------------------------------------------
     # Fires only when a build tree carries a version stamp; drift between the
     # stamp and VERSION splits netplay lobbies onto different pins.
@@ -733,6 +758,13 @@ def build_plan(
         wanted.add("snes_probe_rom_refresh")
     else:
         wanted.discard("snes_probe_rom_refresh")
+    # Netplay is opt-in both ways: only an explicit flag plans a flip, and the
+    # audit row never does (severity INFO, no auto-planned fix op).
+    if options.enable_netplay and options.players >= 2:
+        wanted.add("snes_enable_netplay")
+    if options.disable_netplay:
+        wanted.discard("snes_enable_netplay")
+        wanted.add("snes_disable_netplay")
 
     if options.only:
         wanted = {o for o in wanted if o in options.only} | set(options.only)
@@ -983,6 +1015,94 @@ def _op_record_pins(root: Path, opts: MigrateOptions) -> ApplyResult:
     return ApplyResult(op, True, f"Wrote {len(pins)} pin(s)", ["framework_pins.txt"])
 
 
+_NETPLAY_CALL_RE = re.compile(
+    r"^([ \t]*)snesrecomp_enable_recomp_net\(([^)]*)\)", re.M)
+_NETPLAY_DISABLED_RE = re.compile(
+    r"^([ \t]*)#[ \t]*snesrecomp_enable_recomp_net\(([^)]*)\)", re.M)
+
+
+def _netplay_wired(cml_text: str) -> bool:
+    return bool(_NETPLAY_CALL_RE.search(cml_text))
+
+
+def _cml_target_name(cml_text: str) -> str | None:
+    m = re.search(r"add_executable\(\s*([A-Za-z0-9_.-]+)", cml_text)
+    return m.group(1) if m else None
+
+
+def _op_enable_netplay(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Wire snesrecomp_enable_recomp_net(<target>) into CMakeLists.txt.
+
+    Build-side flip only: it links the delay-sync engine and lobby client and
+    defines SNES_HAS_LOBBY_CLIENT. The launcher's netplay button additionally
+    needs host wiring in src/main.c (gi.netplay_supported + the barrier loop);
+    scaffolds from the current wizard template carry it, older hosts follow
+    MetalWarriorsSNESRecomp's src/main.c.
+    """
+    op = "snes_enable_netplay"
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return ApplyResult(op, False, "No CMakeLists.txt")
+    text = cml.read_text(encoding="utf-8", errors="replace")
+    if _netplay_wired(text):
+        return ApplyResult(op, True, "Netplay already wired")
+    changed_note = ""
+    m = _NETPLAY_DISABLED_RE.search(text)
+    if m:
+        new_text = text[: m.start()] + m.group(1) \
+            + f"snesrecomp_enable_recomp_net({m.group(2)})" + text[m.end():]
+        changed_note = "Uncommented the existing call"
+    else:
+        target = _cml_target_name(text)
+        if not target:
+            return ApplyResult(op, False,
+                               "Could not find add_executable() to name the target")
+        block = (
+            "\n# Delay-sync netplay + MotK lobby client (defines "
+            "SNES_HAS_LOBBY_CLIENT; the\n"
+            "# launcher's netplay button needs the host wiring in src/main.c "
+            "as well —\n"
+            "# see MetalWarriorsSNESRecomp src/main.c for the reference).\n"
+            f"snesrecomp_enable_recomp_net({target})\n"
+        )
+        anchor = re.search(r"^[ \t]*recomp_target_launcher_ui\([^)]*\)",
+                           text, re.M | re.S)
+        if anchor:
+            end = anchor.end()
+            new_text = text[:end] + block + text[end:]
+        else:
+            new_text = text.rstrip() + "\n" + block
+        changed_note = f"Added snesrecomp_enable_recomp_net({target})"
+    if _dry(opts):
+        return ApplyResult(op, True, f"[dry-run] {changed_note}")
+    cml.write_text(new_text, encoding="utf-8", newline="\n")
+    # The engine needs its nested submodules; reuse the existing op.
+    nested = _op_ensure_nested(root, opts)
+    msg = changed_note + ("; " + nested.message if nested.message else "")
+    return ApplyResult(op, True, msg, ["CMakeLists.txt"] + nested.changed_paths)
+
+
+def _op_disable_netplay(root: Path, opts: MigrateOptions) -> ApplyResult:
+    """Comment the snesrecomp_enable_recomp_net() call out (reversible)."""
+    op = "snes_disable_netplay"
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return ApplyResult(op, False, "No CMakeLists.txt")
+    text = cml.read_text(encoding="utf-8", errors="replace")
+    m = _NETPLAY_CALL_RE.search(text)
+    if not m:
+        return ApplyResult(op, True, "Netplay already not wired")
+    new_text = text[: m.start()] + m.group(1) \
+        + f"# snesrecomp_enable_recomp_net({m.group(2)})" + text[m.end():]
+    if _dry(opts):
+        return ApplyResult(op, True, "[dry-run] would comment the call out")
+    cml.write_text(new_text, encoding="utf-8", newline="\n")
+    return ApplyResult(op, True,
+                       "Commented snesrecomp_enable_recomp_net() out "
+                       "(host code compiles the netplay blocks away)",
+                       ["CMakeLists.txt"])
+
+
 def _op_repair_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
     op = "snes_repair_framework_submodule"
     broken = diagnose_framework_checkout(root)
@@ -1201,4 +1321,6 @@ _OPS = {
     "snes_relocate_boxart": _op_relocate_boxart,
     "snes_emit_boxart_stub": _op_emit_boxart_stub,
     "snes_patch_readme_metrics": _op_patch_readme_metrics,
+    "snes_enable_netplay": _op_enable_netplay,
+    "snes_disable_netplay": _op_disable_netplay,
 }

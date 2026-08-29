@@ -1216,6 +1216,75 @@ def op_patch_readme_metrics(root: Path, options: MigrateOptions) -> ApplyResult:
     )
 
 
+_PSX_GAME_RUNTIME_RE = re.compile(
+    r"psxrecomp_add_game_runtime\(", re.M)
+
+
+def op_enable_netplay(root: Path, options: MigrateOptions) -> ApplyResult:
+    """Add ENABLE_NETPLAY_IF_PRESENT to psxrecomp_add_game_runtime(...).
+
+    Build-side flip: runtime.cmake then sets PSX_NETPLAY when recomp-net is
+    present. The setup-host template already carries the host wiring, so on
+    PSX the flag alone lights the feature.
+    """
+    op = "enable_netplay"
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return ApplyResult(op, False, "No CMakeLists.txt")
+    text = cml.read_text(encoding="utf-8", errors="replace")
+    m = _PSX_GAME_RUNTIME_RE.search(text)
+    if not m:
+        return ApplyResult(
+            op, False,
+            "CMakeLists.txt does not call psxrecomp_add_game_runtime — "
+            "rewrite to the setup-host helper first (rewrite_cmake_setup_host).")
+    # Find the matching close paren of the call.
+    depth = 0
+    end = None
+    for i in range(m.end() - 1, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end is None:
+        return ApplyResult(op, False, "Unbalanced psxrecomp_add_game_runtime call")
+    body = text[m.end():end]
+    if re.search(r"^\s*ENABLE_NETPLAY_IF_PRESENT\s*$", body, re.M) or \
+            "ENABLE_NETPLAY_IF_PRESENT" in body:
+        return ApplyResult(op, True, "ENABLE_NETPLAY_IF_PRESENT already present")
+    indent = "    "
+    lm = re.search(r"\n([ \t]+)\S", body)
+    if lm:
+        indent = lm.group(1)
+    insert = f"\n{indent}ENABLE_NETPLAY_IF_PRESENT"
+    new_text = text[:end] + insert + "\n" + text[end:]
+    if options.dry_run:
+        return ApplyResult(op, True, "[dry-run] would add ENABLE_NETPLAY_IF_PRESENT")
+    cml.write_text(new_text, encoding="utf-8", newline="\n")
+    return ApplyResult(op, True, "Added ENABLE_NETPLAY_IF_PRESENT",
+                       ["CMakeLists.txt"])
+
+
+def op_disable_netplay(root: Path, options: MigrateOptions) -> ApplyResult:
+    """Remove ENABLE_NETPLAY_IF_PRESENT from psxrecomp_add_game_runtime(...)."""
+    op = "disable_netplay"
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return ApplyResult(op, False, "No CMakeLists.txt")
+    text = cml.read_text(encoding="utf-8", errors="replace")
+    new_text, n = re.subn(r"[ \t]*ENABLE_NETPLAY_IF_PRESENT[ \t]*\n", "", text)
+    if n == 0:
+        return ApplyResult(op, True, "Netplay already not enabled")
+    if options.dry_run:
+        return ApplyResult(op, True, "[dry-run] would remove ENABLE_NETPLAY_IF_PRESENT")
+    cml.write_text(new_text, encoding="utf-8", newline="\n")
+    return ApplyResult(op, True, "Removed ENABLE_NETPLAY_IF_PRESENT",
+                       ["CMakeLists.txt"])
+
+
 _OPS = {
     "rename_psxrecomp_submodule": op_rename_psxrecomp_submodule,
     "ensure_psxrecomp_submodule": op_ensure_psxrecomp_submodule,
@@ -1235,6 +1304,8 @@ _OPS = {
     "emit_ci_workflow": op_emit_ci_workflow,
     "annotate_legacy_packaging": op_annotate_legacy_packaging,
     "probe_disc_refresh": op_probe_disc_refresh,
+    "enable_netplay": op_enable_netplay,
+    "disable_netplay": op_disable_netplay,
     "record_framework_pins": op_record_framework_pins,
     "patch_readme_metrics": op_patch_readme_metrics,
 }

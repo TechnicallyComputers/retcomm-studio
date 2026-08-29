@@ -254,6 +254,50 @@ def test_parity_checks(root: Path) -> None:
     (root / "snesrecomp" / ".git").unlink()
 
 
+def test_netplay_flip(root: Path) -> None:
+    print("netplay flip")
+    from project_studio import snesops
+
+    cml = root / "CMakeLists.txt"
+    base = cml.read_text(encoding="utf-8")
+    # The scaffold fixture has no launcher call; the op appends after
+    # add_executable-derived target discovery... it needs add_executable.
+    cml.write_text(base + "add_executable(ZedSNESRecomp src/main.c)\n",
+                   encoding="utf-8")
+
+    plan = snesops.build_plan(root, MigrateOptions(dry_run=True))
+    check(not any("netplay" in st.op_id for st in plan.steps),
+          "no netplay op planned without the flag")
+    plan = snesops.build_plan(root, MigrateOptions(enable_netplay=True))
+    check("snes_enable_netplay" in [st.op_id for st in plan.steps],
+          "--enable-netplay plans the enable op")
+    plan = snesops.build_plan(root,
+                              MigrateOptions(enable_netplay=True, players=1))
+    check("snes_enable_netplay" not in [st.op_id for st in plan.steps],
+          "1-player titles cannot opt in")
+
+    res = snesops._op_enable_netplay(root, MigrateOptions())
+    text = cml.read_text(encoding="utf-8")
+    check(res.ok and "snesrecomp_enable_recomp_net(ZedSNESRecomp)" in text,
+          "enable wires the call with the discovered target")
+    audit = {c.id: c for c in snesops.audit_project(root).checks}
+    check(audit["netplay"].status.value == "pass",
+          "audit reports netplay wired")
+
+    res = snesops._op_disable_netplay(root, MigrateOptions())
+    text = cml.read_text(encoding="utf-8")
+    check(res.ok and "# snesrecomp_enable_recomp_net(" in text,
+          "disable comments the call out")
+    res = snesops._op_enable_netplay(root, MigrateOptions())
+    text = cml.read_text(encoding="utf-8")
+    check(res.ok and "\nsnesrecomp_enable_recomp_net(" in text.replace(
+              "# snesrecomp", "XX"),
+          "re-enable uncomments rather than duplicating")
+    check(text.count("snesrecomp_enable_recomp_net(") == 1,
+          "exactly one call after the round trip")
+    cml.write_text(base, encoding="utf-8")
+
+
 def test_version_stamp(root: Path) -> None:
     print("lobby pin stamp")
     from project_studio import snesops
@@ -774,6 +818,7 @@ def main() -> int:
         test_repo_recognition(root)
         test_audit(root)
         test_parity_checks(root)
+        test_netplay_flip(root)
         test_version_stamp(root)
         test_plan_and_apply(root)
         test_digest_recovery(root)

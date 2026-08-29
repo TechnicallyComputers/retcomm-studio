@@ -275,6 +275,21 @@ if(NOT WIN32)
     target_link_libraries(spawn_test PRIVATE nlohmann_json::nlohmann_json)
 endif()
 
+# ---- pipe-drain test ---------------------------------------------------------
+# A child's stdout and stderr must be drained CONCURRENTLY. Draining stdout to
+# EOF first deadlocks past one pipe buffer of stderr, and below that still
+# withholds every stderr line until the child exits -- which is what made a
+# MinGW cross-build look frozen. No GPU, no repo:  ./build/pipe_drain_test
+if(NOT WIN32)
+    add_executable(pipe_drain_test
+        tests/pipe_drain_test.cpp
+        src/studio/studio_runner.cpp
+        src/studio/studio_model.cpp
+    )
+    target_include_directories(pipe_drain_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(pipe_drain_test PRIVATE nlohmann_json::nlohmann_json)
+endif()
+
 # ---- JSON-boundary test ------------------------------------------------------
 # The toolkit's optional fields are Python `str | None`, and nlohmann's value()
 # throws on a present-but-null key rather than using the fallback. That is a

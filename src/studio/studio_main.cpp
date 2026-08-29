@@ -151,6 +151,19 @@ float trailing_checkbox_width(const char* label) {
            s.ItemSpacing.x;
 }
 
+// Colour AND wrap. ImGui ships TextColored and TextWrapped but not both, and
+// an unwrapped explanatory paragraph widens the content region until the page
+// scrolls sideways. Same helper as the Frames / SNES panes.
+void wrapped(const ImVec4& col, const char* fmt, ...) IM_FMTARGS(2);
+void wrapped(const ImVec4& col, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextWrappedV(fmt, args);
+    ImGui::PopStyleColor();
+    va_end(args);
+}
+
 void left_label(const char* label, float col_w) {
     ImGui::AlignTextToFramePadding();
     const float x0 = ImGui::GetCursorPosX();
@@ -1316,15 +1329,17 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
               kLabelW);
     field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo), kLabelW);
 
-    // Netplay has no op in the SNES plan; a checkbox that reaches nothing is
-    // worse than an absent one. Probe DOES reach one now: with a ROM path in
-    // the image field, snes_probe_rom_refresh re-derives the identity digests
-    // and re-emits codegen_setup + regen.sh from them.
+    // Every checkbox reaches an op on both consoles now. Netplay maps to
+    // enable_netplay / snes_enable_netplay (build-side wiring; on SNES the
+    // launcher button additionally needs host code — the op's detail says
+    // so). Probe maps to probe_disc_refresh / snes_probe_rom_refresh with a
+    // path in the image field.
     if (!snes) {
         checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe disc", &model.migrate_probe);
     } else {
+        checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe ROM", &model.migrate_probe);
     }
@@ -1489,6 +1504,13 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         else
             model.np_netplay = false;
     }
+    // Netplay lives beside the seat count that gates it: a 1-player title
+    // cannot opt in, and bumping the count to 2+ suggests it by default.
+    ImGui::SameLine();
+    ImGui::BeginDisabled(model.np_players < 2);
+    ImGui::Checkbox("Netplay##np", &model.np_netplay);
+    ImGui::EndDisabled();
+    if (model.np_players < 2) model.np_netplay = false;
     if (snes) {
         // Seats above two need a Super Multitap; the script derives a layout
         // from the count, and this only overrides it.
@@ -1532,7 +1554,6 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
 
     checkbox_wrapped("recomp-ui", &model.np_ui);
     if (!snes) checkbox_wrapped("Wizard", &model.np_wizard);
-    checkbox_wrapped("Netplay##np", &model.np_netplay);
     if (snes) {
         if (ImGui::Checkbox("Rollback", &model.np_rollback)) {
             if (model.np_rollback) model.np_netplay = true;
@@ -2685,13 +2706,23 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     }
 
 #if !defined(_WIN32)
-    // The MinGW cross-build drives psxrecomp's build_windows_mingw.sh, which
-    // knows about PSX_NETPLAY, OpenBIOS staging and the psx-runtime target.
-    // There is no SNES counterpart yet, so the section is absent rather than
-    // present-and-broken.
-    if (!snes) {
+    // Both consoles cross-build, each through its own script: the PSX one also
+    // cross-compiles two emitters, stages OpenBIOS and drives PSX_NETPLAY,
+    // which a cartridge has none of. `build mingw` routes on the session's
+    // platform, so the controls below are identical.
+    {
     ImGui::Separator();
     ImGui::TextUnformatted("Windows (MinGW)");
+    if (snes) {
+        wrapped(th.text_muted,
+                "Cross-compile a Windows .exe from Linux (no GitHub CI). Needs "
+                "mingw-w64-gcc and a MinGW SDL — the backend is chosen from what "
+                "the sysroot actually has, since distro MinGW packages are "
+                "usually SDL2 while a native SNES build defaults to SDL3. "
+                "Regenerate C from ROM first: a cartridge build links src/gen/ "
+                "and there is nothing to compile without it. Bundle + Export "
+                "packages the existing MinGW build into a zip.");
+    } else {
     ImGui::TextColored(th.text_muted,
                        "Cross-compile a Windows .exe from Linux (no GitHub CI). "
                        "Needs mingw-w64-gcc + mingw-w64-sdl2. Full playable builds "
@@ -2700,12 +2731,20 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                        "an older MinGW cache has PSX_NETPLAY=OFF). "
                        "Bundle + Export packages the existing MinGW build into a zip "
                        "and opens a save dialog.");
+    }
     field_row("##mingw_bdir", "MinGW dir", model.mingw_build_dir, sizeof(model.mingw_build_dir),
               kLabelW);
-    checkbox_wrapped("Setup-host", &model.mingw_setup_host);
+    // Setup-host, Ensure and Dynamic SDL are psxrecomp concepts — a setup
+    // wizard host, "generate the game C first", and a shared-SDL link. The
+    // SNES script has none of them: it errors when src/gen/ is empty rather
+    // than generating, and picks its SDL from the sysroot. Showing dead
+    // checkboxes would just invite a run that ignores them.
+    if (!snes) checkbox_wrapped("Setup-host", &model.mingw_setup_host);
     checkbox_wrapped("Package zip", &model.mingw_package);
-    checkbox_wrapped("Ensure first", &model.mingw_ensure);
-    checkbox_wrapped("Dynamic SDL", &model.mingw_dynamic);
+    if (!snes) {
+        checkbox_wrapped("Ensure first", &model.mingw_ensure);
+        checkbox_wrapped("Dynamic SDL", &model.mingw_dynamic);
+    }
     end_wrapped_line();
     auto mingw_build_dir_arg = [&]() -> std::string {
         // Match script defaults: setup-host → build-mingw-setup when UI still says build-mingw.
@@ -2726,10 +2765,10 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--build-dir");
             args.push_back(bdir);
         }
-        if (model.mingw_setup_host) args.push_back("--setup-host");
+        if (!snes && model.mingw_setup_host) args.push_back("--setup-host");
         if (model.mingw_package) args.push_back("--package");
-        if (model.mingw_ensure) args.push_back("--ensure");
-        if (model.mingw_dynamic) args.push_back("--dynamic");
+        if (!snes && model.mingw_ensure) args.push_back("--ensure");
+        if (!snes && model.mingw_dynamic) args.push_back("--dynamic");
         if (model.build_jobs[0]) {
             args.push_back("--jobs");
             args.push_back(model.build_jobs);
@@ -2747,8 +2786,8 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             args.push_back("--build-dir");
             args.push_back(bdir);
         }
-        if (model.mingw_setup_host) args.push_back("--setup-host");
-        if (model.mingw_dynamic) args.push_back("--dynamic");
+        if (!snes && model.mingw_setup_host) args.push_back("--setup-host");
+        if (!snes && model.mingw_dynamic) args.push_back("--dynamic");
         retcomm::studio::run_project_studio_async(
             model, std::move(args), [&model, window](RunResult r) {
                 if (!r.ok()) {

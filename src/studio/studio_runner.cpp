@@ -16,7 +16,9 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -28,6 +30,47 @@ struct PendingDone {
     DoneFn fn;
     RunResult result;
 };
+
+// One captured output stream of a child process.
+//
+// Both of a child's pipes have to be drained CONCURRENTLY. Reading stdout to
+// EOF and only then reading stderr -- what this file used to do -- fails two
+// ways. It deadlocks outright once the child writes more than one pipe buffer
+// (64 KiB on Linux) to stderr: the child blocks in write(2), the parent blocks
+// in read(1), and neither moves again. And even below that threshold it holds
+// back every stderr line until the child exits, so a cross-build that reports
+// progress on stderr shows an empty log for its whole run and is
+// indistinguishable from a hang.
+//
+// Declared out here, above the platform fork, so the line splitting cannot
+// drift between the two implementations.
+struct CapturedStream {
+    std::string* dest = nullptr;   // full text, handed back in RunResult
+    bool to_log = false;           // also stream to the Studio log, line by line
+    std::string acc;               // bytes not yet terminated by a newline
+    bool open = true;
+};
+
+// Append freshly read bytes, emitting each completed line to the log as it
+// arrives. At end of stream, `final_flush` releases a trailing partial line.
+void stream_take(CapturedStream& s, const char* buf, size_t n, StudioModel* log_model) {
+    s.dest->append(buf, buf + n);
+    if (!s.to_log || !log_model) return;
+    s.acc.append(buf, buf + n);
+    size_t pos;
+    while ((pos = s.acc.find('\n')) != std::string::npos) {
+        std::string line = s.acc.substr(0, pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        log_model->append_log(std::move(line));
+        s.acc.erase(0, pos + 1);
+    }
+}
+
+void stream_finish(CapturedStream& s, StudioModel* log_model) {
+    if (s.to_log && log_model && !s.acc.empty()) log_model->append_log(s.acc);
+    s.acc.clear();
+    s.open = false;
+}
 
 std::mutex g_done_mu;
 std::vector<PendingDone> g_done_queue;
@@ -243,28 +286,39 @@ RunResult run_process(const std::string& exe, const std::vector<std::string>& ar
         return out;
     }
 
-    auto read_pipe = [&](HANDLE h, std::string& dest, bool to_log) {
-        char buf[4096];
-        DWORD n = 0;
-        std::string line_acc;
-        while (ReadFile(h, buf, sizeof(buf), &n, nullptr) && n > 0) {
-            dest.append(buf, buf + n);
-            if (!to_log || !log_model) continue;
-            line_acc.append(buf, buf + n);
-            size_t pos;
-            while ((pos = line_acc.find('\n')) != std::string::npos) {
-                std::string line = line_acc.substr(0, pos);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                log_model->append_log(line);
-                line_acc.erase(0, pos + 1);
-            }
-        }
-        if (to_log && log_model && !line_acc.empty()) log_model->append_log(line_acc);
-    };
+    // Poll both handles so neither pipe can fill and stall the child -- see
+    // CapturedStream. ReadFile on an anonymous pipe blocks, so ask
+    // PeekNamedPipe what is available and only ever read that much.
+    HANDLE handles[2] = {out_r, err_r};
+    CapturedStream streams[2];
+    streams[0].dest = &out.stdout_text;
+    streams[0].to_log = log_stdout;
+    streams[1].dest = &out.stderr_text;
+    streams[1].to_log = true;
 
-    // Interleave by draining both (simple sequential is OK for CLI JSON tools).
-    read_pipe(out_r, out.stdout_text, log_stdout);
-    read_pipe(err_r, out.stderr_text, true);
+    while (streams[0].open || streams[1].open) {
+        bool progressed = false;
+        for (int i = 0; i < 2; ++i) {
+            CapturedStream& st = streams[i];
+            if (!st.open) continue;
+            DWORD avail = 0;
+            if (!PeekNamedPipe(handles[i], nullptr, 0, nullptr, &avail, nullptr)) {
+                stream_finish(st, log_model);  // write end closed: child is done with it
+                continue;
+            }
+            if (avail == 0) continue;
+            char buf[4096];
+            DWORD want = avail < sizeof(buf) ? avail : static_cast<DWORD>(sizeof(buf));
+            DWORD n = 0;
+            if (!ReadFile(handles[i], buf, want, &n, nullptr) || n == 0) {
+                stream_finish(st, log_model);
+                continue;
+            }
+            stream_take(st, buf, static_cast<size_t>(n), log_model);
+            progressed = true;
+        }
+        if (!progressed && (streams[0].open || streams[1].open)) Sleep(5);
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
@@ -310,27 +364,45 @@ RunResult run_process(const std::string& exe, const std::vector<std::string>& ar
     close(out_pipe[1]);
     close(err_pipe[1]);
 
-    auto read_fd = [&](int fd, std::string& dest, bool to_log) {
-        char buf[4096];
-        std::string line_acc;
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof(buf))) > 0) {
-            dest.append(buf, buf + n);
-            if (!to_log || !log_model) continue;
-            line_acc.append(buf, buf + n);
-            size_t pos;
-            while ((pos = line_acc.find('\n')) != std::string::npos) {
-                std::string line = line_acc.substr(0, pos);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                log_model->append_log(line);
-                line_acc.erase(0, pos + 1);
+    // poll() both pipes so whichever has bytes is served -- see CapturedStream.
+    const int fds[2] = {out_pipe[0], err_pipe[0]};
+    CapturedStream streams[2];
+    streams[0].dest = &out.stdout_text;
+    streams[0].to_log = log_stdout;
+    streams[1].dest = &out.stderr_text;
+    streams[1].to_log = true;
+
+    while (streams[0].open || streams[1].open) {
+        struct pollfd pfd[2];
+        int idx[2] = {-1, -1};
+        nfds_t nfd = 0;
+        for (int i = 0; i < 2; ++i) {
+            if (!streams[i].open) continue;
+            pfd[nfd].fd = fds[i];
+            pfd[nfd].events = POLLIN;
+            pfd[nfd].revents = 0;
+            idx[nfd] = i;
+            ++nfd;
+        }
+        if (nfd == 0) break;
+        if (poll(pfd, nfd, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;  // the reads below would spin; treat as end of capture
+        }
+        for (nfds_t k = 0; k < nfd; ++k) {
+            if (pfd[k].revents == 0) continue;
+            CapturedStream& st = streams[idx[k]];
+            char buf[4096];
+            ssize_t n = read(pfd[k].fd, buf, sizeof(buf));
+            if (n > 0) {
+                stream_take(st, buf, static_cast<size_t>(n), log_model);
+            } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+                stream_finish(st, log_model);
             }
         }
-        if (to_log && log_model && !line_acc.empty()) log_model->append_log(line_acc);
-        close(fd);
-    };
-    read_fd(out_pipe[0], out.stdout_text, log_stdout);
-    read_fd(err_pipe[0], out.stderr_text, true);
+    }
+    close(out_pipe[0]);
+    close(err_pipe[0]);
     int status = 0;
     waitpid(pid, &status, 0);
     if (WIFEXITED(status)) out.exit_code = WEXITSTATUS(status);

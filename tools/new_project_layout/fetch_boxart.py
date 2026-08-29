@@ -304,6 +304,12 @@ def main() -> int:
         help="attribution file (default: next to TGA as BOXART_SOURCE.txt)",
     )
     ap.add_argument(
+        "--system",
+        default=DEFAULT_SYSTEM,
+        help="libretro-thumbnails system name "
+             f"(default: {DEFAULT_SYSTEM!r})",
+    )
+    ap.add_argument(
         "--png-out",
         default="",
         help="output PNG path (default: same stem as --out with .png)",
@@ -325,6 +331,7 @@ def main() -> int:
             display_name=args.display_name,
             extra_names=list(args.name),
             png_path=png_out,
+            system=args.system,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(str(exc) or "boxart fetch failed", file=sys.stderr)

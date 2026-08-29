@@ -28,6 +28,8 @@ _OP_ORDER = [
     "emit_ci_workflow",
     "annotate_legacy_packaging",
     "probe_disc_refresh",
+    "enable_netplay",
+    "disable_netplay",
     "record_framework_pins",
     "patch_readme_metrics",
 ]
@@ -51,6 +53,8 @@ _OP_TITLES = {
     "emit_ci_workflow": "Emit setup-host release.yml",
     "annotate_legacy_packaging": "Annotate legacy prebuilt packaging",
     "probe_disc_refresh": "Refresh disc identity via probe_disc.py",
+    "enable_netplay": "Enable netplay (ENABLE_NETPLAY_IF_PRESENT)",
+    "disable_netplay": "Disable netplay (remove ENABLE_NETPLAY_IF_PRESENT)",
     "record_framework_pins": "Write framework_pins.txt",
     "patch_readme_metrics": "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
 }
@@ -70,6 +74,16 @@ def build_plan(
     # Option-gated extras
     if options.probe_disc and options.disc:
         wanted.add("probe_disc_refresh")
+    # Netplay is opt-in both ways: only an explicit flag plans a flip. When
+    # the full CMake rewrite is planned anyway, the template rewrite already
+    # honors enable_netplay, so the standalone op is for repos NOT being
+    # rewritten.
+    if options.enable_netplay and options.players >= 2 \
+            and "rewrite_cmake_setup_host" not in wanted:
+        wanted.add("enable_netplay")
+    if options.disable_netplay:
+        wanted.discard("enable_netplay")
+        wanted.add("disable_netplay")
     if options.record_pins:
         wanted.add("record_framework_pins")
     if options.merge_gitignore:

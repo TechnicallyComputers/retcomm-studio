@@ -66,6 +66,7 @@ def _options_from_args(args: argparse.Namespace) -> MigrateOptions:
         enable_recomp_ui=not args.no_recomp_ui,
         enable_wizard=not args.no_wizard,
         enable_netplay=args.enable_netplay,
+        disable_netplay=bool(getattr(args, "disable_netplay", False)),
         lobby_url=args.lobby_url,
         enable_ci=not args.no_ci,
         relocate_boxart=not args.no_boxart,
@@ -1488,18 +1489,13 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
-    if platforms.current().key == "snes":
-        # The script configures PSX_NETPLAY, stages OpenBIOS and builds
-        # psx-runtime. Refusing is honest; running it against a SNES tree would
-        # fail deep inside cmake with a message about none of that.
-        print(
-            "error: build mingw is a psxrecomp cross-build; there is no snesrecomp "
-            "counterpart yet. Use CI, or build natively on Windows.",
-            file=sys.stderr,
-        )
-        return 2
-
-    script = _TOOLKIT / "scripts" / "build_windows_mingw.sh"
+    # Each console cross-builds through its own script: the PSX one also
+    # cross-compiles two emitters, stages OpenBIOS and drives PSX_NETPLAY, none
+    # of which a cartridge has. Same flags, same MINGW_ZIP= final line.
+    if platforms.is_snes():
+        script = _TOOLKIT / "scripts" / "build_windows_mingw_snes.sh"
+    else:
+        script = _TOOLKIT / "scripts" / "build_windows_mingw.sh"
     if not script.is_file():
         print(f"error: missing {script}", file=sys.stderr)
         return 2
@@ -1523,7 +1519,11 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     if getattr(args, "package_only", False):
         cmd.append("--package-only")
     if getattr(args, "setup_host", False):
-        cmd.append("--setup-host")
+        if platforms.is_snes():
+            print("note: --setup-host is a psxrecomp setup-wizard mode; ignored on SNES",
+                  file=sys.stderr)
+        else:
+            cmd.append("--setup-host")
     if getattr(args, "package", False) and not getattr(args, "package_only", False):
         cmd.append("--package")
     if getattr(args, "dynamic", False):
@@ -1994,6 +1994,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--github-repo", help="GitHub repo name for README download badges")
         p.add_argument("--window-title", help="WINDOW_TITLE override")
         p.add_argument("--enable-netplay", action="store_true")
+        p.add_argument("--disable-netplay", action="store_true",
+                       help="Plan the op that removes netplay from the build")
         p.add_argument("--lobby-url", default="ws://netplay.retcomm.net:8765")
         p.add_argument("--no-recomp-ui", action="store_true",
                        help="Ignored for setup-host apply (forced on)")

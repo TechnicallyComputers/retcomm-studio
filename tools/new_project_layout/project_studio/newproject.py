@@ -274,6 +274,7 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     flag(opts.enable_netplay or opts.enable_rollback, "--netplay", "--no-netplay")
     flag(opts.enable_rollback, "--rollback", "--no-rollback")
     flag(opts.enable_ci, "--ci", "--no-ci")
+    flag(opts.fetch_boxart, "--fetch-boxart", "--no-fetch-boxart")
     flag(opts.do_generate or opts.do_build, "--generate", "--no-generate")
     flag(opts.do_build, "--build", "--no-build")
     flag(opts.create_github, "--create-github", "--no-github")
@@ -294,8 +295,8 @@ def snes_ignored_fields(opts: NewProjectOptions) -> list[str]:
     ):
         if (value or "").strip():
             ignored.append(label)
-    if opts.fetch_boxart:
-        ignored.append("Boxart")
+    # Boxart is no longer ignored: the SNES wizard grew --fetch-boxart and
+    # fetches SNES Named_Boxarts exactly the way the PSX wizard does.
     if opts.stage_disc:
         ignored.append("Stage image")
     return ignored
