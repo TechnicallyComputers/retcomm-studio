@@ -1750,11 +1750,14 @@ def cmd_build_run(args: argparse.Namespace) -> int:
         if not rom_p.is_file():
             print(f"error: ROM not found: {rom_p}", file=sys.stderr)
             return 2
-        # FIRST, not appended. Both the scaffolded host and the runner's
-        # snesrecomp_launcher_resolve_rom_sha256() read the ROM from argv[1],
-        # so a flag ahead of it (e.g. --args "--launcher") makes the ROM
-        # invisible to both and the host falls through to a file picker.
-        extra.insert(0, str(rom_p))
+        # AFTER the flags, not before. The SNES hosts take their flags first
+        # (`<exe> --launcher <rom>`): mmx23_host_main.inc accepts --launcher
+        # only as argv[1], and MetalWarriors stops scanning flags at the first
+        # non-flag argument. Putting the ROM first hid --launcher from both, so
+        # every title booted straight past its launcher. The runner's resolver
+        # and the scaffold host now scan for the first non-flag argument, so
+        # this order satisfies all of them.
+        extra.append(str(rom_p))
 
     def _log(line: str) -> None:
         # Piped into Studio — must flush or activity log stalls until buffer fill.

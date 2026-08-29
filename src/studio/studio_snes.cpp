@@ -1159,13 +1159,13 @@ void draw_snes(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
             ImGui::SameLine();
             if (accent_button(th, "Launch game")) {
                 model.snes_launch_log = (fs::path(root) / "snes-diag.log").string();
-                std::vector<std::string> args;
+                // Flags first, then the ROM: mmx23_host_main.inc accepts
+                // --launcher only as argv[1], and MetalWarriors stops scanning
+                // flags at the first non-flag argument. ROM-first hid the flag
+                // from both and they booted straight past the launcher.
+                std::vector<std::string> args = {"--launcher"};
                 const std::string rom = effective_rom(model);
                 if (!rom.empty()) args.push_back(rom);
-                // A ROM on the argv preloads the launcher; it no longer skips
-                // it. Ask for it explicitly anyway, so this keeps showing the
-                // launcher against a host built before that changed.
-                args.push_back("--launcher");
                 std::vector<std::pair<std::string, std::string>> env = {
                     {"SNESRECOMP_DEBUG_PORT", std::to_string(model.snes_port)},
                 };
