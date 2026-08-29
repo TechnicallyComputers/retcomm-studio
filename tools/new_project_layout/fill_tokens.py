@@ -8,7 +8,7 @@ import re
 import sys
 from pathlib import Path
 
-def github_about_description(framework: str = "psxrecomp",
+def github_about_description(framework: str = "PSXrecomp",
                              console: str = "Sony PlayStation") -> str:
     """The GitHub About line, for the console the port is actually built on.
 

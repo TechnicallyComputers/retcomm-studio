@@ -8,8 +8,8 @@ import subprocess
 from pathlib import Path
 
 from fill_tokens import (
-    GITHUB_ABOUT_DESCRIPTION,
     GITHUB_ABOUT_HOMEPAGE,
+    github_about_description,
     sanitize_github_name,
 )
 
@@ -129,13 +129,24 @@ def apply_github_about(
 ) -> tuple[bool, str]:
     """Set GitHub About description + Discord homepage via ``gh repo edit``."""
     slug = f"{sanitize_github_name(owner) or DEFAULT_GITHUB_OWNER}/{sanitize_github_name(repo) or 'repo'}"
+    # Built for THIS session's console. Both migrations call this, and it used
+    # to send one hardcoded PSX string — so migrating a SNES port advertised it
+    # as "Made with PSXrecomp, a Sony PlayStation game static recompiler
+    # ecosystem" on a Super Nintendo repository.
+    from project_studio import platforms
+
+    profile = platforms.current()
+    description = github_about_description(
+        profile.about_brand or profile.framework,
+        profile.about_console or profile.display,
+    )
     cmd = [
         "gh",
         "repo",
         "edit",
         slug,
         "--description",
-        GITHUB_ABOUT_DESCRIPTION,
+        description,
         "--homepage",
         GITHUB_ABOUT_HOMEPAGE,
     ]

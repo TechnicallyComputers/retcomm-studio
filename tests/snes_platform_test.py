@@ -727,6 +727,41 @@ def test_snes_functions() -> None:
         )
 
 
+def test_github_about_names_the_console() -> None:
+    """The About line must name the console the port is actually built on.
+
+    Both migrations call apply_github_about(), and it sent one hardcoded PSX
+    string — so migrating a SNES port advertised it as "Made with PSXrecomp, a
+    Sony PlayStation game static recompiler ecosystem" on a Super Nintendo
+    repository. The README was right the whole time; only the About was wrong,
+    which is the field nobody re-reads after it is set once.
+    """
+    print("github About")
+    from project_studio.readme_metrics import apply_github_about
+
+    def about(kind: str) -> str:
+        platforms.set_current(kind)
+        ok, msg = apply_github_about("TechnicallyComputers", "Example", dry_run=True)
+        check(ok, f"{kind}: dry-run builds a command")
+        return msg
+
+    snes = about("snes")
+    check("SNESrecomp" in snes, "a SNES session says SNESrecomp")
+    check("Super Nintendo" in snes, "...and Super Nintendo")
+    check("PSXrecomp" not in snes and "PlayStation" not in snes,
+          "and never mentions the PlayStation")
+
+    psx = about("psx")
+    # Byte-identical to the string shipped before this was made per-console, so
+    # re-migrating a PSX port does not rewrite its About.
+    check(
+        "Made with PSXrecomp, a Sony PlayStation game static recompiler "
+        "ecosystem · Part of the R.A.I.D. community" in psx,
+        "a PSX session is unchanged, word for word",
+    )
+    platforms.set_current("snes")
+
+
 def main() -> int:
     if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
         print("git not available — skipping")
@@ -751,6 +786,7 @@ def main() -> int:
     test_launch_rom()
     test_module_targets()
     test_snes_functions()
+    test_github_about_names_the_console()
     print("FAILED" if failures else "PASSED")
     return 1 if failures else 0
 

@@ -34,6 +34,13 @@ class PlatformProfile:
     default_target: str  # CMake target, "" = derive from project()
     # Relative file that proves a directory really is the framework checkout
     # (rather than an empty submodule slot with the right name).
+    # Brand spelling for prose aimed at people (the GitHub About line), as
+    # distinct from `framework`, which is the checkout/submodule directory.
+    about_brand: str = ""
+    # Console name as it reads in prose. Distinct from `display`, which is the
+    # short label the GUI shows: the About line says "Sony PlayStation" where
+    # the platform picker says "PlayStation".
+    about_console: str = ""
     framework_marker: str = ""
     repo_markers: tuple[str, ...] = field(default_factory=tuple)
 
@@ -49,6 +56,8 @@ PSX = PlatformProfile(
     image_exts=(".cue",),
     image_label="Disc .cue",
     default_target="psx-runtime",
+    about_brand="PSXrecomp",
+    about_console="Sony PlayStation",
     framework_marker="runtime/runtime.cmake",
     repo_markers=("game.toml",),
 )
@@ -68,6 +77,8 @@ SNES = PlatformProfile(
     image_exts=(".sfc", ".smc"),
     image_label="ROM (.sfc)",
     default_target="",  # SNES projects name the target after the project
+    about_brand="SNESrecomp",
+    about_console="Super Nintendo",
     framework_marker="runner/runner.cmake",
     repo_markers=("recomp",),
 )
