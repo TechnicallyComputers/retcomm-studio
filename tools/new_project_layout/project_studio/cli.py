@@ -676,6 +676,23 @@ def _root_or_die(args: argparse.Namespace) -> Path | None:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return None
+    # Refuse a root CMake cannot build from, here rather than 200 lines into a
+    # configure. A ':' in the path makes FetchContent's sub-build report a
+    # truncated path the user never typed ("…/Marvel vs. Capcom.rule which
+    # already has a custom rule", once per ExternalProject step), which reads as
+    # a broken dependency rather than a directory that needs renaming. Spaces
+    # are fine and are deliberately not flagged. See fill_tokens.
+    from fill_tokens import path_build_problems, safe_path_suggestion
+
+    problems = path_build_problems(root)
+    if problems:
+        print(f"error: this project's path cannot be built from:\n  {root}",
+              file=sys.stderr)
+        for why in problems:
+            print(f"  - it {why}", file=sys.stderr)
+        print("\nRename the directory, then re-point Studio at it. Suggested:\n"
+              f"  {safe_path_suggestion(root)}", file=sys.stderr)
+        return None
     return root
 
 

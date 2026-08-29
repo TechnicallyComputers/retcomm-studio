@@ -42,6 +42,74 @@ def derive_zip_prefix(name: str) -> str:
     return (slug or "game")[:20]
 
 
+# ---- project path safety -----------------------------------------------------
+# Characters that make a filesystem path unusable as a CMake project root.
+#
+# ':' and ';' are not cosmetic. CMake writes custom-command outputs into
+# makefile/ninja dependency rules, where ':' is the rule separator, and it joins
+# list arguments with ';'. A root containing either is silently split, and the
+# build dies far from the cause: FetchContent's ExternalProject sub-build
+# reports "Attempt to add a custom rule to output <path cut at the colon>.rule
+# which already has a custom rule" once per step, naming a path nobody typed.
+#
+# Measured against the pinned toolchain CMake (3.31.12), configuring a
+# FetchContent dependency from a source dir whose name contains each character:
+#   "plain"           -> OK
+#   "with spaces"     -> OK          <- spaces are fine; do not flag them
+#   "with: colon"     -> fails in ExternalProject
+#   "with; semicolon" -> fails earlier, in compiler detection
+#
+# The second set is what Windows cannot put in a filename at all. A port whose
+# directory carries one cannot be cloned by the players it ships to, however
+# well it builds on the host that made it.
+PATH_FATAL_CHARS = {
+    ":": "separates targets from dependencies in build rules",
+    ";": "separates list elements in CMake",
+    "\n": "newline",
+    "\r": "carriage return",
+}
+PATH_WINDOWS_ILLEGAL = '*?"<>|'
+
+
+# A leading Windows drive letter, matched by shape rather than by Path.drive:
+# Path("C:/x").drive is "C:" on Windows but "" on Linux, and this check has to
+# give the same verdict wherever it runs -- Studio is cross-platform, and a
+# guard that fires on one host and not the other is worse than none.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:(?=[\\/])")
+
+
+def _path_body(path) -> str:
+    """The path minus any drive letter, so "C:/…" is not read as a colon fault."""
+    return _DRIVE_RE.sub("", str(path))
+
+
+def path_build_problems(path) -> list[str]:
+    """Human-readable reasons `path` cannot serve as a project root. Empty = fine."""
+    body = _path_body(path)
+    out: list[str] = []
+    for ch, why in PATH_FATAL_CHARS.items():
+        if ch in body:
+            shown = {"\n": "\\n", "\r": "\\r"}.get(ch, ch)
+            out.append(f"contains '{shown}', which {why} — CMake cannot build from it")
+    for ch in PATH_WINDOWS_ILLEGAL:
+        if ch in body:
+            out.append(f"contains '{ch}', which Windows cannot put in a path — "
+                       "players could not clone this repo")
+    return out
+
+
+def safe_path_suggestion(path) -> str:
+    """`path` with the hostile characters replaced, for a rename hint."""
+    p = Path(path)
+    name = p.name
+    for ch in PATH_FATAL_CHARS:
+        name = name.replace(ch, " -" if ch == ":" else " ")
+    for ch in PATH_WINDOWS_ILLEGAL:
+        name = name.replace(ch, "")
+    name = re.sub(r"\s{2,}", " ", name).strip(" .-") or "project"
+    return str(p.with_name(name))
+
+
 def sanitize_github_name(name: str) -> str:
     """GitHub owner/repo slug: spaces → '-', drop illegal chars, keep [A-Za-z0-9._-]."""
     s = (name or "").strip()
