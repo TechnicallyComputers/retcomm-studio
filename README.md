@@ -264,3 +264,23 @@ cmake --build build --target snes_platform_test   # or: python3 tests/snes_platf
 ./build/spawn_test
 ./build/debug_client_test
 ```
+
+
+## License
+
+RetComM Studio is licensed under the **PolyForm Noncommercial License 1.0.0** —
+use, modification and distribution are permitted for **noncommercial purposes
+only**. See [`LICENSE`](LICENSE).
+
+**Commercial use requires a separate license.** Contact
+[alex@technicallycomputers.ca](mailto:alex@technicallycomputers.ca) — see
+[`COMMERCIAL.md`](COMMERCIAL.md) for what counts as commercial and what to
+include when you get in touch.
+
+Not everything in this repository is covered by those terms. Third-party
+components keep their own licenses, and the emulator patches under
+`tools/psx_analysis/` are derivative works of the emulators they patch. See
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+Versions published before this change remain available under the MIT license
+they were released under.
