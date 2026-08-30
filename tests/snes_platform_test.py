@@ -165,7 +165,12 @@ def test_plan_and_apply(root: Path) -> None:
     pkg = root / "scripts" / "package_release.sh"
     check(pkg.is_file(), "packager emitted from the wizard template")
     check("@ZIP_PREFIX@" not in pkg.read_text(encoding="utf-8"), "no @TOKEN@ survives the fill")
-    check(pkg.stat().st_mode & 0o111 != 0, "the emitted packager is executable")
+    # NTFS has no execute bit, so chmod(+x) is a documented no-op on Windows
+    # and this would fail for a reason that says nothing about the emitter.
+    # Nothing depends on the bit either: the packager is always invoked as
+    # "bash <script>", never executed directly.
+    if os.name != "nt":
+        check(pkg.stat().st_mode & 0o111 != 0, "the emitted packager is executable")
     check(
         (root / ".github" / "workflows" / "release.yml").is_file(),
         "CI workflow emitted from the wizard template",

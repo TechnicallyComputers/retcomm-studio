@@ -23,6 +23,7 @@ from typing import Callable
 
 from . import platforms
 from .gitops import CmdResult
+from .paths import find_bash
 
 DEFAULT_BUILD_DIR = "build-release"
 DEFAULT_TARGET = "psx-runtime"
@@ -527,7 +528,14 @@ def generate_snes_c(
             False,
             f"No tools/regen.sh in {root} — run Migrate → Emit tools/regen.sh first",
         )
-    cmd = ["sh", str(script)]
+    shell = find_bash()
+    if shell is None:
+        return CmdResult(
+            False,
+            "No POSIX shell found to run tools/regen.sh. On Windows install "
+            "Git for Windows (it ships bash.exe); on Linux/macOS put bash on PATH.",
+        )
+    cmd = [shell, str(script)]
     if rom:
         rom_p = Path(rom).expanduser()
         if not rom_p.is_file():
@@ -820,7 +828,7 @@ def _regen_bios_profile(
         return CmdResult(False, f"BIOS profile missing: {profile}")
 
     script = fw / "tools" / "regen_bios.sh"
-    bash = shutil.which("bash") or shutil.which("bash.exe")
+    bash = find_bash()
 
     if script.is_file() and bash:
         cmd = [bash, str(script), "--config", profile_rel]
@@ -905,7 +913,7 @@ def ensure_bios_backends(
     # Prefer regen_bios.sh (builds emitter + fingerprints). It does not configure
     # the recompiler — ensure a usable tree (or a found binary) first.
     script = fw / "tools" / "regen_bios.sh"
-    bash = shutil.which("bash") or shutil.which("bash.exe")
+    bash = find_bash()
     need_emitter_setup = not (
         _any_usable_recompiler_build(fw) or _find_psxrecomp_bios(fw, root) is not None
     )
@@ -1639,7 +1647,7 @@ def package_local(
     version = project_version(root)
     dist = root / "dist"
     script = root / "scripts" / "package_release.sh"
-    bash = shutil.which("bash")
+    bash = find_bash()
     use_script = use_repo_script and script.is_file() and bool(bash)
 
     if dry_run:

@@ -22,7 +22,34 @@ import json
 import os
 import socket
 import struct
+import sys
 import zlib
+
+
+def _force_utf8_streams() -> None:
+    """Let these tools print the arrows and box glyphs they format with.
+
+    The Windows console default is cp1252, which cannot encode U+2192 or the
+    box-drawing characters the tables use, so one such line would abort the
+    tool with UnicodeEncodeError. Studio sets PYTHONUTF8 for everything it
+    spawns; a developer running these straight from a terminal gets no such
+    help. It lives here for the same reason DebugConn does -- every tool in
+    this directory goes through this module, so none needs a private copy.
+
+    Best effort: a stream that is already UTF-8, or is not a reconfigurable
+    text wrapper, is left exactly as it is.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        _enc = (getattr(_stream, "encoding", "") or "").lower().replace("-", "")
+        if _enc.startswith("utf8"):
+            continue
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_streams()
 
 # MetalWarriorsSNESRecomp uses 4380; snesrecomp's own harnesses use 4377
 # (recomp) / 4378 (oracle). There is no single reserved port — pass --port.

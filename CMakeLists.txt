@@ -227,6 +227,11 @@ add_executable(analysis_load_test
 target_include_directories(analysis_load_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(analysis_load_test PRIVATE nlohmann_json::nlohmann_json)
+# It compiles studio_debug.cpp, so it needs Winsock for the same reason
+# snes_load_test does. Without this the target fails to LINK on Windows only.
+if(WIN32)
+    target_link_libraries(analysis_load_test PRIVATE ws2_32)
+endif()
 
 # ---- Frames tab data-path test ----------------------------------------------
 # studio_frames_data.cpp is ImGui-free for the same reason studio_analysis.cpp
@@ -330,3 +335,6 @@ target_include_directories(debug_client_test PRIVATE
 target_link_libraries(debug_client_test PRIVATE nlohmann_json::nlohmann_json)
 find_package(Threads REQUIRED)
 target_link_libraries(debug_client_test PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(debug_client_test PRIVATE ws2_32)
+endif()

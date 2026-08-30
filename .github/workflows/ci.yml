@@ -1,0 +1,203 @@
+name: CI
+
+# Build and test on every push and PR, on Windows and Linux.
+#
+# The release workflow is workflow_dispatch only, so until this existed the
+# first sign of a Windows break was a failed release. Two targets
+# (debug_client_test, analysis_load_test) had in fact been unbuildable on
+# Windows -- one missing a Winsock shim, one missing ws2_32 -- and nothing
+# reported it, because nothing built Windows outside a release.
+#
+# The GUI is built in full rather than only the test targets on purpose:
+# studio_main / studio_frames / studio_snes / studio_functions are ~9k lines
+# that NO test target compiles, so a tests-only job would miss a compile error
+# in most of the codebase.
+#
+# Icons and fonts are committed (assets/retcomm-studio.ico, assets/fonts), so
+# packaging/make-icons.sh -- and its rsvg/imagemagick dependency -- is not
+# needed to build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDL_TAG: "release-3.2.16"
+
+jobs:
+  windows:
+    name: windows-x64 (MSVC)
+    runs-on: windows-2022
+    env:
+      RETCOMM_VCPKG: ${{ github.workspace }}/retcomm-vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Caches the BUILT packages, not the vcpkg checkout: a cache hit turns
+      # the SDL3 install into an unpack instead of a compile.
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $baseline = "9d7f79f56ae1a9b4704d6a7fb8237e347a974133"
+          git clone https://github.com/microsoft/vcpkg.git $env:RETCOMM_VCPKG
+          git -C $env:RETCOMM_VCPKG checkout $baseline
+          $metaPath = Join-Path $env:RETCOMM_VCPKG "scripts\vcpkg-tool-metadata.txt"
+          $meta = ConvertFrom-StringData (Get-Content $metaPath -Raw)
+          $tag = $meta.VCPKG_TOOL_RELEASE_TAG
+          $url = "https://github.com/microsoft/vcpkg-tool/releases/download/$tag/vcpkg.exe"
+          $dest = Join-Path $env:RETCOMM_VCPKG "vcpkg.exe"
+          $ok = $false
+          for ($i = 1; $i -le 10; $i++) {
+            if (Test-Path $dest) { Remove-Item -LiteralPath $dest -Force }
+            & curl.exe -fsSL --retry 5 --retry-all-errors --retry-delay 2 `
+              --connect-timeout 30 --max-time 300 -o $dest $url
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $dest) -and ((Get-Item $dest).Length -gt 1MB)) {
+              $ok = $true
+              break
+            }
+            Start-Sleep -Seconds ([Math]::Min(60, 3 * $i))
+          }
+          if (-not $ok) { throw "Failed to download vcpkg.exe" }
+          Set-Content -LiteralPath (Join-Path $env:RETCOMM_VCPKG "vcpkg.disable-metrics") -Value ""
+          & $dest version --disable-metrics
+
+      - name: Configure & build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE="${RETCOMM_VCPKG}/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=x64-windows \
+            -DCMAKE_INSTALL_PREFIX="$PWD/out"
+          cmake --build build --config Release -j
+
+      - name: Install & check layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --install build --config Release
+          test -f out/bin/RetComM-Studio.exe
+          test -d out/share/retcomm-studio/toolkit/project_studio
+          test -d out/share/retcomm-studio/psx_analysis
+
+      # analysis_load_test is omitted: with no argument it only prints usage and
+      # exits 0, so running it bare would assert nothing. It needs a repo that
+      # has an analysis/ bundle.
+      - name: C++ data-layer tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in json_null_test frames_load_test snes_load_test debug_client_test; do
+            echo "== $t =="
+            "./build/Release/$t.exe"
+          done
+
+      # psx_analysis_test is omitted: gen_oracle_caps.py --check needs a sibling
+      # psxrecomp checkout to regenerate the Beetle table, and reports the
+      # committed oracle_caps.json as stale without one. It fails the same way
+      # on Linux, so it is an integration test rather than a CI gate.
+      - name: Python toolkit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in snes_platform_test project_path_test ui_wrapping_test snes_analysis_test; do
+            echo "== $t =="
+            python "tests/$t.py"
+          done
+
+  linux:
+    name: linux-x64 (gcc)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libgl1-mesa-dev libfreetype6-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxinerama-dev libxss-dev libwayland-dev \
+            libxkbcommon-dev libasound2-dev libpulse-dev \
+            libibus-1.0-dev libudev-dev
+
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ runner.os }}-${{ env.SDL_TAG }}
+
+      - name: Build SDL3
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${SDL_TAG}" https://github.com/libsdl-org/SDL.git "$HOME/SDL"
+          cmake -G Ninja -S "$HOME/SDL" -B "$HOME/sdl-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/sdl3" \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF
+          cmake --build "$HOME/sdl-build" -j"$(nproc)"
+          cmake --install "$HOME/sdl-build"
+
+      - name: Configure & build
+        run: |
+          set -euo pipefail
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/out" \
+            -DCMAKE_PREFIX_PATH="$HOME/sdl3"
+          cmake --build build -j"$(nproc)"
+
+      - name: Install & check layout
+        run: |
+          set -euo pipefail
+          cmake --install build
+          test -f out/bin/RetComM-Studio
+          test -d out/share/retcomm-studio/toolkit/project_studio
+
+      # spawn_test and pipe_drain_test are POSIX-only (CMake excludes them on
+      # WIN32), so this job is the only place the fork/exec/poll half of
+      # studio_runner.cpp is exercised at all.
+      - name: C++ data-layer tests
+        run: |
+          set -euo pipefail
+          for t in json_null_test frames_load_test snes_load_test debug_client_test \
+                   spawn_test pipe_drain_test; do
+            echo "== $t =="
+            "./build/$t"
+          done
+
+      - name: Python toolkit tests
+        run: |
+          set -euo pipefail
+          for t in snes_platform_test project_path_test ui_wrapping_test snes_analysis_test; do
+            echo "== $t =="
+            python "tests/$t.py"
+          done

@@ -7,10 +7,21 @@
 
 #include "studio/studio_debug.hpp"
 
+// Same platform shim as studio_debug.cpp: Winsock is close enough to BSD
+// sockets that only the header, the close name and the length types differ.
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+using socklen_t = int;
+#define CLOSESOCK closesocket
+#define SHUT_RDWR SD_BOTH
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#define CLOSESOCK ::close
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -24,6 +35,22 @@
 using namespace retcomm::studio;
 
 namespace {
+
+// Windows resets a connection that is closed while data it has accepted is
+// still undelivered, so the peer sees ECONNRESET partway through instead of
+// the rest of the reply. gpu_frame_dump below is 3 MB -- comfortably more than
+// the socket buffer -- and without this it arrived truncated about a third of
+// the time. SO_LINGER makes closesocket() wait for delivery instead of
+// aborting. It must be set BEFORE the send, and then a plain close is enough:
+// a shutdown()/drain dance before an aborting close does not help.
+// Harmless on POSIX, where the default already behaves this way.
+void deliver_before_close(int fd) {
+    struct linger lg {};
+    lg.l_onoff = 1;
+    lg.l_linger = 30;
+    ::setsockopt(fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&lg), sizeof(lg));
+}
+
 
 int failures = 0;
 void check(bool ok, const char* what) {
@@ -63,10 +90,11 @@ void serve(int listen_fd) {
         socklen_t cl = sizeof(ca);
         int fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&ca), &cl);
         if (fd < 0) { if (g_stop.load()) break; continue; }
+        deliver_before_close(fd);
         std::string rx;
         while (!g_stop.load()) {
             char buf[4096];
-            auto n = ::recv(fd, buf, sizeof(buf), 0);
+            auto n = ::recv(fd, buf, static_cast<int>(sizeof(buf)), 0);
             if (n <= 0) break;
             rx.append(buf, static_cast<size_t>(n));
             size_t nl;
@@ -103,10 +131,10 @@ void serve(int listen_fd) {
                     out = "{\"id\":" + id + ",\"ok\":true}";
                 }
                 out += "\n";
-                ::send(fd, out.data(), out.size(), 0);
+                ::send(fd, out.data(), static_cast<int>(out.size()), 0);
             }
         }
-        ::close(fd);
+        CLOSESOCK(fd);
     }
 }
 
@@ -125,10 +153,11 @@ void serve_one_shot(int listen_fd) {
         socklen_t cl = sizeof(ca);
         int fd = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&ca), &cl);
         if (fd < 0) { if (g_os_stop.load()) break; continue; }
+        deliver_before_close(fd);
         std::string rx;
         while (rx.find('\n') == std::string::npos) {
             char buf[4096];
-            auto n = ::recv(fd, buf, sizeof(buf), 0);
+            auto n = ::recv(fd, buf, static_cast<int>(sizeof(buf)), 0);
             if (n <= 0) break;
             rx.append(buf, static_cast<size_t>(n));
         }
@@ -147,11 +176,11 @@ void serve_one_shot(int listen_fd) {
         out += "\n";
         size_t sent = 0;
         while (sent < out.size()) {
-            auto n = ::send(fd, out.data() + sent, out.size() - sent, 0);
+            auto n = ::send(fd, out.data() + sent, static_cast<int>(out.size() - sent), 0);
             if (n <= 0) break;
             sent += static_cast<size_t>(n);
         }
-        ::close(fd);   // <- the contract
+        CLOSESOCK(fd);   // <- the contract
     }
 }
 
@@ -167,9 +196,13 @@ bool wait_for(const std::function<bool()>& pred, int ms = 5000) {
 } // namespace
 
 int main() {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
-    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -236,13 +269,13 @@ int main() {
 
     g_stop.store(true);
     ::shutdown(lfd, SHUT_RDWR);
-    ::close(lfd);
+    CLOSESOCK(lfd);
     server.detach();
 
     // ---- phase 2: the real server's one-request-per-connection contract ----
     std::printf("  -- one-shot server (real protocol) --\n");
     int ofd = ::socket(AF_INET, SOCK_STREAM, 0);
-    ::setsockopt(ofd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    ::setsockopt(ofd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof(one));
     sockaddr_in oaddr{};
     oaddr.sin_family = AF_INET;
     oaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -284,7 +317,7 @@ int main() {
     // leave the caller polling take_reply() forever.
     g_os_stop.store(true);
     ::shutdown(ofd, SHUT_RDWR);
-    ::close(ofd);
+    CLOSESOCK(ofd);
     oserver.detach();
 
     DebugClient dead;

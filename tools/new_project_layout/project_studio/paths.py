@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -98,3 +99,68 @@ def ci_setup_release_template(game_root: Path | None = None) -> Path | None:
         return None
     p = root / "docs" / "ci" / "templates" / "setup-release.yml"
     return p if p.is_file() else None
+
+
+def find_bash() -> str | None:
+    """Absolute path to a POSIX shell that understands Windows paths, or None.
+
+    The toolkit drives several .sh scripts the projects own (regen.sh,
+    package_release.sh, regen_bios.sh, the MinGW cross-build). On Linux and
+    macOS bash is simply on PATH. On Windows it usually is NOT, even though it
+    is installed: Git for Windows puts git.exe in "Git/cmd" (which the
+    installer adds to PATH) but bash.exe in "Git/bin" and "Git/usr/bin" (which
+    it does not). So a plain shutil.which("bash") reports "no bash" on a
+    machine that has one, and every one of those features turns itself off.
+
+    The System32 bash.exe is deliberately NOT accepted. That is the WSL
+    launcher: it runs a Linux bash in a Linux filesystem namespace, so handing
+    it a "C:/Users/..." script path fails in a way that reads like a broken
+    script rather than the wrong shell.
+    """
+    if os.name != "nt":
+        return shutil.which("bash")
+
+    def usable(cand: Path) -> str | None:
+        try:
+            if not cand.is_file():
+                return None
+            if cand.parent.name.lower() in {"system32", "sysnative"}:
+                return None
+        except OSError:
+            return None
+        return str(cand)
+
+    rels = (Path("bin") / "bash.exe", Path("usr") / "bin" / "bash.exe")
+
+    # Most reliable: derive it from the git we already require. git.exe lives
+    # in Git/cmd (or Git/mingw64/bin); bash.exe is its sibling under Git/bin.
+    git = shutil.which("git")
+    if git:
+        base = Path(git).resolve().parent
+        for up in (base.parent, base.parent.parent):
+            for rel in rels:
+                hit = usable(up / rel)
+                if hit:
+                    return hit
+
+    for root in (
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("ProgramW6432"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+    ):
+        if not root:
+            continue
+        for rel in rels:
+            hit = usable(Path(root) / "Git" / rel)
+            if hit:
+                return hit
+
+    # Last resort: whatever is on PATH, provided it is not the WSL shim.
+    for name in ("bash", "bash.exe", "sh", "sh.exe"):
+        found = shutil.which(name)
+        if found:
+            hit = usable(Path(found))
+            if hit:
+                return hit
+    return None

@@ -8,6 +8,28 @@ import re
 import sys
 from pathlib import Path
 
+def _force_utf8_streams() -> None:
+    """Let this tool print the arrows and box glyphs it formats with.
+
+    The Windows console default is cp1252, which cannot encode U+2192 or the
+    box-drawing characters used in the tables below, so a single such line
+    would abort the tool with UnicodeEncodeError. Studio sets PYTHONUTF8 for
+    everything it spawns; a developer running this script straight from a
+    terminal gets no such help. Best effort: a stream that is already UTF-8,
+    or is not a reconfigurable text wrapper, is left alone.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        _enc = (getattr(_stream, "encoding", "") or "").lower().replace("-", "")
+        if _enc.startswith("utf8"):
+            continue
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_streams()
+
 def github_about_description(framework: str = "PSXrecomp",
                              console: str = "Sony PlayStation") -> str:
     """The GitHub About line, for the console the port is actually built on.

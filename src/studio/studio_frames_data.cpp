@@ -200,6 +200,11 @@ std::string game_disc_for(const std::string& root) {
         return {};
     fs::path p(rel);
     if (!p.is_absolute()) p = fs::path(root) / p;
+    // game.toml spells the relative part with '/', so on Windows the join
+    // leaves a mixed "C:\repo\disc/Game.cue". It opens fine, but this string
+    // goes onto oracle command lines and into the log, so normalise the
+    // separators rather than leaking both kinds.
+    p = p.lexically_normal();
     std::error_code ec;
     return fs::is_regular_file(p, ec) ? p.string() : std::string();
 }
@@ -464,6 +469,7 @@ std::string selected_game_exe(const StudioModel& model, const std::string& root)
     if (model.build_exe[0]) {
         fs::path e(model.build_exe);
         if (!e.is_absolute() && !root.empty()) e = fs::path(root) / e;
+        e = e.lexically_normal();   // see game_disc_for(): no mixed separators
         if (fs::is_regular_file(e, ec)) return e.string();
         // A stale override is worth falling back from rather than failing on:
         // the directory scan still finds a real binary, and the Build tab is

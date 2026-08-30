@@ -16,6 +16,7 @@ if str(_TOOLKIT) not in sys.path:
 
 from project_studio import __version__, platforms  # noqa: E402
 from project_studio.models import MigrateOptions  # noqa: E402
+from project_studio.paths import find_bash  # noqa: E402
 
 
 def _print_audit(report, *, as_json: bool) -> int:
@@ -1517,9 +1518,13 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
         print(f"error: missing {script}", file=sys.stderr)
         return 2
 
-    bash = shutil.which("bash")
+    bash = find_bash()
     if not bash:
-        print("error: bash not found (required for MinGW cross script)", file=sys.stderr)
+        print(
+            "error: no POSIX shell found (required for the MinGW cross script). "
+            "On Windows, install Git for Windows -- it ships bash.exe.",
+            file=sys.stderr,
+        )
         return 2
 
     cmd: list[str] = [bash, str(script)]

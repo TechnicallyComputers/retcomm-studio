@@ -23,7 +23,13 @@ from .naming import (
     window_title_from_cmake,
     window_title_from_name,
 )
-from .paths import ci_setup_release_template, psxrecomp_root_from_toolkit, templates_dir, toolkit_dir
+from .paths import (
+    ci_setup_release_template,
+    find_bash,
+    psxrecomp_root_from_toolkit,
+    templates_dir,
+    toolkit_dir,
+)
 
 
 def _run(cmd: list[str], cwd: Path, dry_run: bool) -> tuple[bool, str]:
@@ -1062,7 +1068,7 @@ def op_record_framework_pins(root: Path, options: MigrateOptions) -> ApplyResult
             ["framework_pins.txt"],
         )
     proc = subprocess.run(
-        ["bash", str(record), "--root", str(root)],
+        [find_bash() or "bash", str(record), "--root", str(root)],
         capture_output=True,
         text=True,
         check=False,
