@@ -48,6 +48,7 @@ OP_ORDER: tuple[str, ...] = (
     "snes_ensure_src_gen",
     "snes_emit_version",
     "snes_probe_rom_refresh",
+    "snes_emit_rom_identity",
     "snes_emit_codegen_setup",
     "snes_emit_regen",
     "snes_relocate_boxart",
@@ -72,6 +73,7 @@ OP_TITLES: dict[str, str] = {
     "snes_record_framework_pins": "Write framework_pins.txt",
     "snes_repair_framework_submodule": "Repair broken snesrecomp/ git checkout",
     "snes_probe_rom_refresh": "Refresh ROM identity via probe_rom.py",
+    "snes_emit_rom_identity": "Emit rom_identity.txt",
     "snes_emit_codegen_setup": "Emit src/codegen_setup.c / .h",
     "snes_relocate_boxart": "Relocate boxart → launcher_assets/img/",
     "snes_emit_boxart_stub": "Create launcher_assets/img stub dir",
@@ -107,6 +109,48 @@ GITIGNORE_RULES: tuple[str, ...] = (
 
 FRAMEWORK = "snesrecomp"
 NESTED_PATHS = ("lib/recomp-net", "lib/retcomm-rbengine")
+
+# ---------------------------------------------------------------------------
+# ROM identity carriers
+# ---------------------------------------------------------------------------
+# Which file carries ROM identity is the framework's call, not Studio's, and it
+# changed: snesrecomp now scaffolds a single ``rom_identity.txt`` that CMake
+# turns into snesrecomp_rom_identity.h and that tools/regen.sh and the release
+# workflow read directly, replacing the src/codegen_setup.c/.h pair older
+# revisions emitted. Studio drives whichever wizard the port is *pinned* to
+# (see snes_paths), so it has to serve both eras — and the templates present in
+# that wizard are the only honest signal of which one this is. Hardcoding
+# either set is what made a migration against a current checkout die with
+# "Template not found: .../codegen_setup.c.in".
+IDENTITY_FILE = "rom_identity.txt"
+
+_IDENTITY_CARRIERS: dict[str, tuple[tuple[str, str], ...]] = {
+    "file": (("rom_identity.txt.in", IDENTITY_FILE),),
+    "codegen": (
+        ("codegen_setup.c.in", "src/codegen_setup.c"),
+        ("codegen_setup.h.in", "src/codegen_setup.h"),
+    ),
+}
+
+_IDENTITY_OPS: dict[str, str] = {
+    "file": "snes_emit_rom_identity",
+    "codegen": "snes_emit_codegen_setup",
+}
+
+
+def identity_layout(game_root: Path | str | None = None) -> str:
+    """``"file"``, ``"codegen"``, or ``""`` when the wizard offers neither."""
+    tdir = snes_paths.templates_dir(game_root)
+    if (tdir / "rom_identity.txt.in").is_file():
+        return "file"
+    if (tdir / "codegen_setup.c.in").is_file():
+        return "codegen"
+    return ""
+
+
+def identity_carriers(game_root: Path | str | None = None) -> tuple[tuple[str, str], ...]:
+    """``(template, repo-relative path)`` pairs this wizard scaffolds."""
+    return _IDENTITY_CARRIERS.get(identity_layout(game_root), ())
 
 
 def list_ops() -> list[str]:
@@ -196,6 +240,49 @@ _DIGEST_PATTERNS = (
 )
 
 
+def _parse_identity_file(path: Path) -> dict[str, str]:
+    """``key = value`` lines, ``#`` comments, optionally quoted values.
+
+    Deliberately mirrors the sed in regen.sh's ``identity_get`` rather than
+    being stricter: only a line that *starts* with ``#`` is a comment, the
+    first occurrence of a key wins, trailing whitespace goes, surrounding
+    double quotes come off. Studio agreeing with the file's actual consumer
+    matters more than agreeing with a tidier grammar. Values still carrying an
+    unfilled ``@TOKEN@`` are dropped, not recovered.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, val = stripped.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+            val = val[1:-1]
+        if key and val and "@" not in val:
+            out.setdefault(key, val)
+    return out
+
+
+def _carrier_label(game_root: Path | str | None = None) -> str:
+    """What to call the identity carrier in a message, for this wizard."""
+    carriers = identity_carriers(game_root)
+    return " / ".join(rel for _, rel in carriers) or "the identity carrier"
+
+
+def _identity_source(root: Path) -> str:
+    """The file a recovered digest actually came from, for the audit detail."""
+    for rel in (IDENTITY_FILE, "src/codegen_setup.c"):
+        if (root / rel).is_file():
+            return rel
+    return "tools/regen.sh"
+
+
 def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
     """ROM tokens for the templates: probed if a ROM is given, else recovered.
 
@@ -231,8 +318,28 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
             out["rom_file"] = rom_path.name
         return out
 
-    # codegen_setup.c is the richest recovery source: it carries mapping and
-    # region alongside the digests, which regen.sh does not.
+    # rom_identity.txt first: it is the current carrier, it holds mapping and
+    # region alongside the digests, and it is the very file the build and
+    # regen.sh read — so what Studio recovers is what the port actually uses.
+    # (Under this layout regen.sh no longer bakes digests in at all, it calls
+    # identity_get, so _DIGEST_PATTERNS below has nothing to fall back on.)
+    ident_file = root / IDENTITY_FILE
+    if ident_file.is_file():
+        data = _parse_identity_file(ident_file)
+        for field, key in (
+            ("display_name", "display_name"),
+            ("rom_file", "rom_file"),
+            ("expected_crc32", "crc32"),
+            ("expected_sha256", "sha256"),
+            ("mapping", "mapping"),
+            ("region", "region"),
+        ):
+            if data.get(field):
+                out.setdefault(key, data[field])
+
+    # codegen_setup.c is the same thing for a port pinned to an older
+    # framework: mapping and region alongside the digests, which regen.sh
+    # does not carry.
     cg = root / "src" / "codegen_setup.c"
     if cg.is_file():
         try:
@@ -493,47 +600,76 @@ def audit_project(root: Path) -> AuditReport:
     # --- ROM / catalog identity ---------------------------------------------
     ident = rom_identity(root)
     if ident.get("sha256") and ident.get("crc32"):
-        src = "src/codegen_setup.c" if (root / "src" / "codegen_setup.c").is_file() \
-            else "tools/regen.sh"
         add("rom_identity", "ROM identity (digests)", CheckStatus.PASS,
             Severity.RECOMMENDED,
-            f"crc32 {ident['crc32']} recovered from {src}.")
+            f"crc32 {ident['crc32']} recovered from {_identity_source(root)}.")
     else:
         # Refresh needs the ROM (--disc) — the plan gates the op on it.
         add("rom_identity", "ROM identity (digests)", CheckStatus.WARN,
             Severity.RECOMMENDED,
             "No ROM digests recoverable — probe with a ROM path to seed "
-            "regen.sh / codegen_setup.", "snes_probe_rom_refresh")
+            f"regen.sh / {_carrier_label(root)}.", "snes_probe_rom_refresh")
 
-    # --- codegen_setup.c/.h ---------------------------------------------------
-    cg_c = root / "src" / "codegen_setup.c"
-    cg_h = root / "src" / "codegen_setup.h"
-    if cg_c.is_file() and cg_h.is_file():
-        try:
-            cg_text = cg_c.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            cg_text = ""
-        if "kGameCodegenIdentity" not in cg_text:
-            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.WARN,
-                Severity.REQUIRED,
-                "codegen_setup.c missing kGameCodegenIdentity.",
-                "snes_emit_codegen_setup")
-        elif "@" in cg_text and re.search(r"@[A-Z0-9_]+@", cg_text):
-            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.WARN,
-                Severity.REQUIRED,
-                "codegen_setup.c still has unfilled @TOKEN@ placeholders.",
-                "snes_emit_codegen_setup")
-        else:
-            add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.PASS,
-                Severity.REQUIRED, "Identity present with digests.")
-    else:
-        blocked_cg = not (ident.get("sha256") and ident.get("crc32"))
-        add("codegen_setup", "src/codegen_setup.c / .h", CheckStatus.FAIL,
+    # --- ROM identity carrier -------------------------------------------------
+    # Audit whichever carrier the wizard this port is pinned to actually
+    # scaffolds, rather than assuming either era (see IDENTITY_FILE above).
+    layout = identity_layout(root)
+    carriers = identity_carriers(root)
+    blocked_id = not (ident.get("sha256") and ident.get("crc32"))
+    if not carriers:
+        # A wizard that offers neither template is a broken tool, and saying so
+        # beats emitting a FAIL whose fix op would die on a missing template.
+        add("identity_carrier", "ROM identity carrier", CheckStatus.WARN,
             Severity.REQUIRED,
-            "Missing — ROM digests unknown, so it cannot be emitted without a "
-            "--disc ROM path." if blocked_cg
-            else "Missing codegen identity sources.",
-            None if blocked_cg else "snes_emit_codegen_setup")
+            f"{snes_paths.templates_dir(root)} has neither rom_identity.txt.in "
+            "nor codegen_setup.c.in — cannot tell which carrier this framework "
+            "revision wants.")
+    else:
+        title = " / ".join(rel for _, rel in carriers)
+        emit_op = _IDENTITY_OPS[layout]
+        present = [root / rel for _, rel in carriers]
+        primary = present[0]
+        if all(pth.is_file() for pth in present):
+            try:
+                text = primary.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            if layout == "codegen" and "kGameCodegenIdentity" not in text:
+                add("identity_carrier", title, CheckStatus.WARN, Severity.REQUIRED,
+                    "codegen_setup.c missing kGameCodegenIdentity.", emit_op)
+            elif re.search(r"@[A-Z0-9_]+@", text):
+                add("identity_carrier", title, CheckStatus.WARN, Severity.REQUIRED,
+                    f"{primary.name} still has unfilled @TOKEN@ placeholders.",
+                    None if blocked_id else emit_op)
+            elif layout == "file" and not all(
+                _parse_identity_file(primary).get(k)
+                for k in ("expected_crc32", "expected_sha256")
+            ):
+                # An empty digest is not a formatting nit: the build says so and
+                # then cannot verify the ROM it is handed.
+                add("identity_carrier", title, CheckStatus.WARN, Severity.REQUIRED,
+                    "rom_identity.txt carries no digests, so the build cannot "
+                    "verify a ROM.", None if blocked_id else emit_op)
+            else:
+                add("identity_carrier", title, CheckStatus.PASS,
+                    Severity.REQUIRED, "Identity present with digests.")
+        else:
+            add("identity_carrier", title, CheckStatus.FAIL, Severity.REQUIRED,
+                "Missing — ROM digests unknown, so it cannot be emitted without "
+                "a --disc ROM path." if blocked_id
+                else "Missing identity carrier.",
+                None if blocked_id else emit_op)
+
+    # A port that predates the move keeps dead codegen_setup sources: this
+    # framework's CMakeLists no longer compiles them, so their digests are no
+    # longer the ones the build reads — two identities, one of them a lie.
+    # Named, not auto-fixed: deleting a tracked source is a human's call.
+    if layout == "file" and (root / "src" / "codegen_setup.c").is_file():
+        add("identity_stale", "src/codegen_setup.c (superseded)", CheckStatus.WARN,
+            Severity.OPTIONAL,
+            "This framework revision reads rom_identity.txt and no longer "
+            "compiles codegen_setup.c — remove it once rom_identity.txt is in "
+            "place.")
 
     # --- boxart ---------------------------------------------------------------
     modern_box = root / "launcher_assets" / "img"
@@ -1125,15 +1261,33 @@ def _op_repair_framework(root: Path, opts: MigrateOptions) -> ApplyResult:
                        ([FRAMEWORK, aside.name] if res.ok else [aside.name]))
 
 
+def _emit_identity(root: Path, opts: MigrateOptions, op: str) -> ApplyResult:
+    """Write whichever identity carrier the pinned wizard scaffolds.
+
+    Both op ids route here on purpose. A saved plan, a stale audit or an
+    explicit ``--only snes_emit_codegen_setup`` should still produce the file
+    the framework in front of it actually builds against; the result message
+    names what was written, so nothing is written behind the caller's back.
+    """
+    carriers = identity_carriers(root)
+    if not carriers:
+        return ApplyResult(
+            op, False,
+            f"No identity template in {snes_paths.templates_dir(root)} — "
+            "neither rom_identity.txt.in nor codegen_setup.c.in")
+    results = [_fill_template(root, opts, op, tpl, rel) for tpl, rel in carriers]
+    changed = [pth for r in results for pth in r.changed_paths]
+    failed = "; ".join(r.message for r in results if not r.ok)
+    return ApplyResult(op, not failed,
+                       failed or "; ".join(r.message for r in results), changed)
+
+
 def _op_emit_codegen_setup(root: Path, opts: MigrateOptions) -> ApplyResult:
-    op = "snes_emit_codegen_setup"
-    r_c = _fill_template(root, opts, op, "codegen_setup.c.in", "src/codegen_setup.c")
-    if not r_c.ok:
-        return r_c
-    r_h = _fill_template(root, opts, op, "codegen_setup.h.in", "src/codegen_setup.h")
-    changed = list(r_c.changed_paths) + list(r_h.changed_paths)
-    ok = r_c.ok and r_h.ok
-    return ApplyResult(op, ok, f"{r_c.message}; {r_h.message}", changed)
+    return _emit_identity(root, opts, "snes_emit_codegen_setup")
+
+
+def _op_emit_rom_identity(root: Path, opts: MigrateOptions) -> ApplyResult:
+    return _emit_identity(root, opts, "snes_emit_rom_identity")
 
 
 def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
@@ -1149,11 +1303,14 @@ def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
     import dataclasses as _dc
 
     forced = _dc.replace(opts, force=True)
-    results = [
-        _fill_template(root, forced, op, "codegen_setup.c.in", "src/codegen_setup.c"),
-        _fill_template(root, forced, op, "codegen_setup.h.in", "src/codegen_setup.h"),
-        _fill_template(root, forced, op, "regen.sh.in", "tools/regen.sh"),
-    ]
+    carriers = identity_carriers(root)
+    if not carriers:
+        return ApplyResult(
+            op, False,
+            f"No identity template in {snes_paths.templates_dir(root)} — "
+            "neither rom_identity.txt.in nor codegen_setup.c.in")
+    results = [_fill_template(root, forced, op, tpl, rel) for tpl, rel in carriers]
+    results.append(_fill_template(root, forced, op, "regen.sh.in", "tools/regen.sh"))
     changed = [pth for r in results for pth in r.changed_paths]
     ok = all(r.ok for r in results)
     detail = f"crc32 {ident['crc32']}, sha256 {ident['sha256'][:12]}…"
@@ -1318,6 +1475,7 @@ _OPS = {
     "snes_repair_framework_submodule": _op_repair_framework,
     "snes_probe_rom_refresh": _op_probe_rom_refresh,
     "snes_emit_codegen_setup": _op_emit_codegen_setup,
+    "snes_emit_rom_identity": _op_emit_rom_identity,
     "snes_relocate_boxart": _op_relocate_boxart,
     "snes_emit_boxart_stub": _op_emit_boxart_stub,
     "snes_patch_readme_metrics": _op_patch_readme_metrics,

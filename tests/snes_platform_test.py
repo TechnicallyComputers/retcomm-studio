@@ -193,10 +193,10 @@ def test_parity_checks(root: Path) -> None:
           "no recoverable digests → ROM identity warns")
     check(by_id["rom_identity"].fix_op == "snes_probe_rom_refresh",
           "identity warn names the probe op")
-    check(by_id["codegen_setup"].status.value == "fail",
-          "missing codegen_setup fails")
-    check(by_id["codegen_setup"].fix_op is None,
-          "codegen_setup is NOT offered as a fix without digests")
+    check(by_id["identity_carrier"].status.value == "fail",
+          "a missing ROM identity carrier fails")
+    check(by_id["identity_carrier"].fix_op is None,
+          "the carrier is NOT offered as a fix without digests")
     check(by_id["boxart"].status.value == "warn", "no boxart warns (optional)")
     check(by_id["readme_metrics"].status.value == "warn",
           "bare README warns with the metrics op")
@@ -220,10 +220,44 @@ def test_parity_checks(root: Path) -> None:
     mid = {c.id: c for c in snesops.audit_project(root).checks}
     check(mid["rom_identity"].status.value == "pass",
           "identity passes once recoverable")
-    check(mid["codegen_setup"].status.value == "fail",
-          "codegen_setup.c without its header still fails (build needs both)")
-    check(mid["codegen_setup"].fix_op == "snes_emit_codegen_setup",
-          "and now names the emit op")
+    # Which carrier is incomplete depends on the wizard this port is pinned to
+    # — codegen_setup.c without its header, or a rom_identity.txt that does not
+    # exist yet — but either way it fails and names an op that can be applied.
+    layout = snesops.identity_layout(root)
+    check(layout in ("file", "codegen"),
+          f"the wizard declares an identity layout ({layout or 'neither'})")
+    expected_op = {"file": "snes_emit_rom_identity",
+                   "codegen": "snes_emit_codegen_setup"}[layout]
+    check(mid["identity_carrier"].status.value == "fail",
+          "an incomplete carrier still fails (the build needs all of it)")
+    check(mid["identity_carrier"].fix_op == expected_op,
+          f"and names the emit op this wizard can honour ({expected_op})")
+
+    # rom_identity.txt is the current carrier: digests recover from it, and it
+    # outranks a codegen_setup.c the older layout left behind.
+    (root / "rom_identity.txt").write_text(
+        "# ROM identity\n"
+        "display_name    = Zed\n"
+        'rom_file        = "Zed (World).sfc"\n'
+        "expected_crc32  = deadbeef\n"
+        "expected_sha256 = bb\n"
+        "mapping         = hirom\n"
+        "region          = PAL\n",
+        encoding="utf-8",
+    )
+    fid = snesops.rom_identity(root)
+    check(fid.get("crc32") == "deadbeef", "digests recover from rom_identity.txt")
+    check(fid.get("rom_file") == "Zed (World).sfc",
+          "a quoted value is unquoted, as regen.sh identity_get does")
+    check(fid.get("mapping") == "hirom",
+          "rom_identity.txt outranks a stale codegen_setup.c")
+    if layout == "file":
+        fchecks = {c.id: c for c in snesops.audit_project(root).checks}
+        check(fchecks["identity_carrier"].status.value == "pass",
+              "a filled rom_identity.txt passes")
+        check(fchecks["identity_stale"].status.value == "warn",
+              "and a superseded codegen_setup.c is named, not silently kept")
+    (root / "rom_identity.txt").unlink()
 
     # Probe gating: never planned without a ROM, planned with one.
     plan = snesops.build_plan(root, MigrateOptions(dry_run=True, probe_disc=True))
@@ -380,6 +414,157 @@ def test_probe_rom(root: Path) -> None:
         ident.get("crc32") != "deadbeef",
         "a probed ROM overrides the digests recovered from regen.sh",
     )
+
+    # The op itself, not just the probe behind it. This is the one that died
+    # with "Template not found: .../codegen_setup.c.in" once snesrecomp moved
+    # identity into rom_identity.txt: it must write whatever carrier the wizard
+    # in front of it scaffolds, and never name a template that wizard lacks.
+    res = snesops._op_probe_rom_refresh(root, MigrateOptions(disc=str(rom), force=True))
+    check(res.ok, f"probe refresh applies against the live wizard ({res.message})")
+    for _tpl, rel in snesops.identity_carriers(root):
+        check((root / rel).is_file(), f"probe refresh wrote {rel}")
+    regen_after = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
+    check(ident["crc32"] in regen_after
+          or "identity_get expected_crc32" in regen_after,
+          "regen.sh either carries the fresh CRC32 or reads it from the file")
+
+_CODEGEN_SETUP_C = """const GameCodegenIdentity kGameCodegenIdentity = {
+    .display_name   = "@DISPLAY_NAME@",
+    .rom_file       = "@ROM_FILE@",
+    .expected_crc32 = "@ROM_CRC32@",
+    .expected_sha256= "@ROM_SHA256@",
+    .mapping        = "@ROM_MAPPING@",
+    .region         = "@REGION@",
+};
+"""
+
+_ROM_IDENTITY_TXT = """# ROM identity for @DISPLAY_NAME@.
+display_name    = @DISPLAY_NAME@
+rom_file        = @ROM_FILE@
+expected_crc32  = @ROM_CRC32@
+expected_sha256 = @ROM_SHA256@
+mapping         = @ROM_MAPPING@
+region          = @REGION@
+"""
+
+_REGEN_SH = 'EXPECTED_CRC32="${SNESRECOMP_EXPECTED_CRC32:-@ROM_CRC32@}"\n'
+
+
+def _fake_wizard(base: Path, templates: dict[str, str]) -> Path:
+    """The smallest thing snes_paths will accept as a snesrecomp checkout."""
+    (base / "runner").mkdir(parents=True, exist_ok=True)
+    (base / "runner" / "runner.cmake").write_text("", encoding="utf-8")
+    wiz = base / "tools" / "new_project"
+    (wiz / "templates").mkdir(parents=True, exist_ok=True)
+    (wiz / "setup_project.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    for name, body in templates.items():
+        (wiz / "templates" / name).write_text(body, encoding="utf-8")
+    return base
+
+
+def _seed_port(root: Path) -> None:
+    """A port already carrying identity, in the shape the old wizard left."""
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "codegen_setup.c").write_text(
+        'const GameCodegenIdentity kGameCodegenIdentity = {\n'
+        '    .display_name   = "Zed",\n'
+        '    .rom_file       = "Zed (USA).sfc",\n'
+        '    .expected_crc32 = "deadbeef",\n'
+        '    .expected_sha256= "abc123",\n'
+        '    .mapping        = "lorom",\n'
+        '    .region         = "USA",\n'
+        "};\n",
+        encoding="utf-8",
+    )
+
+
+def test_identity_layouts() -> None:
+    """Studio follows the wizard's identity carrier, across the move.
+
+    snesrecomp replaced src/codegen_setup.c/.h with a single rom_identity.txt
+    that CMake, regen.sh and the release workflow all read. Studio drives
+    whichever wizard a port is *pinned* to, so both eras run through the same
+    code — and neither may name a template the other lacks. Hardcoding the old
+    pair is what made a migration against a current checkout die with
+    "Template not found: .../codegen_setup.c.in".
+
+    Both wizards are synthetic on purpose: this must keep testing the skew long
+    after every checkout on this machine has moved past it.
+    """
+    print("identity layouts")
+    from project_studio import snesops
+
+    cases = (
+        ("file",
+         {"rom_identity.txt.in": _ROM_IDENTITY_TXT, "regen.sh.in": _REGEN_SH},
+         ["rom_identity.txt"],
+         "snes_emit_rom_identity"),
+        ("codegen",
+         {"codegen_setup.c.in": _CODEGEN_SETUP_C,
+          "codegen_setup.h.in": "/* @DISPLAY_NAME@ */\n",
+          "regen.sh.in": _REGEN_SH},
+         ["src/codegen_setup.c", "src/codegen_setup.h"],
+         "snes_emit_codegen_setup"),
+    )
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    try:
+        for layout, templates, rels, emit_op in cases:
+            with tempfile.TemporaryDirectory() as td:
+                os.environ["SNESRECOMP_ROOT"] = str(
+                    _fake_wizard(Path(td) / "snesrecomp", templates))
+                root = Path(td) / "Port"
+                _seed_port(root)
+
+                check(snesops.identity_layout(root) == layout,
+                      f"{layout}: the wizard's templates decide the layout")
+                check([r for _, r in snesops.identity_carriers(root)] == rels,
+                      f"{layout}: carriers are {', '.join(rels)}")
+
+                by_id = {c.id: c for c in snesops.audit_project(root).checks}
+                check(by_id["identity_carrier"].fix_op == emit_op,
+                      f"{layout}: the audit names {emit_op}")
+
+                res = snesops._OPS[emit_op](root, MigrateOptions(force=True))
+                check(res.ok, f"{layout}: {emit_op} applies ({res.message})")
+                for rel in rels:
+                    body = (root / rel).read_text(encoding="utf-8")
+                    check("@" not in body, f"{layout}: no @TOKEN@ survives in {rel}")
+                check("deadbeef" in (root / rels[0]).read_text(encoding="utf-8"),
+                      f"{layout}: the recovered CRC32 is carried across, not re-derived")
+
+                # The legacy op id routes to whatever this wizard scaffolds; it
+                # must never reach for a template the wizard dropped.
+                legacy = snesops._op_emit_codegen_setup(root, MigrateOptions(force=True))
+                check(legacy.ok,
+                      f"{layout}: the legacy op id still applies ({legacy.message})")
+
+                after = {c.id: c for c in snesops.audit_project(root).checks}
+                check(after["identity_carrier"].status.value == "pass",
+                      f"{layout}: the carrier passes once written")
+                check(("identity_stale" in after) == (layout == "file"),
+                      f"{layout}: a superseded codegen_setup.c is named only "
+                      "when the framework has moved past it")
+
+        # A wizard offering neither template is a broken tool, and the ops say
+        # so by name instead of surfacing a bare missing-file path.
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["SNESRECOMP_ROOT"] = str(
+                _fake_wizard(Path(td) / "snesrecomp", {"regen.sh.in": _REGEN_SH}))
+            root = Path(td) / "Port"
+            _seed_port(root)
+            check(snesops.identity_layout(root) == "",
+                  "neither template present → no layout claimed")
+            res = snesops._op_emit_rom_identity(root, MigrateOptions(force=True))
+            check(not res.ok and "neither rom_identity.txt.in" in res.message,
+                  f"and the op refuses by name ({res.message})")
+            stuck = {c.id: c for c in snesops.audit_project(root).checks}
+            check(stuck["identity_carrier"].fix_op is None,
+                  "the audit offers no fix op it could not honour")
+    finally:
+        if prev is None:
+            os.environ.pop("SNESRECOMP_ROOT", None)
+        else:
+            os.environ["SNESRECOMP_ROOT"] = prev
 
 
 def test_region_default() -> None:
@@ -824,6 +1009,7 @@ def main() -> int:
         test_digest_recovery(root)
         test_probe_rom(root)
     test_rom_discovery()
+    test_identity_layouts()
     test_region_default()
     test_probe_rom_cli()
     test_dispatch_inputs()
