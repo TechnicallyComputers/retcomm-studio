@@ -11,6 +11,7 @@ from .models import (
     CheckResult,
     CheckStatus,
     LayoutClass,
+    MigrateOptions,
     Severity,
 )
 from .naming import boot_exe_from_game_toml, infer_project_name
@@ -115,7 +116,56 @@ def _cmake_has(text: str, needle: str) -> bool:
     return needle in text
 
 
-def audit_project(root: Path) -> AuditReport:
+def _audit_readme(root: Path) -> list[CheckResult]:
+    """The README / GitHub About row.
+
+    Split out so the switch that gates it reads as a switch. One row and one op
+    cover both because ``patch_readme_metrics`` writes both: the badges,
+    boxart, launcher and R.A.I.D. blocks in README.md, and the repository's
+    About blurb over the GitHub API.
+    """
+    readme_path = root / "README.md"
+    readme_text = _read(readme_path) if readme_path.is_file() else ""
+    missing_readme: list[str] = []
+    if not readme_path.is_file():
+        missing_readme.append("README.md")
+    else:
+        if not readme_has_metrics(readme_text):
+            missing_readme.append("download badges")
+        if not readme_has_boxart(readme_text):
+            missing_readme.append("libretro boxart")
+        if not readme_has_launcher(readme_text):
+            missing_readme.append("RetComM Launcher section")
+        if not readme_has_raid(readme_text):
+            missing_readme.append("R.A.I.D. Discord footer")
+    if not (root / ".github" / "raid-discord.png").is_file():
+        missing_readme.append(".github/raid-discord.png")
+    if not boxart_png_present(root):
+        missing_readme.append("launcher_assets/img/boxart.png")
+    if missing_readme:
+        return [
+            CheckResult(
+                id="readme_metrics",
+                title="README download metrics / launcher / RAID / boxart",
+                status=CheckStatus.WARN,
+                severity=Severity.RECOMMENDED,
+                detail="Missing: " + ", ".join(missing_readme),
+                fix_op="patch_readme_metrics",
+            )
+        ]
+    return [
+        CheckResult(
+            id="readme_metrics",
+            title="README download metrics / launcher / RAID / boxart",
+            status=CheckStatus.PASS,
+            severity=Severity.RECOMMENDED,
+            detail="Download badges, boxart, RetComM Launcher, and R.A.I.D. footer present.",
+        )
+    ]
+
+
+def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditReport:
+    options = options or MigrateOptions()
     root = root.resolve()
     name = infer_project_name(root)
     boot = boot_exe_from_game_toml(root / "game.toml")
@@ -757,45 +807,23 @@ def audit_project(root: Path) -> AuditReport:
         )
 
     # README download badges + boxart + RetComM Launcher (idempotent migrate op)
-    readme_path = root / "README.md"
-    readme_text = _read(readme_path) if readme_path.is_file() else ""
-    missing_readme: list[str] = []
-    if not readme_path.is_file():
-        missing_readme.append("README.md")
-    else:
-        if not readme_has_metrics(readme_text):
-            missing_readme.append("download badges")
-        if not readme_has_boxart(readme_text):
-            missing_readme.append("libretro boxart")
-        if not readme_has_launcher(readme_text):
-            missing_readme.append("RetComM Launcher section")
-        if not readme_has_raid(readme_text):
-            missing_readme.append("R.A.I.D. Discord footer")
-    if not (root / ".github" / "raid-discord.png").is_file():
-        missing_readme.append(".github/raid-discord.png")
-    if not boxart_png_present(root):
-        missing_readme.append("launcher_assets/img/boxart.png")
-    if missing_readme:
+    # Reported as skipped rather than dropped when the switch is off: a row that
+    # silently disappears reads as "nothing to do here", which is the opposite
+    # of what the switch means. SKIP carries no fix op, so it never reaches
+    # failing_ops() and the layout classification below stops counting it as a
+    # recommended warning.
+    if not options.patch_readme:
         checks.append(
             CheckResult(
                 id="readme_metrics",
                 title="README download metrics / launcher / RAID / boxart",
-                status=CheckStatus.WARN,
-                severity=Severity.RECOMMENDED,
-                detail="Missing: " + ", ".join(missing_readme),
-                fix_op="patch_readme_metrics",
+                status=CheckStatus.SKIP,
+                severity=Severity.INFO,
+                detail="Skipped — README & About is off for this repo.",
             )
         )
     else:
-        checks.append(
-            CheckResult(
-                id="readme_metrics",
-                title="README download metrics / launcher / RAID / boxart",
-                status=CheckStatus.PASS,
-                severity=Severity.RECOMMENDED,
-                detail="Download badges, boxart, RetComM Launcher, and R.A.I.D. footer present.",
-            )
-        )
+        checks.extend(_audit_readme(root))
 
     # Classify layout
     fails = {c.id for c in checks if c.status == CheckStatus.FAIL}

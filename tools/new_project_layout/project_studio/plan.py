@@ -46,7 +46,7 @@ _OP_TITLES = {
     "merge_gitignore": "Merge setup-host .gitignore rules",
     "emit_mods_preloaded": "Stub mods/preloaded catalog",
     "relocate_boxart": "Relocate boxart → launcher_assets/",
-    "emit_boxart_stub": "Create launcher_assets stub dir",
+    "emit_boxart_stub": "Fetch boxart \u2192 launcher_assets/ (stub if unavailable)",
     "ensure_app_icon": "Install assets/psxrecomp app icon",
     "rewrite_cmake_setup_host": "Rewrite CMakeLists.txt (setup-host)",
     "emit_packager": "Emit scripts/package_setup_release.sh",
@@ -67,7 +67,7 @@ def build_plan(
 ) -> Plan:
     root = root.resolve()
     options = options or MigrateOptions()
-    report = report or audit_project(root)
+    report = report or audit_project(root, options)
 
     wanted = set(report.failing_ops())
 
@@ -95,6 +95,8 @@ def build_plan(
         wanted.discard("rewrite_cmake_setup_host")
     if not options.enable_ci:
         wanted.discard("emit_ci_workflow")
+    if not options.patch_readme:
+        wanted.discard("patch_readme_metrics")
     if not options.probe_disc:
         wanted.discard("probe_disc_refresh")
     if not options.record_pins:

@@ -566,6 +566,480 @@ def test_identity_layouts() -> None:
         else:
             os.environ["SNESRECOMP_ROOT"] = prev
 
+def test_readme_toggle() -> None:
+    """The README & About switch gates the audit row, not just the op.
+
+    One switch for both because one op writes both: README.md's badge, boxart,
+    launcher and R.A.I.D. blocks *and* the repository's GitHub About blurb. A
+    port that hand-writes its README should stop being told about it on every
+    run, so the row goes to SKIP rather than disappearing — a row that vanishes
+    reads as "nothing to do here", which is the opposite of what was asked for.
+
+    Both consoles, because the two migrations are independent implementations
+    and a switch wired into only one of them is the bug this guards against.
+    """
+    print("README & About toggle")
+    from project_studio import detect, plan as psx_plan, snesops
+
+    backends = (
+        ("snes", snesops.audit_project, snesops.build_plan, "snes_patch_readme_metrics"),
+        ("psx", detect.audit_project, psx_plan.build_plan, "patch_readme_metrics"),
+    )
+    for name, audit, build, op in backends:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Port"
+            root.mkdir()
+            # No README at all: the loudest thing the check can say, so a SKIP
+            # here cannot be mistaken for the repo simply being clean.
+            on = {c.id: c for c in audit(root).checks}["readme_metrics"]
+            check(on.status.value == "warn", f"{name}: on → the row warns")
+            check(on.fix_op == op, f"{name}: on → the row names {op}")
+
+            off_opts = MigrateOptions(patch_readme=False)
+            off = {c.id: c for c in audit(root, off_opts).checks}["readme_metrics"]
+            check(off.status.value == "skip", f"{name}: off → the row is SKIP, not absent")
+            check(off.fix_op is None, f"{name}: off → the row names no op")
+            check(off.severity.value == "info",
+                  f"{name}: off → INFO, so it stops counting toward the layout class")
+
+            steps_on = [st.op_id for st in build(root, MigrateOptions()).steps]
+            check(op in steps_on, f"{name}: on → {op} is planned")
+            steps_off = [st.op_id for st in build(root, off_opts).steps]
+            check(op not in steps_off, f"{name}: off → {op} is not planned")
+            # --only is the explicit escape hatch every other switch honours;
+            # asking for the op by name still gets it.
+            forced = [st.op_id for st in build(root, MigrateOptions(
+                patch_readme=False, only=[op])).steps]
+            check(op in forced, f"{name}: off → --only {op} still plans it")
+
+_FAKE_CLI = """#!/usr/bin/env python3
+import argparse
+ap = argparse.ArgumentParser(prog="snesrecomp")
+sub = ap.add_subparsers(dest="command", required=True)
+%s
+ap.parse_args()
+"""
+
+
+def _fake_framework(base: Path, commands: tuple[str, ...]) -> Path:
+    """A snesrecomp checkout whose CLI offers exactly `commands`."""
+    base.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(f'sub.add_parser({c!r})' for c in commands)
+    (base / "snesrecomp_cli.py").write_text(_FAKE_CLI % body, encoding="utf-8")
+    return base
+
+
+_REGEN_SH_MODERN = """#!/usr/bin/env bash
+IDENTITY="$ROOT/rom_identity.txt"
+"$PYTHON" "$CLI" verify-rom --rom "$ROM"
+"$PYTHON" "$CLI" generate --rom "$ROM"
+"""
+
+
+def test_generate_preflight() -> None:
+    """Generate refuses, by name, when the pinned framework cannot run regen.sh.
+
+    A port forked from GitHub carries a regen.sh emitted by whatever wizard was
+    current, and a snesrecomp submodule pinned to whatever that fork pointed at.
+    When those disagree the raw failure is an argparse "invalid choice:
+    'verify-rom'" with exit 2, attributed to Studio's Generate button. The
+    preflight has to name the skew instead — and it must ask the CLI what it
+    supports rather than assume, because assuming is how this happened.
+    """
+    print("generate preflight")
+    from project_studio import buildops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Port"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(_REGEN_SH_MODERN, encoding="utf-8")
+
+            # 1. No framework checked out at all.
+            r = buildops.preflight_snes_generate(root)
+            check(r is not None and "git submodule update" in r.message,
+                  f"an absent snesrecomp names the submodule command ({r.message[:48]}…)")
+
+            # 2. The reported case: a framework older than its own regen.sh.
+            fw = _fake_framework(root / "snesrecomp", ("build",))
+            check(buildops.snes_cli_commands(fw / "snesrecomp_cli.py") == {"build"},
+                  "the CLI is asked what it supports, not assumed")
+            r = buildops.preflight_snes_generate(root)
+            check(r is not None and "older than its own" in r.message,
+                  "an old framework is named as skew, not as an argparse error")
+            check(r is not None and "'verify-rom'" in r.message and "'generate'" in r.message,
+                  "and both missing subcommands are named")
+
+            # 3. --no-verify does not need verify-rom, but still needs generate.
+            r = buildops.preflight_snes_generate(root, verify=False)
+            check(r is not None and "'verify-rom'" not in r.message,
+                  "no-verify stops asking for verify-rom")
+            check(r is not None and "'generate'" in r.message,
+                  "but generate is still required")
+
+            # 4. A current framework, but no digests for --verify to check.
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            r = buildops.preflight_snes_generate(root)
+            check(r is not None and "rom_identity.txt" in r.message and "is missing" in r.message,
+                  "an absent rom_identity.txt is caught before regen.sh verifies nothing")
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  =\nexpected_sha256 =\n", encoding="utf-8")
+            r = buildops.preflight_snes_generate(root)
+            check(r is not None and "carries no digests" in r.message,
+                  "and so is one that carries empty digests")
+
+            # 5. Everything in place — the preflight gets out of the way.
+            (root / "rom_identity.txt").write_text(
+                "expected_crc32  = deadbeef\nexpected_sha256 = abc123\n", encoding="utf-8")
+            check(buildops.preflight_snes_generate(root) is None,
+                  "a pinned framework that can run regen.sh is not blocked")
+            check(buildops.preflight_snes_generate(root, verify=False) is None,
+                  "and neither is the no-verify path")
+
+            # 6. Whatever the preflight cannot foresee is still read, not
+            #    passed through as somebody else's stack trace.
+            hint = buildops.diagnose_generate_failure(
+                "snesrecomp: error: argument command: invalid choice: 'verify-rom' "
+                "(choose from build)", root)
+            check(hint is not None and "predates" in hint,
+                  "the raw argparse error is translated after the fact too")
+    finally:
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+def test_regen_framework_skew() -> None:
+    """Studio must not write a regen.sh the port's own snesrecomp cannot run.
+
+    This is the defect behind the Generate failure, not just its symptom. A
+    fork carries whatever snesrecomp gitlink its parent recorded; Studio drives
+    whichever wizard it can find, which on such a fork is a sibling or the
+    vendored copy. Emitting that wizard's regen.sh into the fork bakes in calls
+    the pinned CLI has never heard of, and nothing notices until somebody
+    presses Generate. Refusing to write the file is the fix — writing it anyway
+    only moves the failure somewhere less legible.
+    """
+    print("regen.sh vs pinned framework")
+    from project_studio import buildops, snes_paths, snesops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    try:
+        # Read out of the script's own call sites: prose naming a command is
+        # not a call, which is what `echo "regen.sh: $CLI missing"` looks like.
+        text = (
+            'echo "regen.sh: $CLI missing — run: git submodule update" >&2\n'
+            '"$PYTHON" "$CLI" verify-rom --rom "$ROM"\n'
+            '"$PYTHON" "$CLI" generate --rom "$ROM"\n'
+        )
+        check(snes_paths.regen_cli_commands(text) == ["verify-rom", "generate"],
+              "regen.sh's calls are read from its call sites, not from prose")
+        check("missing" not in snes_paths.regen_cli_commands(text),
+              "an echo mentioning $CLI is not mistaken for a subcommand")
+        check(snes_paths.regen_cli_commands(text, verify=False) == ["generate"],
+              "--no-verify drops the one call regen.sh gates on verification")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "Fork"
+            (root / "tools").mkdir(parents=True)
+            (root / "tools" / "regen.sh").write_text(text, encoding="utf-8")
+            _fake_framework(root / "snesrecomp", ("build",))
+
+            gap = snes_paths.regen_framework_gap(root, text)
+            check(gap is not None and gap[0] == ["verify-rom", "generate"],
+                  "the gap names what the pinned CLI is missing")
+            check(gap is not None and gap[1] == {"build"},
+                  "and what it does offer")
+
+            # The audit says so on the Migrate tab, before Generate is pressed.
+            by_id = {c.id: c for c in snesops.audit_project(root).checks}
+            check(by_id["regen_framework"].status.value == "fail",
+                  "the audit fails on the skew")
+            check(by_id["regen_framework"].fix_op is None,
+                  "and offers no fix op — moving a framework pin is a human's call")
+            check(by_id["wizard_source"].status.value == "warn",
+                  "and names the wizard being driven, which is where this came from")
+
+            # The emit ops refuse rather than overwrite with a broken script.
+            before = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
+            r = snesops._op_emit_regen(root, MigrateOptions(force=True))
+            check(not r.ok and "would not run against" in r.message,
+                  f"emit regen.sh refuses ({r.message[:56]}…)")
+            check((root / "tools" / "regen.sh").read_text(encoding="utf-8") == before,
+                  "and leaves the existing script untouched")
+
+            # One wording, wherever the skew is met.
+            cli = snes_paths.regen_framework_root(root) / "snesrecomp_cli.py"
+            shared = buildops.framework_gap_message(cli, ["generate"], {"build"})
+            check("that has it" in shared, "a single missing command reads as 'it'")
+            check("that has them" in buildops.framework_gap_message(
+                cli, ["generate", "verify-rom"], {"build"}),
+                  "and two or more as 'them'")
+
+            # A framework that can run it is not blocked.
+            _fake_framework(root / "snesrecomp", ("build", "generate", "verify-rom"))
+            check(snes_paths.regen_framework_gap(root, text) is None,
+                  "a current framework reports no gap")
+            ok_ids = {c.id: c for c in snesops.audit_project(root).checks}
+            check(ok_ids["regen_framework"].status.value == "pass",
+                  "and the audit row passes")
+    finally:
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+_CLI_WITH = """import argparse
+ap = argparse.ArgumentParser(prog="snesrecomp")
+s = ap.add_subparsers(dest="command", required=True)
+%s
+ap.parse_args()
+"""
+
+# A local `file://` submodule is refused by default (git's CVE-2022-39253
+# mitigation). Injected through the environment rather than written into the
+# user's global config, and only for the fixture.
+_FILE_PROTOCOL_ENV = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "protocol.file.allow",
+    "GIT_CONFIG_VALUE_0": "always",
+}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    return (r.stdout or "").strip()
+
+
+def _stale_fork(base: Path) -> tuple[Path, str, str]:
+    """A port pinned to a framework revision older than its own regen.sh.
+
+    Real git objects, not a mock: the thing under test is whether a *gitlink*
+    moves and gets staged, and a fake directory cannot answer that.
+    """
+    env = {**os.environ, **_FILE_PROTOCOL_ENV,
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def run(cwd: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True, text=True)
+
+    fw = base / "fw"
+    fw.mkdir(parents=True)
+    run(fw, "init", "-q", "-b", "main")
+    (fw / "runner").mkdir()
+    (fw / "runner" / "runner.cmake").write_text("", encoding="utf-8")
+    (fw / "snesrecomp_cli.py").write_text(
+        _CLI_WITH % 's.add_parser("build")', encoding="utf-8")
+    # A module one level down, where a PSX port keeps most of what it pins.
+    lib = base / "netlib"
+    lib.mkdir()
+    run(lib, "init", "-q", "-b", "main")
+    (lib / "v.txt").write_text("1\n", encoding="utf-8")
+    run(lib, "add", "-A")
+    run(lib, "commit", "-qm", "lib old")
+    run(fw, "submodule", "add", "-q", "-b", "main", str(lib), "lib/recomp-net")
+    run(fw, "add", "-A")
+    run(fw, "commit", "-qm", "old")
+    old = _git(fw, "rev-parse", "HEAD")
+    (lib / "v.txt").write_text("2\n", encoding="utf-8")
+    run(lib, "add", "-A")
+    run(lib, "commit", "-qm", "lib new")
+    lib_new = _git(lib, "rev-parse", "HEAD")
+    (fw / "snesrecomp_cli.py").write_text(
+        _CLI_WITH % ('s.add_parser("build")\ns.add_parser("generate")\n'
+                     's.add_parser("verify-rom")'), encoding="utf-8")
+    run(fw, "add", "-A")
+    run(fw, "commit", "-qm", "new")
+    new = _git(fw, "rev-parse", "HEAD")
+
+    port = base / "port"
+    port.mkdir()
+    run(port, "init", "-q", "-b", "main")
+    run(port, "submodule", "add", "-q", "-b", "main", "../fw", "snesrecomp")
+    run(port / "snesrecomp", "checkout", "-q", old)
+    (port / "tools").mkdir()
+    (port / "tools" / "regen.sh").write_text(
+        '"$PYTHON" "$CLI" verify-rom --rom "$ROM"\n'
+        '"$PYTHON" "$CLI" generate --rom "$ROM"\n', encoding="utf-8")
+    run(port, "add", "-A")
+    run(port, "commit", "-qm", "init")
+    return port, old, new, lib_new
+
+
+def test_advance_pins() -> None:
+    """Moving a stale fork's framework pin, which `submodule update` cannot do.
+
+    `git submodule update` checks out the gitlink the superproject *already
+    records*, so on a fork carrying an old pin it puts the old revision back —
+    which is why reaching for it leaves the pin exactly where it was. Advancing
+    is a different operation, and the half that is easy to forget is staging
+    the new gitlink: without it nothing about the superproject has changed.
+    """
+    print("advance framework pins")
+    from project_studio import gitops, snesops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    saved = {k: os.environ.get(k) for k in _FILE_PROTOCOL_ENV}
+    os.environ.update(_FILE_PROTOCOL_ENV)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            port, old, new, lib_new = _stale_fork(Path(td))
+            check(old != new and len(old) == 40, "the fixture has two real revisions")
+            check(_git(port / "snesrecomp", "rev-parse", "HEAD") == old,
+                  "the port starts pinned to the old one")
+
+            before = {c.id: c for c in snesops.audit_project(port).checks}
+            check(before["regen_framework"].status.value == "fail",
+                  "and the audit fails on the skew")
+
+            # The operation people reach for first, and what it actually does.
+            gitops.update_submodules(port, paths=["snesrecomp"])
+            check(_git(port / "snesrecomp", "rev-parse", "HEAD") == old,
+                  "`submodule update` puts the recorded pin back — it cannot advance")
+
+            dry = gitops.advance_submodule_pins(port, paths=["snesrecomp"], dry_run=True)
+            check(all(r.ok for r in dry) and "would advance" in dry[0].message,
+                  "dry-run says what it would do")
+            check(_git(port / "snesrecomp", "rev-parse", "HEAD") == old,
+                  "and moves nothing")
+
+            res = gitops.advance_submodule_pins(port, paths=["snesrecomp"])
+            check(all(r.ok for r in res), f"advance succeeds ({res[0].message})")
+            check(_git(port / "snesrecomp", "rev-parse", "HEAD") == new,
+                  "the checkout is at the tracked branch tip")
+            check(old[:9] in res[0].message and new[:9] in res[0].message,
+                  "and the move is reported as from → to, not just 'done'")
+            staged = _git(port, "diff", "--cached", "--name-only")
+            check("snesrecomp" in staged,
+                  "the new gitlink is staged, so the superproject records the move")
+            check(_git(port, "log", "--oneline", "-1", "--format=%s") == "init",
+                  "but nothing is committed — the pin change stays reviewable")
+
+            after = {c.id: c for c in snesops.audit_project(port).checks}
+            check(after["regen_framework"].status.value == "pass",
+                  "and the audit that flagged the skew now passes")
+
+            again = gitops.advance_submodule_pins(port, paths=["snesrecomp"])
+            check(all(r.ok for r in again) and "already at" in again[0].message,
+                  "a second run is a no-op that says so")
+
+            gone = gitops.advance_submodule_pins(port, paths=["recomp-ui"])
+            check(not gone[0].ok and "Ensure submodules first" in gone[0].message,
+                  "a module that is not checked out names the op that fixes it")
+
+            # Nested: the PSX shape, where what a port pins lives inside the
+            # framework rather than beside it. Same op, one level down.
+            fw_dir = port / "snesrecomp"
+            nested = gitops.advance_submodule_pins(
+                port, paths=["lib/recomp-net"], nested=True)
+            check(all(r.ok for r in nested), f"nested advance succeeds ({nested[0].message})")
+            check(_git(fw_dir / "lib" / "recomp-net", "rev-parse", "HEAD") == lib_new,
+                  "the nested checkout moves to its tracked tip")
+            check("staged in snesrecomp" in nested[0].message,
+                  "and the message says which repo the gitlink was staged in")
+            check("lib/recomp-net" in _git(fw_dir, "diff", "--cached", "--name-only"),
+                  "the gitlink is staged inside the framework, not the game repo")
+            check("lib/recomp-net" not in _git(port, "diff", "--cached", "--name-only"),
+                  "the game repo records nothing until the framework is committed")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
+def test_module_urls() -> None:
+    """Repointing a module at a fork, without committing it for everyone.
+
+    Three settings answer "which repo is this" and they are not the same one:
+    the tracked `.gitmodules` URL, this clone's `.git/config` override, and the
+    checkout's own `origin`. A contributor working from a fork needs the last
+    two moved and the first left alone — committing their fork into the port
+    would repoint it for everybody who clones it. The scope is therefore the
+    caller's to state, and the default is the one that cannot surprise anyone.
+    """
+    print("module remote URLs")
+    from project_studio import gitops
+
+    prev = os.environ.get("SNESRECOMP_ROOT")
+    os.environ.pop("SNESRECOMP_ROOT", None)
+    saved = {k: os.environ.get(k) for k in _FILE_PROTOCOL_ENV}
+    os.environ.update(_FILE_PROTOCOL_ENV)
+    FORK = "https://github.com/alex/snesrecomp.git"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            port, _old, _new, _lib = _stale_fork(Path(td))
+            rows = {r.path: r for r in gitops.module_urls(port)}
+            check("snesrecomp" in rows and "lib/recomp-net" in rows,
+                  "both levels are listed — submodules and nested modules")
+            check(rows["lib/recomp-net"].nested,
+                  "and the nested one is marked as such")
+            check(rows["recomp-ui"].present is False,
+                  "a module that is not checked out still gets a row to edit")
+            tracked_before = _git(port, "show", "HEAD:.gitmodules")
+
+            bad = gitops.set_module_url(port, "snesrecomp", "my fork")
+            check(not bad.ok and "does not look like a git remote" in bad.message,
+                  "a URL that is not a URL is refused before anything is written")
+
+            scoped = gitops.set_module_url(port, "snesrecomp", FORK, scope="nonsense")
+            check(not scoped.ok and "Unknown scope" in scoped.message,
+                  "and so is an unknown scope")
+
+            r = gitops.set_module_url(port, "snesrecomp", FORK)
+            check(r.ok, f"local scope applies ({r.message})")
+            after = {x.path: x for x in gitops.module_urls(port)}
+            check(after["snesrecomp"].origin_url == FORK,
+                  "origin moves, so push and pull go to the fork")
+            check(after["snesrecomp"].local_url == FORK,
+                  "the .git/config override moves, so submodule update follows")
+            check(after["snesrecomp"].gitmodules_url != FORK,
+                  "but .gitmodules is untouched")
+            check(_git(port, "diff", "--name-only", "--", ".gitmodules") == "",
+                  "and nothing tracked is modified — the fork stays private")
+            check(after["snesrecomp"].effective_url == FORK,
+                  "the effective URL is what git will actually reach for")
+
+            back = gitops.reset_module_url(port, "snesrecomp")
+            check(back.ok, f"reset applies ({back.message})")
+            check(gitops.module_urls(port)[0].origin_url != FORK,
+                  "and origin goes back to what .gitmodules says")
+
+            shared = gitops.set_module_url(port, "snesrecomp", FORK, scope="gitmodules")
+            check(shared.ok and "commit to share it" in shared.message,
+                  "the tracked scope says it has to be committed")
+            check(_git(port, "diff", "--name-only", "--", ".gitmodules") == ".gitmodules",
+                  "because it modifies a tracked file")
+            check(_git(port, "show", "HEAD:.gitmodules") == tracked_before,
+                  "and still commits nothing itself")
+
+            # Nested modules live in the framework's .gitmodules, not the port's.
+            # Init it first: with no checkout only the config override can move,
+            # which is a different (also correct) path.
+            subprocess.run(["git", "submodule", "update", "--init", "--", "lib/recomp-net"],
+                           cwd=str(port / "snesrecomp"), capture_output=True, text=True)
+            nested = gitops.set_module_url(
+                port, "lib/recomp-net", "https://github.com/alex/recomp-net.git",
+                nested=True)
+            check(nested.ok, f"a nested module can be repointed too ({nested.message})")
+            fw_rows = {x.path: x for x in gitops.module_urls(port)}
+            check(fw_rows["lib/recomp-net"].origin_url
+                  == "https://github.com/alex/recomp-net.git",
+                  "and its origin moves")
+            check(fw_rows["lib/recomp-net"].owner.endswith("snesrecomp"),
+                  "with the framework named as the repo that owns the setting")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        if prev is not None:
+            os.environ["SNESRECOMP_ROOT"] = prev
+
 
 def test_region_default() -> None:
     """--region defaults to USA on PSX and to nothing on SNES.
@@ -1010,6 +1484,11 @@ def main() -> int:
         test_probe_rom(root)
     test_rom_discovery()
     test_identity_layouts()
+    test_readme_toggle()
+    test_generate_preflight()
+    test_regen_framework_skew()
+    test_advance_pins()
+    test_module_urls()
     test_region_default()
     test_probe_rom_cli()
     test_dispatch_inputs()

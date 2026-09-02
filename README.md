@@ -65,6 +65,64 @@ committed generated C, `recomp/` analysis config, `VERSION`, `tools/regen.sh`,
 `scripts/package_release.sh`, CI, and whether `framework_pins.txt` still
 matches the gitlinks — and applies the fixes.
 
+It also checks two things a **fork** gets wrong that a repo scaffolded here
+never does: whether the `snesrecomp` gitlink the fork inherited can actually run
+the `tools/regen.sh` in the same repo, and which wizard Studio is driving when
+that submodule ships no `tools/new_project` of its own. Those two together are
+how a port ends up with a regen.sh that dies on `invalid choice: 'verify-rom'`
+— so Migrate now refuses to *write* a regen.sh the port's own framework could
+not run, rather than emitting it and leaving the failure for the Build tab.
+Moving a framework pin is never done for you — but the **Git** tab can do it
+when you ask. The two buttons there are opposite operations, and the difference
+is the thing that costs people an afternoon:
+
+* **Restore pinned** — `git submodule update`. Checks out the revision this
+  repo *already records*. On a fork carrying a stale pin it puts the old
+  revision back, which is why reaching for it leaves the pin where it was.
+* **Advance pins** — fetches, moves each module to its tracked branch tip, and
+  **stages the new gitlink**. That staging is the half that is easy to forget:
+  without it nothing about the superproject has changed. It reports
+  `snesrecomp: a64932f1a → f624c9f12 (main)` and stops there — review with
+  `git diff --cached`, then Commit and Push on the same tab. On the command
+  line: `git advance-pins [--modules] [--nested] [--paths …] [--ref <rev>]`.
+
+Both consoles, one tab. Advance pins honours the same **Targets** ticks as
+Switch / Pull / Commit / Push, so a PSX port can advance `recomp-net` and
+`retcomm-rbengine` *inside* `psxrecomp` — where most of what it pins actually
+lives. Nested gitlinks are staged in the framework checkout, so that repo needs
+its own commit before advancing the game repo's framework pin is worth doing;
+the result says so rather than leaving it to be deduced from a confusing diff.
+
+"Tracked branch tip" means the branch `.gitmodules` declares, not `master` by
+assumption — a port tracking `feat/…` follows that. Use `--ref` for a specific
+revision instead.
+
+**Git settings** (header, beside Check updates) is where a contributor points a
+module at their own fork. Three settings answer "which repo is this", and they
+are not the same one:
+
+| | scope | what it drives |
+|---|---|---|
+| `.gitmodules submodule.<p>.url` | tracked | what everyone who clones this port gets |
+| `.git/config submodule.<p>.url` | this clone | what `submodule update` fetches |
+| the checkout's `origin` | this clone | what **push and pull** use |
+
+The dialog lists every submodule and nested module with its effective URL, and
+makes you say which scope you mean. **This clone only** (the default) moves the
+last two: push and pull go to your fork, nothing tracked changes, and nobody
+else sees it. **Commit to .gitmodules** additionally rewrites the tracked URL —
+that repoints the port for everyone who clones it, so it is never the default
+and has to be committed. Reset drops a local override and goes back to
+`.gitmodules`. On the command line: `git module-urls` and
+`git set-module-url --path … --url … [--nested] [--scope …] [--reset]`.
+
+None of this is needed to *use* the upstream repos. Restore pinned, Advance
+pins, and pulling all work read-only, with no write access to `psxrecomp` or
+`recomp-ui`.
+
+Re-run Audit afterwards: `framework_pins.txt` is stale the moment a pin moves,
+and the port now builds against a different framework.
+
 Two things it deliberately will **not** do:
 
 * **Untracking generated C keeps the working tree** (`git rm --cached` only), so
@@ -75,10 +133,30 @@ Two things it deliberately will **not** do:
   carrying made-up digests verifies a ROM nobody owns and fails at the least
   useful moment.
 
+**README & About** is a switch, not a step. README badges, boxart, the RetComM
+Launcher section, the R.A.I.D. footer and the repository's GitHub About blurb
+are one op, so one checkbox governs them — and it governs the *audit* as well
+as the apply, which none of the other checkboxes do. A port whose README is
+hand-written should not be reading a warning about it on every run. The row
+stays visible as `skip` rather than disappearing, because a row that vanishes
+reads as "nothing to do here". On the command line: `--no-readme`, on `audit`
+as well as `plan` / `apply`. Asking for the op by name (`--only
+patch_readme_metrics`) still runs it.
+
 **Build → Regenerate C from ROM** runs the project's own `tools/regen.sh` rather
 than reimplementing generation, because regen.sh verifies the ROM against the
 digests that port was pinned against first. Turning that check off is possible
 and says so in orange.
+
+It preflights that script before running it, because the thing most likely to
+be wrong in a freshly forked port is not the ROM. Studio resolves the framework
+regen.sh will actually use (`$SNESRECOMP_ROOT`, else the repo's own
+`snesrecomp/`), asks that CLI what subcommands it offers, and refuses with the
+mismatch named when the port's `snesrecomp` pin predates its own regen.sh — the
+skew that otherwise arrives as `invalid choice: 'verify-rom'` attributed to the
+Generate button. It refuses the same way when `rom_identity.txt` is missing or
+carries empty digests, since `--verify` would then be checking the ROM against
+nothing.
 
 ## Setup
 

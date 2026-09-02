@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from . import snes_paths
@@ -240,7 +241,7 @@ _DIGEST_PATTERNS = (
 )
 
 
-def _parse_identity_file(path: Path) -> dict[str, str]:
+def parse_identity_file(path: Path) -> dict[str, str]:
     """``key = value`` lines, ``#`` comments, optionally quoted values.
 
     Deliberately mirrors the sed in regen.sh's ``identity_get`` rather than
@@ -325,7 +326,7 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
     # identity_get, so _DIGEST_PATTERNS below has nothing to fall back on.)
     ident_file = root / IDENTITY_FILE
     if ident_file.is_file():
-        data = _parse_identity_file(ident_file)
+        data = parse_identity_file(ident_file)
         for field, key in (
             ("display_name", "display_name"),
             ("rom_file", "rom_file"),
@@ -462,7 +463,55 @@ def diagnose_framework_checkout(root: Path) -> str | None:
 # ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
-def audit_project(root: Path) -> AuditReport:
+def _audit_readme(root: Path, add: Callable[..., None]) -> None:
+    """The README / GitHub About row.
+
+    Split out so the switch that gates it reads as a switch. One row and one op
+    cover both because ``snes_patch_readme_metrics`` writes both: the badges,
+    boxart, launcher and R.A.I.D. blocks in README.md, and the repository's
+    About blurb over the GitHub API.
+    """
+    from .readme_metrics import (
+        boxart_png_present,
+        readme_has_boxart,
+        readme_has_launcher,
+        readme_has_metrics,
+        readme_has_raid,
+    )
+    readme_path = root / "README.md"
+    try:
+        readme_text = readme_path.read_text(encoding="utf-8", errors="replace") \
+            if readme_path.is_file() else ""
+    except OSError:
+        readme_text = ""
+    missing_readme: list[str] = []
+    if not readme_path.is_file():
+        missing_readme.append("README.md")
+    else:
+        if not readme_has_metrics(readme_text):
+            missing_readme.append("download badges")
+        if not readme_has_boxart(readme_text):
+            missing_readme.append("libretro boxart")
+        if not readme_has_launcher(readme_text):
+            missing_readme.append("RetComM Launcher section")
+        if not readme_has_raid(readme_text):
+            missing_readme.append("R.A.I.D. Discord footer")
+    if not (root / ".github" / "raid-discord.png").is_file():
+        missing_readme.append(".github/raid-discord.png")
+    if not boxart_png_present(root):
+        missing_readme.append("launcher_assets/img/boxart.png")
+    if missing_readme:
+        add("readme_metrics", "README download metrics / launcher / RAID / boxart",
+            CheckStatus.WARN, Severity.RECOMMENDED,
+            "Missing: " + ", ".join(missing_readme), "snes_patch_readme_metrics")
+    else:
+        add("readme_metrics", "README download metrics / launcher / RAID / boxart",
+            CheckStatus.PASS, Severity.RECOMMENDED,
+            "Badges, boxart, RetComM Launcher, and R.A.I.D. footer present.")
+
+
+def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditReport:
+    options = options or MigrateOptions()
     root = Path(root).expanduser().resolve()
     checks: list[CheckResult] = []
     notes: list[str] = []
@@ -597,6 +646,47 @@ def audit_project(root: Path) -> AuditReport:
             None if blocked else op,
         )
 
+    # --- regen.sh vs the framework this port is pinned to ---------------------
+    # A fork carries whatever gitlink its parent recorded, which may be far
+    # older than the wizard Studio is driving. Say so on the Migrate tab rather
+    # than letting it surface as an argparse error from the Build tab.
+    regen_path = root / "tools" / "regen.sh"
+    if regen_path.is_file():
+        try:
+            regen_text = regen_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            regen_text = ""
+        gap = snes_paths.regen_framework_gap(root, regen_text) if regen_text else None
+        if gap is not None:
+            missing, have = gap
+            # No fix op: moving a framework pin is a decision about what this
+            # port is measured against, and that belongs to a human.
+            add("regen_framework", "tools/regen.sh vs pinned snesrecomp",
+                CheckStatus.FAIL, Severity.REQUIRED,
+                f"regen.sh calls {', '.join(missing)}, which this port's "
+                f"snesrecomp does not have (it offers {', '.join(sorted(have))}). "
+                "Generate cannot work until the submodule moves to a revision "
+                "that has them.")
+        elif regen_text:
+            add("regen_framework", "tools/regen.sh vs pinned snesrecomp",
+                CheckStatus.PASS, Severity.REQUIRED,
+                "The pinned snesrecomp offers everything regen.sh calls.")
+
+    # --- which wizard is being driven ----------------------------------------
+    # Provenance, because every emitted file inherits it. Silent until now, and
+    # a fallback to the vendored copy is precisely what lets Studio write files
+    # the port's own framework has never heard of.
+    own_wizard = root / FRAMEWORK / "tools" / "new_project" / "setup_project.sh"
+    if not own_wizard.is_file():
+        add("wizard_source", "Scaffold templates in use", CheckStatus.WARN,
+            Severity.INFO,
+            f"{FRAMEWORK}/tools/new_project is absent, so Studio is driving "
+            f"{snes_paths.wizard_dir(root)} instead — a different revision from "
+            "the one this port builds against.")
+    else:
+        add("wizard_source", "Scaffold templates in use", CheckStatus.PASS,
+            Severity.INFO, f"{snes_paths.wizard_source(root)}.")
+
     # --- ROM / catalog identity ---------------------------------------------
     ident = rom_identity(root)
     if ident.get("sha256") and ident.get("crc32"):
@@ -642,7 +732,7 @@ def audit_project(root: Path) -> AuditReport:
                     f"{primary.name} still has unfilled @TOKEN@ placeholders.",
                     None if blocked_id else emit_op)
             elif layout == "file" and not all(
-                _parse_identity_file(primary).get(k)
+                parse_identity_file(primary).get(k)
                 for k in ("expected_crc32", "expected_sha256")
             ):
                 # An empty digest is not a formatting nit: the build says so and
@@ -694,43 +784,16 @@ def audit_project(root: Path) -> AuditReport:
             "snes_emit_boxart_stub")
 
     # --- README metrics / launcher / RAID ------------------------------------
-    from .readme_metrics import (
-        boxart_png_present,
-        readme_has_boxart,
-        readme_has_launcher,
-        readme_has_metrics,
-        readme_has_raid,
-    )
-    readme_path = root / "README.md"
-    try:
-        readme_text = readme_path.read_text(encoding="utf-8", errors="replace") \
-            if readme_path.is_file() else ""
-    except OSError:
-        readme_text = ""
-    missing_readme: list[str] = []
-    if not readme_path.is_file():
-        missing_readme.append("README.md")
-    else:
-        if not readme_has_metrics(readme_text):
-            missing_readme.append("download badges")
-        if not readme_has_boxart(readme_text):
-            missing_readme.append("libretro boxart")
-        if not readme_has_launcher(readme_text):
-            missing_readme.append("RetComM Launcher section")
-        if not readme_has_raid(readme_text):
-            missing_readme.append("R.A.I.D. Discord footer")
-    if not (root / ".github" / "raid-discord.png").is_file():
-        missing_readme.append(".github/raid-discord.png")
-    if not boxart_png_present(root):
-        missing_readme.append("launcher_assets/img/boxart.png")
-    if missing_readme:
+    # Reported as skipped rather than dropped: a row that silently disappears
+    # reads as "nothing to do here", which is the opposite of what the switch
+    # means. SKIP carries no fix op, so it never reaches failing_ops() and the
+    # layout classification below stops counting it as a recommended warning.
+    if not options.patch_readme:
         add("readme_metrics", "README download metrics / launcher / RAID / boxart",
-            CheckStatus.WARN, Severity.RECOMMENDED,
-            "Missing: " + ", ".join(missing_readme), "snes_patch_readme_metrics")
+            CheckStatus.SKIP, Severity.INFO,
+            "Skipped — README & About is off for this repo.")
     else:
-        add("readme_metrics", "README download metrics / launcher / RAID / boxart",
-            CheckStatus.PASS, Severity.RECOMMENDED,
-            "Badges, boxart, RetComM Launcher, and R.A.I.D. footer present.")
+        _audit_readme(root, add)
 
     # --- netplay wiring -------------------------------------------------------
     # Report-only: netplay is opt-in, so the plan adds the enable/disable op
@@ -875,7 +938,7 @@ def build_plan(
 ) -> Plan:
     root = Path(root).expanduser().resolve()
     options = options or MigrateOptions()
-    report = report or audit_project(root)
+    report = report or audit_project(root, options)
 
     wanted = set(report.failing_ops())
     if options.record_pins:
@@ -884,6 +947,8 @@ def build_plan(
         wanted.discard("snes_record_framework_pins")
     if not options.enable_ci:
         wanted.discard("snes_emit_ci_workflow")
+    if not options.patch_readme:
+        wanted.discard("snes_patch_readme_metrics")
     if not options.merge_gitignore:
         wanted.discard("snes_merge_gitignore")
     if not options.enable_recomp_ui:
@@ -1125,8 +1190,47 @@ def _fill_template(
     return ApplyResult(op, True, f"Wrote {rel} ({snes_paths.wizard_source(root)})", [rel])
 
 
+def _regen_gap(root: Path, rendered: str) -> str | None:
+    """The reason this regen.sh would not run here, or None.
+
+    Studio drives whichever wizard it can find; the port runs whichever
+    snesrecomp its gitlink records. On a fork those are routinely different
+    revisions, and writing the newer wizard's regen.sh into the older
+    framework's repo is exactly how a port ends up with a script that dies on
+    `invalid choice: 'verify-rom'` the first time anyone presses Generate.
+    Refusing to write it is the fix: the file Studio was about to create is the
+    defect, and creating it anyway only moves the failure later.
+    """
+    from .buildops import framework_gap_message
+
+    gap = snes_paths.regen_framework_gap(root, rendered)
+    if gap is None:
+        return None
+    missing, have = gap
+    cli = snes_paths.regen_framework_root(root) / "snesrecomp_cli.py"
+    return framework_gap_message(cli, missing, have)
+
+
+def _fill_regen(root: Path, opts: MigrateOptions, op: str) -> ApplyResult:
+    """tools/regen.sh, but never a version the pinned framework cannot run."""
+    src = snes_paths.templates_dir(root) / "regen.sh.in"
+    if src.is_file():
+        try:
+            rendered, _ = _render(src.read_text(encoding="utf-8"),
+                                  _template_values(root, opts))
+        except OSError:
+            rendered = ""
+        why = _regen_gap(root, rendered) if rendered else None
+        if why:
+            return ApplyResult(
+                op, False,
+                "tools/regen.sh not written — it would not run against this "
+                f"port's own snesrecomp. {why}")
+    return _fill_template(root, opts, op, "regen.sh.in", "tools/regen.sh")
+
+
 def _op_emit_regen(root: Path, opts: MigrateOptions) -> ApplyResult:
-    return _fill_template(root, opts, "snes_emit_regen", "regen.sh.in", "tools/regen.sh")
+    return _fill_regen(root, opts, "snes_emit_regen")
 
 
 def _op_emit_packager(root: Path, opts: MigrateOptions) -> ApplyResult:
@@ -1310,7 +1414,7 @@ def _op_probe_rom_refresh(root: Path, opts: MigrateOptions) -> ApplyResult:
             f"No identity template in {snes_paths.templates_dir(root)} — "
             "neither rom_identity.txt.in nor codegen_setup.c.in")
     results = [_fill_template(root, forced, op, tpl, rel) for tpl, rel in carriers]
-    results.append(_fill_template(root, forced, op, "regen.sh.in", "tools/regen.sh"))
+    results.append(_fill_regen(root, forced, op))
     changed = [pth for r in results for pth in r.changed_paths]
     ok = all(r.ok for r in results)
     detail = f"crc32 {ident['crc32']}, sha256 {ident['sha256'][:12]}…"

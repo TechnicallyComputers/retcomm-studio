@@ -96,6 +96,11 @@ class MigrateOptions:
     rewrite_cmake: bool = True
     merge_gitignore: bool = True
     probe_disc: bool = False
+    # README badges/boxart/launcher/RAID and the GitHub About blurb are one
+    # unit of work — one op writes both — so one switch governs both, and it
+    # governs the audit too: a port that deliberately hand-writes its README
+    # should not be reporting a warning about it on every run.
+    patch_readme: bool = True
     record_pins: bool = True
     force: bool = False
     only: list[str] = field(default_factory=list)

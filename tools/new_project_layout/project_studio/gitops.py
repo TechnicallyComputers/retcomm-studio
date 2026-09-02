@@ -560,6 +560,173 @@ def set_submodule_url(
     return CmdResult(True, f"Set {path} url → {url}")
 
 
+# ---------------------------------------------------------------------------
+# Where each module is fetched from and pushed to
+# ---------------------------------------------------------------------------
+# Three settings answer "which repo is this", and they are not the same one:
+#
+#   .gitmodules  submodule.<p>.url   tracked; what everyone who clones gets
+#   .git/config  submodule.<p>.url   this clone only; what `submodule update` uses
+#   <sub>/remote origin              this clone only; what push and pull use
+#
+# A contributor working from a fork wants the last two pointed at their fork
+# and the first left alone — changing .gitmodules would commit their fork into
+# the port for everybody. Someone re-homing a project wants all three. Both are
+# legitimate, so the scope is the caller's to state rather than ours to guess.
+URL_SCOPES = ("local", "gitmodules")
+
+
+@dataclass
+class ModuleUrl:
+    path: str
+    nested: bool = False
+    owner: str = ""            # the repo holding this gitlink
+    gitmodules_url: str = ""   # tracked
+    local_url: str = ""        # .git/config override, this clone only
+    origin_url: str = ""       # the checkout's own origin
+    present: bool = False
+
+    @property
+    def effective_url(self) -> str:
+        """What git will actually reach for, in the order git resolves it."""
+        return self.origin_url or self.local_url or self.gitmodules_url
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["effective_url"] = self.effective_url
+        return d
+
+
+def _local_url(owner: Path, path: str) -> str:
+    code, out, _ = _git(owner, "config", "--local", "--get", f"submodule.{path}.url")
+    return out.strip() if code == 0 else ""
+
+
+def _gitmodules_url(owner: Path, path: str) -> str:
+    cp = _read_gitmodules(owner)
+    section = _section_for_path(cp, path)
+    if section is None:
+        return ""
+    return cp.get(section, "url", fallback="").strip()
+
+
+def _url_owner(root: Path, *, nested: bool) -> Path | None:
+    return resolve_framework_dir(root) if nested else root.expanduser().resolve()
+
+
+def module_urls(root: Path) -> list[ModuleUrl]:
+    """Every module this port pins, and where each one currently points."""
+    root = root.expanduser().resolve()
+    rows: list[ModuleUrl] = []
+    for nested in (False, True):
+        owner = _url_owner(root, nested=nested)
+        if owner is None or not _is_git_repo(owner):
+            continue
+        for path in default_module_paths(nested=nested):
+            sub_dir = owner / path
+            rows.append(ModuleUrl(
+                path=path,
+                nested=nested,
+                owner=str(owner),
+                gitmodules_url=_gitmodules_url(owner, path) or _default_url_for_path(path),
+                local_url=_local_url(owner, path),
+                origin_url=_submodule_remote_url(owner, path),
+                present=sub_dir.is_dir(),
+            ))
+    return rows
+
+
+# Not validation of whether the repo exists — only of whether this is the shape
+# of a git remote at all, so a stray path or a half-pasted line is caught before
+# it is written somewhere that will fail confusingly later.
+_URL_SHAPE_RE = re.compile(
+    r"^(https?://|ssh://|git://|file://|[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:|/|\.{1,2}/)"
+)
+
+
+def valid_remote_url(url: str) -> bool:
+    return bool(_URL_SHAPE_RE.match((url or "").strip()))
+
+
+def set_module_url(
+    root: Path,
+    path: str,
+    url: str,
+    *,
+    nested: bool = False,
+    scope: str = "local",
+    dry_run: bool = False,
+) -> CmdResult:
+    """Point one module at a different remote.
+
+    ``scope="local"`` touches nothing tracked: the ``.git/config`` override and
+    the checkout's ``origin``, which together are what a fork workflow needs.
+    ``scope="gitmodules"`` additionally rewrites the tracked ``.gitmodules``,
+    which changes the project for everyone who clones it and has to be
+    committed — so it is never the default.
+    """
+    if scope not in URL_SCOPES:
+        return CmdResult(False, f"Unknown scope {scope!r} (expected {', '.join(URL_SCOPES)})")
+    url = (url or "").strip()
+    if not url:
+        return CmdResult(False, "URL required")
+    if not valid_remote_url(url):
+        return CmdResult(
+            False,
+            f"{url!r} does not look like a git remote — expected https://…, "
+            "ssh://…, git@host:owner/repo.git, or an absolute path")
+    root = root.expanduser().resolve()
+    path = _normalize_module_path(path, nested=nested)
+    owner = _url_owner(root, nested=nested)
+    if owner is None:
+        return CmdResult(False, f"No {framework_name()} checkout found")
+
+    if scope == "gitmodules":
+        # set_submodule_url syncs, which propagates into .git/config and origin.
+        r = set_submodule_url(owner, path, url, dry_run=dry_run)
+        if not r.ok:
+            return r
+        return CmdResult(True, f"{path} → {url} (.gitmodules; commit to share it)")
+
+    if dry_run:
+        return CmdResult(True, f"[dry-run] {path} → {url} (this clone only)")
+    code, out, err = _git(owner, "config", "--local", f"submodule.{path}.url", url)
+    if code != 0:
+        return CmdResult(False, f"{path}: could not set the local override", err or out)
+    # Deliberately not `git submodule sync`: sync copies .gitmodules back over
+    # the override we just wrote, which would silently undo this.
+    sub_dir = owner / path
+    if (sub_dir / ".git").exists():
+        code, out, err = _git(sub_dir, "remote", "set-url", "origin", url)
+        if code != 0:
+            return CmdResult(False, f"{path}: could not set origin", err or out)
+        return CmdResult(True, f"{path} → {url} (this clone only; push/pull use it now)")
+    return CmdResult(
+        True,
+        f"{path} → {url} (this clone only; applies when the submodule is checked out)")
+
+
+def reset_module_url(
+    root: Path,
+    path: str,
+    *,
+    nested: bool = False,
+    dry_run: bool = False,
+) -> CmdResult:
+    """Drop the local override and go back to what ``.gitmodules`` says."""
+    root = root.expanduser().resolve()
+    path = _normalize_module_path(path, nested=nested)
+    owner = _url_owner(root, nested=nested)
+    if owner is None:
+        return CmdResult(False, f"No {framework_name()} checkout found")
+    if dry_run:
+        return CmdResult(True, f"[dry-run] {path}: would drop the local override")
+    _git(owner, "config", "--local", "--unset", f"submodule.{path}.url")
+    _git(owner, "submodule", "sync", "--", path)
+    back = _gitmodules_url(owner, path) or _default_url_for_path(path)
+    return CmdResult(True, f"{path} → {back} (back to .gitmodules)")
+
+
 def ensure_submodule(
     root: Path,
     path: str,
@@ -1108,6 +1275,111 @@ def update_submodules(
         return CmdResult(False, "Submodule update failed", err or out)
     mode = "remote tracking tip" if remote else "pinned gitlink"
     return CmdResult(True, f"Updated submodules ({mode})", out)
+
+
+def advance_submodule_pins(
+    root: Path,
+    *,
+    paths: list[str] | None = None,
+    nested: bool = False,
+    ref: str = "",
+    stage: bool = True,
+    dry_run: bool = False,
+) -> list[CmdResult]:
+    """Move submodule gitlinks forward, and stage the move.
+
+    Not the same operation as :func:`update_submodules`, and the difference is
+    the whole point. ``git submodule update`` checks out the gitlink the
+    superproject *already records* — so on a fork carrying an old pin it puts
+    the old revision back, which is exactly what makes "I tried updating the
+    modules" leave the pin where it was. Advancing fetches, moves the checkout
+    to the tracked branch tip (or ``ref``), and stages the new gitlink so the
+    superproject records it.
+
+    The commit is deliberately left to the caller. Which revision a port is
+    pinned to decides what that port is measured against, so it should be
+    reviewable — ``git diff --cached`` — before it becomes history.
+
+    ``nested=True`` does the same thing one level down, for the modules inside
+    the framework checkout (``lib/recomp-net``, ``lib/retcomm-rbengine``) —
+    which is where a PSX port keeps most of what it pins. The gitlinks are
+    staged *inside the framework*, so that repo needs its own commit before the
+    game repo's framework pin is worth advancing; the caller is told so rather
+    than left to discover it from a confusing diff.
+    """
+    root = root.expanduser().resolve()
+    if not _is_git_repo(root):
+        return [CmdResult(False, "Not a git repository")]
+    # Whose gitlinks are being moved: the game repo, or the framework checkout
+    # that owns the nested modules.
+    owner = resolve_framework_dir(root) if nested else root
+    if owner is None:
+        return [CmdResult(False, f"No {framework_name()} checkout found")]
+    want = paths or list(default_module_paths(nested=nested))
+    results: list[CmdResult] = []
+    for path in want:
+        path = _normalize_module_path(path, nested=nested)
+        sub_dir = resolve_module_dir(root, path, nested=nested)
+        if sub_dir is None or not _is_git_repo(sub_dir):
+            results.append(CmdResult(
+                False, f"{path}: checkout missing — Ensure submodules first"))
+            continue
+        code, old, _ = _git(sub_dir, "rev-parse", "HEAD")
+        old = old.strip() if code == 0 else ""
+
+        target = (ref or "").strip()
+        tracked = _tracking_branch_for(owner, path)
+        if target:
+            # An explicit revision still needs fetching: the point of moving a
+            # stale fork's pin is usually a commit it has never seen.
+            code, out, err = _git(sub_dir, "fetch", "--tags", "origin", dry_run=dry_run)
+            if code != 0 and not dry_run:
+                results.append(CmdResult(False, f"{path}: fetch failed", err or out))
+                continue
+            code, out, err = _git(sub_dir, "checkout", "--detach", target, dry_run=dry_run)
+            if code != 0 and not dry_run:
+                results.append(CmdResult(
+                    False, f"{path}: cannot check out {target}", err or out))
+                continue
+            moved_to = target
+        else:
+            # Let git resolve .gitmodules `branch =` and do the fetch, rather
+            # than reimplementing that resolution here and drifting from it.
+            #
+            # Deliberately NOT --recursive: `--remote --recursive` also walks
+            # the nested modules to *their* tips, which moves checkouts this
+            # call neither reports nor stages. Nested pins are advanced by an
+            # explicit nested=True run, so every move that happens is a move
+            # somebody asked for and can see.
+            code, out, err = _git(
+                owner, "submodule", "update", "--init", "--remote",
+                "--", path, dry_run=dry_run)
+            if code != 0 and not dry_run:
+                results.append(CmdResult(False, f"{path}: update --remote failed", err or out))
+                continue
+            moved_to = tracked or "(default branch)"
+
+        if dry_run:
+            results.append(CmdResult(
+                True, f"[dry-run] {path}: would advance to {moved_to} and stage the gitlink"))
+            continue
+
+        code, new, _ = _git(sub_dir, "rev-parse", "HEAD")
+        new = new.strip() if code == 0 else ""
+        if new and new == old:
+            results.append(CmdResult(True, f"{path}: already at {moved_to} ({old[:9]})"))
+            continue
+        msg = f"{path}: {old[:9] or '?'} → {new[:9] or '?'} ({moved_to})"
+        if not stage:
+            results.append(CmdResult(True, msg + "; not staged"))
+            continue
+        code, out, err = _git(owner, "add", "--", path)
+        if code != 0:
+            results.append(CmdResult(False, msg + "; staging the gitlink failed", err or out))
+            continue
+        where = f" in {framework_name()}" if nested else ""
+        results.append(CmdResult(True, msg + f"; gitlink staged{where}"))
+    return results
 
 
 # pull() strategies — used by CLI/GUI for game root, submodules, and nested libs.

@@ -742,6 +742,11 @@ struct StudioModel {
     bool migrate_netplay = false;
     bool migrate_ci = true;
     bool migrate_probe = false;
+    // README badges/boxart/launcher/RAID plus the GitHub About blurb. On by
+    // default because that is the house style, but a port whose README is
+    // hand-written wants it off — and off means the audit stops reporting it
+    // too, not just the apply.
+    bool migrate_readme = true;
     bool migrate_dry_run = true;
     bool migrate_force = false;
 
@@ -1115,9 +1120,35 @@ struct StudioModel {
     bool ws_loaded = false;
     std::string ws_toml_path;
 
+    // Git settings — where each module is fetched from and pushed to. A
+    // contributor working from a fork repoints these; everyone else never
+    // opens the dialog. `edit` is the text box, kept beside the values it was
+    // seeded from so Save can tell which rows the user actually changed.
+    struct ModuleUrlRow {
+        std::string path;
+        bool nested = false;
+        std::string gitmodules_url;
+        std::string local_url;
+        std::string origin_url;
+        std::string effective_url;
+        bool present = false;
+        char edit[512] = {};
+    };
+    std::vector<ModuleUrlRow> git_urls;
+    std::string git_urls_root;
+    bool git_urls_loading = false;
+    bool git_settings_open = false;
+    // 0 = this clone only, 1 = commit to .gitmodules. Defaults to the scope
+    // that cannot surprise a collaborator.
+    int git_url_scope = 0;
+
     // Log (ring)
     static constexpr size_t kMaxLogLines = 4000;
     std::vector<std::string> log_lines;
+    // Bumped on every change to log_lines. The Activity log word-wraps into a
+    // cache of display rows; this is how the drawing code knows the cache is
+    // stale without hashing four thousand strings every frame.
+    std::uint64_t log_revision = 0;
     bool log_scroll_bottom = true;
     bool log_expanded = true;
     float log_h_pref = 160.f;

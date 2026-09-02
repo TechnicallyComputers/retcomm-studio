@@ -1,5 +1,6 @@
 #include "studio/studio_model.hpp"
 
+#include <cstdint>
 #include <cstdio>
 
 namespace retcomm::studio {
@@ -11,6 +12,7 @@ void StudioModel::append_log(std::string line) {
         const size_t drop = log_lines.size() - kMaxLogLines;
         log_lines.erase(log_lines.begin(), log_lines.begin() + static_cast<std::ptrdiff_t>(drop));
     }
+    ++log_revision;
     log_scroll_bottom = true;
 }
 

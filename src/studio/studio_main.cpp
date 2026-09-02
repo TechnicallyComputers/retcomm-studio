@@ -29,6 +29,7 @@
 #include "stb_image.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -889,6 +890,7 @@ std::vector<std::string> migrate_common_args(StudioModel& model) {
     if (!model.migrate_ci) a.push_back("--no-ci");
     // probe_disc = bool(disc) and not no_probe — pass --no-probe unless user wants probe.
     if (!model.migrate_probe) a.push_back("--no-probe");
+    if (!model.migrate_readme) a.push_back("--no-readme");
     if (model.migrate_force) a.push_back("--force");
     if (model.migrate_dry_run) a.push_back("--dry-run");
     return a;
@@ -901,6 +903,10 @@ void do_audit_plan(StudioModel& model) {
         return;
     }
     std::vector<std::string> audit_args = {"audit", "--root", root, "--json"};
+    // The README switch gates the check as well as the op, so the audit has
+    // to hear about it — otherwise the pane shows a warning for work the
+    // plan below it will never do.
+    if (!model.migrate_readme) audit_args.push_back("--no-readme");
     retcomm::studio::run_project_studio_async(
         model, audit_args,
         [&model, root](RunResult r) {
@@ -1158,6 +1164,141 @@ void draw_platform_picker(StudioModel& model, const Theme& th) {
     }
 }
 
+void refresh_module_urls(StudioModel& model) {
+    const std::string root = model.selected_root();
+    if (root.empty()) return;
+    model.git_urls_loading = true;
+    model.git_urls_root = root;
+    retcomm::studio::run_project_studio_async(
+        model, {"git", "module-urls", "--root", root, "--json"},
+        [&model](RunResult r) {
+            model.git_urls_loading = false;
+            std::string err;
+            if (!r.ok() || !retcomm::studio::load_module_urls_from_json(
+                               model, r.stdout_text, &err)) {
+                model.append_log("[FAIL] Git settings: " +
+                                 (err.empty() ? r.stderr_text : err));
+            }
+        },
+        false);
+}
+
+// Where each module is fetched from and pushed to. Three settings answer that
+// question and they are not the same one, so the dialog makes the user say
+// which they mean rather than picking for them: a fork contributor wants their
+// own clone repointed and .gitmodules left alone, while re-homing a project
+// wants the tracked URL changed for everyone.
+void draw_git_settings_popup(StudioModel& model, const Theme& th) {
+    if (model.git_settings_open) ImGui::OpenPopup("Git settings###git_settings");
+    ImGui::SetNextWindowSize(ImVec2(760.f, 0.f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Git settings###git_settings", &model.git_settings_open,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    const std::string root = model.selected_root();
+    if (root.empty()) {
+        ImGui::TextUnformatted("Select a game repo first.");
+        if (ImGui::Button("Close", ImVec2(120.f, 0))) model.git_settings_open = false;
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::TextWrapped(
+        "Point a module at your own fork so push and pull go there. Leave these "
+        "alone to use the upstream repos read-only — Restore pinned and Advance "
+        "pins work either way, and need no write access.");
+    ImGui::Spacing();
+
+    ImGui::TextUnformatted("Apply to");
+    ImGui::SameLine();
+    ImGui::RadioButton("This clone only", &model.git_url_scope, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Commit to .gitmodules", &model.git_url_scope, 1);
+    ImGui::TextColored(
+        th.text_muted,
+        model.git_url_scope == 0
+            ? "Nothing tracked changes — your fork stays private to this checkout."
+            : "Rewrites the tracked .gitmodules: everyone who clones this port gets "
+              "your URL. Commit it on the Git tab afterwards.");
+    ImGui::Spacing();
+
+    ImGui::BeginDisabled(model.busy.load() || model.git_urls_loading);
+    if (ImGui::Button("Reload")) refresh_module_urls(model);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (model.git_urls_loading) ImGui::TextColored(th.text_muted, "Loading…");
+    else ImGui::TextColored(th.text_muted, "%d module(s)",
+                            static_cast<int>(model.git_urls.size()));
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("git_urls_tbl", 3,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch, 0.30f);
+        ImGui::TableSetupColumn("Remote URL", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 70.f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < model.git_urls.size(); ++i) {
+            auto& row = model.git_urls[i];
+            ImGui::TableNextRow();
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(row.path.c_str());
+            if (row.nested)
+                ImGui::TextColored(th.text_muted, "inside %s", model.framework());
+            if (!row.present) ImGui::TextColored(th.warn, "not checked out");
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputText("##url", row.edit, sizeof(row.edit));
+            // A local override is invisible in the repo, so say when one is in
+            // force — otherwise "why is it pushing there" has no answer on screen.
+            if (!row.local_url.empty() && row.local_url != row.gitmodules_url)
+                ImGui::TextColored(th.text_muted, ".gitmodules says %s",
+                                   row.gitmodules_url.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImGui::BeginDisabled(model.busy.load());
+            if (ImGui::SmallButton("Reset")) {
+                std::vector<std::string> args = {
+                    "git", "set-module-url", "--root", root, "--path", row.path, "--reset"};
+                if (row.nested) args.push_back("--nested");
+                retcomm::studio::run_project_studio_async(
+                    model, std::move(args),
+                    [&model](RunResult) { refresh_module_urls(model); });
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+    ImGui::BeginDisabled(model.busy.load() || model.git_urls_loading);
+    accent_button(th);
+    if (ImGui::Button("Save changes", ImVec2(140.f, 0))) {
+        const char* scope = model.git_url_scope == 1 ? "gitmodules" : "local";
+        int sent = 0;
+        for (const auto& row : model.git_urls) {
+            const std::string want = row.edit;
+            // Only rows the user actually edited: re-setting an unchanged URL
+            // would dirty .gitmodules for no reason under the tracked scope.
+            if (want.empty() || want == row.effective_url) continue;
+            std::vector<std::string> args = {
+                "git", "set-module-url", "--root", root, "--path", row.path,
+                "--url", want, "--scope", scope};
+            if (row.nested) args.push_back("--nested");
+            retcomm::studio::run_project_studio_async(model, std::move(args), nullptr);
+            ++sent;
+        }
+        if (sent == 0) model.append_log("Git settings: no URLs changed.");
+        else refresh_module_urls(model);
+    }
+    accent_button_pop();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(120.f, 0))) model.git_settings_open = false;
+    ImGui::EndPopup();
+}
+
 void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 88.f;
 
@@ -1180,11 +1321,25 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
         }
     }
     {
-        const float bw = widget_label_width("Check updates");
+        const ImGuiStyle& st = ImGui::GetStyle();
+        const float settings_w = widget_label_width("Git settings");
+        const float bw = settings_w + st.ItemSpacing.x + widget_label_width("Check updates");
         ImGui::SameLine(0.f, 0.f);
         const float gap = ImGui::GetContentRegionAvail().x - bw;
-        if (gap > ImGui::GetStyle().ItemSpacing.x)
-            ImGui::Dummy(ImVec2(gap - ImGui::GetStyle().ItemSpacing.x, 0.f));
+        if (gap > st.ItemSpacing.x) ImGui::Dummy(ImVec2(gap - st.ItemSpacing.x, 0.f));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(model.busy.load() || !picked || model.selected_root().empty());
+        if (ImGui::Button("Git settings")) {
+            model.git_settings_open = true;
+            if (model.git_urls.empty() || model.git_urls_root != model.selected_root())
+                refresh_module_urls(model);
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "Where each submodule and nested module is fetched from and pushed to.\n"
+                "Point them at your forks to contribute; leave them for read-only use.");
+        }
         ImGui::SameLine();
         ImGui::BeginDisabled(model.busy.load());
         if (ImGui::Button("Check updates")) {
@@ -1333,15 +1488,20 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     // enable_netplay / snes_enable_netplay (build-side wiring; on SNES the
     // launcher button additionally needs host code — the op's detail says
     // so). Probe maps to probe_disc_refresh / snes_probe_rom_refresh with a
-    // path in the image field.
+    // path in the image field. README & About maps to patch_readme_metrics /
+    // snes_patch_readme_metrics, and unlike the others it also silences the
+    // matching audit row: a port that writes its own README should not have to
+    // read a warning about it on every run.
     if (!snes) {
         checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe disc", &model.migrate_probe);
+        checkbox_wrapped("README & About", &model.migrate_readme);
     } else {
         checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe ROM", &model.migrate_probe);
+        checkbox_wrapped("README & About", &model.migrate_readme);
     }
     checkbox_wrapped("Dry-run", &model.migrate_dry_run);
     checkbox_wrapped("Force", &model.migrate_force);
@@ -1903,11 +2063,36 @@ void draw_git(StudioModel& model, const Theme& th) {
         retcomm::studio::run_project_studio_async(
             model, {"git", "ensure-nested", "--root", root}, nullptr);
     }
-    if (action("Update submodules")) {
+    // Two different operations, and the old label ("Update submodules") read
+    // like the wrong one. `git submodule update` checks out the gitlink the
+    // repo ALREADY records — on a fork carrying a stale pin it puts the old
+    // revision back, which is why "I tried updating the modules" leaves the pin
+    // exactly where it was. Advancing is the other direction.
+    if (action("Restore pinned")) {
         retcomm::studio::run_project_studio_async(
             model, {"git", "update-submodules", "--root", root}, nullptr);
     }
+    if (action("Advance pins")) {
+        // Honours the same Targets ticks as Switch / Pull / Commit / Push, so
+        // a PSX port can advance recomp-net and rbengine inside psxrecomp —
+        // which is where most of what it pins actually lives. Game is not a
+        // pin, so it is ignored here.
+        std::vector<std::string> args = {"git", "advance-pins", "--root", root};
+        if (model.git_tgt_modules) args.push_back("--modules");
+        if (model.git_tgt_nested) args.push_back("--nested");
+        if (!model.git_tgt_modules && !model.git_tgt_nested) args.push_back("--modules");
+        retcomm::studio::run_project_studio_async(
+            model, std::move(args),
+            [&model](RunResult r) {
+                if (r.ok()) model.set_status("Pins advanced — review, then Commit");
+            });
+    }
     end_wrapped_line();
+    ImGui::TextColored(th.text_muted,
+                       "Restore pinned = check out the revision this repo already "
+                       "records. Advance pins = move to each module's tracked "
+                       "branch tip and stage the move (Modules / Nested per the "
+                       "ticks below), then Commit.");
 
     ImGui::TextUnformatted("Targets");
     checkbox_wrapped("Game", &model.git_tgt_game);
@@ -2561,10 +2746,14 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
         // was pinned to before emitting anything. There is no BIOS half and no
         // separate emitter build on a cartridge.
         if (build_btn("Regenerate C from ROM")) {
+            // Not a failure: regen.sh looks for a known filename at the repo
+            // root when it is handed no --rom, so this run may still succeed.
+            // Logging [FAIL] here and then running anyway was reporting a
+            // verdict before there was one.
             if (!model.disc_cue[0]) {
                 model.append_log(
-                    "[FAIL] No ROM set for this repo — set it on the Migrate tab "
-                    "(regen.sh can also find one at the repo root).");
+                    "No ROM set on the Migrate tab — letting regen.sh look for "
+                    "one at the repo root.");
             }
             std::vector<std::string> args = {"build", "generate", "--root", root};
             if (model.disc_cue[0]) {
@@ -2941,6 +3130,60 @@ void draw_log_line_with_links(const std::string& line, const ImVec4& col) {
     if (first) ImGui::TextColored(col, "%s", line.c_str());
 }
 
+// One display row of the Activity log: a byte range inside one source line,
+// after word-wrapping to the current panel width. `line` stays with the row so
+// the colour can be judged from the whole line — a continuation of a [FAIL]
+// must not turn grey halfway through.
+struct LogRow {
+    int line = 0;
+    int begin = 0;
+    int end = 0;
+};
+
+// Wrapping and ImGuiListClipper want opposite things: the clipper needs items
+// of a known uniform height, and a wrapped line is not one item. So wrap once
+// into rows and clip over *rows*, which are one text line each. Rebuilt only
+// when the log changes or the panel is resized — laying out four thousand
+// lines every frame to draw thirty of them is what the clipper is here to
+// avoid, and dropping it to get wrapping would trade one for the other.
+struct LogWrapCache {
+    std::uint64_t revision = ~0ull;
+    float width = -1.f;
+    std::vector<LogRow> rows;
+};
+
+// Continuation rows are indented so a wrapped line reads as one line rather
+// than two entries. They wrap that much narrower to pay for it.
+constexpr float kLogWrapIndent = 16.f;
+
+void rebuild_log_rows(LogWrapCache& cache, const std::vector<std::string>& lines, float wrap_w) {
+    cache.rows.clear();
+    if (wrap_w <= kLogWrapIndent * 2.f) wrap_w = kLogWrapIndent * 2.f + 1.f;
+    ImFont* font = ImGui::GetFont();
+    const float scale = font->FontSize > 0.f ? ImGui::GetFontSize() / font->FontSize : 1.f;
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+        const std::string& src = lines[static_cast<size_t>(i)];
+        if (src.empty()) {
+            cache.rows.push_back({i, 0, 0});
+            continue;
+        }
+        const char* begin = src.c_str();
+        const char* end = begin + src.size();
+        const char* p = begin;
+        while (p < end) {
+            const float w = (p == begin) ? wrap_w : wrap_w - kLogWrapIndent;
+            const char* stop = font->CalcWordWrapPositionA(scale, p, end, w);
+            // A single glyph wider than the panel would otherwise loop forever.
+            if (stop <= p) stop = p + 1;
+            cache.rows.push_back({i, static_cast<int>(p - begin), static_cast<int>(stop - begin)});
+            p = stop;
+            // ImGui's own renderer eats the blanks a wrap lands on; matching it
+            // keeps a wrapped line from starting with a stray space.
+            while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        }
+    }
+}
+
 void draw_log_collapsed_bar(StudioModel& model, const Theme& th) {
     constexpr float kBarH = 40.f;
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 6.f));
@@ -2975,9 +3218,11 @@ void draw_log(StudioModel& model, const Theme& th, float height, SDL_Window* win
 
     std::vector<std::string> lines;
     bool stick = false;
+    std::uint64_t revision = 0;
     {
         std::lock_guard<std::mutex> lock(model.mu);
         lines = model.log_lines;
+        revision = model.log_revision;
         stick = model.log_scroll_bottom;
         if (stick) model.log_scroll_bottom = false;
     }
@@ -3023,17 +3268,37 @@ void draw_log(StudioModel& model, const Theme& th, float height, SDL_Window* win
         if (ImGui::SmallButton("Clear")) {
             std::lock_guard<std::mutex> lock(model.mu);
             model.log_lines.clear();
+            ++model.log_revision;
         }
     }
     ImGui::Separator();
 
-    ImGui::BeginChild("activity_scroll", ImVec2(0, 0), ImGuiChildFlags_None);
+    // AlwaysVerticalScrollbar, so the wrap width does not change the moment a
+    // scrollbar appears. Without it a log sitting exactly at the boundary
+    // oscillates: wrapping adds rows, rows add a scrollbar, the scrollbar
+    // narrows the panel, which adds more rows.
+    ImGui::BeginChild("activity_scroll", ImVec2(0, 0), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_AlwaysVerticalScrollbar);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 2));
+
+    // One panel, drawn once a frame, so the cache lives with the drawing code
+    // rather than in the model — nothing else can observe it.
+    static LogWrapCache wrap_cache;
+    const float wrap_w = ImGui::GetContentRegionAvail().x;
+    if (wrap_cache.revision != revision || wrap_cache.width != wrap_w) {
+        rebuild_log_rows(wrap_cache, lines, wrap_w);
+        wrap_cache.revision = revision;
+        wrap_cache.width = wrap_w;
+    }
+
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(lines.size()));
+    clipper.Begin(static_cast<int>(wrap_cache.rows.size()));
     while (clipper.Step()) {
-        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-            const std::string& line = lines[static_cast<size_t>(i)];
+        for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+            const LogRow& row = wrap_cache.rows[static_cast<size_t>(r)];
+            const std::string& line = lines[static_cast<size_t>(row.line)];
+            // Colour is judged from the whole line, never the fragment: a
+            // continuation row of a failure is still part of that failure.
             ImVec4 col = th.text;
             if (line.find("[FAIL]") != std::string::npos ||
                 line.find("error:") != std::string::npos)
@@ -3042,7 +3307,13 @@ void draw_log(StudioModel& model, const Theme& th, float height, SDL_Window* win
                 col = th.good;
             else if (!line.empty() && line[0] == '$')
                 col = th.text_muted;
-            draw_log_line_with_links(line, col);
+            const bool cont = row.begin > 0;
+            if (cont) ImGui::Indent(kLogWrapIndent);
+            draw_log_line_with_links(
+                line.substr(static_cast<size_t>(row.begin),
+                            static_cast<size_t>(row.end - row.begin)),
+                col);
+            if (cont) ImGui::Unindent(kLogWrapIndent);
         }
     }
     if (stick) ImGui::SetScrollHereY(1.0f);
@@ -3192,6 +3463,8 @@ int main(int argc, char** argv) {
                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         draw_header(model, th, window);
+        // Modal, so it belongs to the frame rather than to whichever tab is up.
+        draw_git_settings_popup(model, th);
         ImGui::Separator();
 
         const float spacing = ImGui::GetStyle().ItemSpacing.y;

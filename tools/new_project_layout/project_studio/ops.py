@@ -779,19 +779,101 @@ def op_relocate_boxart(root: Path, options: MigrateOptions) -> ApplyResult:
     )
 
 
+# A LAUNCHER_BOXART argument that the project template left commented out,
+# pointing at the canonical path. Matched only in that exact shape so this
+# never disturbs a hand-edited or differently-pathed argument.
+_BOXART_CMAKE_RE = re.compile(
+    r'^(?P<indent>[ \t]*)#[ \t]*'
+    r'(?P<arg>LAUNCHER_BOXART[ \t]+'
+    r'"\$\{CMAKE_CURRENT_SOURCE_DIR\}/launcher_assets/img/boxart\.tga")[ \t]*$',
+    re.M,
+)
+
+
+def _wire_cmake_boxart(root: Path) -> list[str]:
+    """Uncomment LAUNCHER_BOXART once a real boxart.tga exists.
+
+    The project template ships the argument commented out because most ports
+    have no art at fill-token time. Art that no build references is inert, so
+    flipping the argument is part of installing it, not a separate concern.
+    Idempotent: an already-live argument is left alone.
+    """
+    cml = root / "CMakeLists.txt"
+    if not cml.is_file():
+        return []
+    try:
+        text = cml.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    if re.search(r"^[ \t]*LAUNCHER_BOXART\b", text, re.M):
+        return []  # already wired
+    new_text, n = _BOXART_CMAKE_RE.subn(r"\g<indent>\g<arg>", text)
+    if not n:
+        return []
+    cml.write_text(new_text, encoding="utf-8")
+    return ["CMakeLists.txt"]
+
+
 def op_emit_boxart_stub(root: Path, options: MigrateOptions) -> ApplyResult:
+    """Install boxart into launcher_assets/, falling back to a bare directory.
+
+    The audit check this op answers looks for launcher_assets/img/boxart.tga,
+    so creating an empty directory could never clear it. Earlier revisions did
+    exactly that, and short-circuited on ``dest_dir.is_dir()`` besides -- once
+    the stub existed, every later run reported success while the check stayed
+    at WARN forever. Fetch the art; fall back to the directory only when the
+    fetch cannot be done, and report that as a failure rather than hiding it.
+    """
     dest_dir = root / "launcher_assets" / "img"
-    if dest_dir.is_dir() and not options.force:
-        return ApplyResult("emit_boxart_stub", True, "launcher_assets already exists", [])
+    tga = dest_dir / "boxart.tga"
+
+    if tga.is_file() and not options.force:
+        changed = _wire_cmake_boxart(root)
+        return ApplyResult(
+            "emit_boxart_stub",
+            True,
+            "boxart.tga already present"
+            + (" (wired LAUNCHER_BOXART)" if changed else ""),
+            changed,
+        )
+
     if options.dry_run:
-        return ApplyResult("emit_boxart_stub", True, "dry-run: mkdir launcher_assets/img", [])
+        return ApplyResult(
+            "emit_boxart_stub",
+            True,
+            "dry-run: fetch libretro boxart -> launcher_assets/img/boxart.tga",
+            ["launcher_assets/img/boxart.tga", "launcher_assets/img/boxart.png"],
+        )
+
     dest_dir.mkdir(parents=True, exist_ok=True)
-    (dest_dir / ".gitkeep").write_text("", encoding="utf-8")
+    changed, err = _fetch_boxart_assets(root, options)
+    if err is None:
+        changed += _wire_cmake_boxart(root)
+        # The stub placeholder has no purpose once real art is in the folder.
+        gitkeep = dest_dir / ".gitkeep"
+        if gitkeep.is_file():
+            gitkeep.unlink()
+        return ApplyResult(
+            "emit_boxart_stub",
+            True,
+            "Fetched boxart into launcher_assets/img (boxart.tga + boxart.png)",
+            changed,
+        )
+
+    # No art. Keep the directory so the path exists, but do not claim the
+    # check is fixed: ok=False is what stops a clean-looking apply run from
+    # concealing a boxart check that is still failing.
+    gitkeep = dest_dir / ".gitkeep"
+    stub_changed: list[str] = []
+    if not gitkeep.is_file():
+        gitkeep.write_text("", encoding="utf-8")
+        stub_changed.append("launcher_assets/img/.gitkeep")
     return ApplyResult(
         "emit_boxart_stub",
-        True,
-        "Created launcher_assets/img (add boxart.tga later)",
-        ["launcher_assets/img/.gitkeep"],
+        False,
+        f"No boxart written -- {err}. Created launcher_assets/img only; "
+        "add boxart.tga by hand or re-run with network access.",
+        stub_changed,
     )
 
 
@@ -1107,34 +1189,51 @@ def _boxart_hints(root: Path, options: MigrateOptions) -> tuple[str, str]:
     return cue, display
 
 
+def _fetch_boxart_assets(
+    root: Path, options: MigrateOptions
+) -> tuple[list[str], str | None]:
+    """Fetch libretro boxart into launcher_assets/img.
+
+    Returns ``(changed_paths, error)``. ``error`` is None on success; on
+    failure it carries the reason, so a caller can say why the boxart check
+    is still failing instead of swallowing it and reporting success. Never
+    raises -- every failure comes back as a reason string.
+    """
+    img = root / "launcher_assets" / "img"
+    png = img / "boxart.png"
+    tga = img / "boxart.tga"
+
+    cue, display = _boxart_hints(root, options)
+    if not cue and not display:
+        return [], "no cue name or display name to search libretro with"
+    try:
+        sys.path.insert(0, str(toolkit_dir()))
+        from fetch_boxart import fetch_to_paths  # type: ignore
+    except ImportError as exc:
+        return [], f"fetch_boxart helper unavailable ({exc})"
+    try:
+        fetch_to_paths(tga, cue_stem=cue, display_name=display)
+    except Exception as exc:  # network down, 404, PNG decode failure
+        reason = str(exc).strip() or type(exc).__name__
+        return [], f"libretro fetch failed: {reason}"
+
+    changed: list[str] = []
+    for path in (png, tga, img / "BOXART_SOURCE.txt"):
+        if path.is_file():
+            changed.append(path.relative_to(root).as_posix())
+    if not changed:
+        return [], "fetch reported success but wrote no files"
+    return changed, None
+
+
 def _ensure_boxart_png(root: Path, options: MigrateOptions) -> list[str]:
     """Fetch libretro boxart PNG/TGA when the README PNG is missing. Never raises."""
     png = root / "launcher_assets" / "img" / "boxart.png"
-    tga = root / "launcher_assets" / "img" / "boxart.tga"
     if png.is_file():
         return []
     if options.dry_run:
         return ["launcher_assets/img/boxart.png"]
-    cue, display = _boxart_hints(root, options)
-    if not cue and not display:
-        return []
-    try:
-        sys.path.insert(0, str(toolkit_dir()))
-        from fetch_boxart import fetch_to_paths  # type: ignore
-    except ImportError:
-        return []
-    try:
-        fetch_to_paths(tga, cue_stem=cue, display_name=display)
-    except Exception:
-        return []
-    changed: list[str] = []
-    if png.is_file():
-        changed.append("launcher_assets/img/boxart.png")
-    if tga.is_file():
-        changed.append("launcher_assets/img/boxart.tga")
-    src = tga.parent / "BOXART_SOURCE.txt"
-    if src.is_file():
-        changed.append("launcher_assets/img/BOXART_SOURCE.txt")
+    changed, _err = _fetch_boxart_assets(root, options)
     return changed
 
 

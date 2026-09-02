@@ -89,5 +89,7 @@ void pump_async_jobs(StudioModel& model);
 bool load_repos_from_json(StudioModel& model, const std::string& json_text, std::string* err);
 bool load_audit_from_json(StudioModel& model, const std::string& json_text, std::string* err);
 bool load_plan_from_json(StudioModel& model, const std::string& json_text, std::string* err);
+bool load_module_urls_from_json(StudioModel& model, const std::string& json_text,
+                                std::string* err);
 
 } // namespace retcomm::studio

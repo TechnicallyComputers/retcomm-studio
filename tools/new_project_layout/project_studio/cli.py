@@ -73,6 +73,7 @@ def _options_from_args(args: argparse.Namespace) -> MigrateOptions:
         rewrite_cmake=not args.no_rewrite_cmake,
         merge_gitignore=not args.no_gitignore,
         probe_disc=bool(args.disc) and not args.no_probe,
+        patch_readme=not bool(getattr(args, "no_readme", False)),
         record_pins=not args.no_pins,
         force=args.force,
         only=only,
@@ -110,7 +111,11 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if not root.is_dir():
         print(f"error: not a directory: {root}", file=sys.stderr)
         return 2
-    return _print_audit(_migration_backend().audit_project(root), as_json=args.json)
+    # audit takes no migration options of its own, but --no-readme has to reach
+    # it: the switch turns the README/About row off as well as the op, so the
+    # audit Studio draws matches the plan it will build.
+    opts = MigrateOptions(patch_readme=not bool(getattr(args, "no_readme", False)))
+    return _print_audit(_migration_backend().audit_project(root, opts), as_json=args.json)
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -146,7 +151,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         opts.enable_netplay = False
 
     backend = _migration_backend()
-    report = backend.audit_project(root)
+    report = backend.audit_project(root, opts)
     plan = backend.build_plan(root, opts, report)
     if args.json_plan:
         print(json.dumps(plan.to_dict(), indent=2))
@@ -1078,6 +1083,106 @@ def cmd_git_switch(args: argparse.Namespace) -> int:
         )
         return 2
     return _print_module_results(results)
+
+
+def cmd_git_module_urls(args: argparse.Namespace) -> int:
+    from project_studio.gitops import module_urls
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    rows = module_urls(root)
+    if getattr(args, "json", False):
+        print(json.dumps({"modules": [r.to_dict() for r in rows]}, indent=2))
+        return 0
+    for r in rows:
+        scope = "nested" if r.nested else "module"
+        mark = "" if r.present else "  (not checked out)"
+        print(f"[{scope}] {r.path}{mark}")
+        print(f"    effective   {r.effective_url or '(none)'}")
+        print(f"    .gitmodules {r.gitmodules_url or '(none)'}")
+        if r.local_url:
+            print(f"    local       {r.local_url}")
+        if r.origin_url and r.origin_url != r.gitmodules_url:
+            print(f"    origin      {r.origin_url}")
+    return 0
+
+
+def cmd_git_set_module_url(args: argparse.Namespace) -> int:
+    from project_studio.gitops import reset_module_url, set_module_url
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    nested = bool(getattr(args, "nested", False))
+    if bool(getattr(args, "reset", False)):
+        r = reset_module_url(root, args.path, nested=nested, dry_run=args.dry_run)
+    else:
+        r = set_module_url(
+            root, args.path, getattr(args, "url", "") or "",
+            nested=nested,
+            scope=getattr(args, "scope", "local") or "local",
+            dry_run=args.dry_run,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(r.to_dict(), indent=2))
+    else:
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.detail and not r.ok:
+            print(r.detail)
+    return 0 if r.ok else 1
+
+
+def cmd_git_advance_pins(args: argparse.Namespace) -> int:
+    from project_studio.gitops import advance_submodule_pins
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    paths = [p.strip() for p in (args.paths or "").split(",") if p.strip()] or None
+    # Same target model as switch / pull / commit / push on the Git tab. With
+    # neither flag, the game repo's own submodules — the common case, and what
+    # the bare command meant before --nested existed.
+    do_modules = bool(getattr(args, "modules", False))
+    do_nested = bool(getattr(args, "nested", False))
+    if not (do_modules or do_nested):
+        do_modules = True
+    ref = getattr(args, "ref", "") or ""
+    stage = not bool(getattr(args, "no_stage", False))
+
+    results = []
+    scopes = []
+    if do_modules:
+        scopes.append(False)
+    if do_nested:
+        scopes.append(True)
+    for is_nested in scopes:
+        results.extend(advance_submodule_pins(
+            root, paths=paths, nested=is_nested, ref=ref, stage=stage,
+            dry_run=args.dry_run,
+        ))
+
+    if getattr(args, "json", False):
+        print(json.dumps([r.to_dict() for r in results], indent=2))
+    else:
+        for r in results:
+            print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+            if r.detail and not r.ok:
+                print(r.detail)
+    moved = [r for r in results if r.ok and "→" in r.message]
+    if moved:
+        print("Pins moved but not committed. Review with `git diff --cached`, then "
+              "Commit on the Git tab. Re-run Audit afterwards: framework_pins.txt "
+              "is now stale, and the port builds against a different framework.")
+    if any("staged in" in r.message for r in moved):
+        # Staged one level down: without a commit there, the game repo's
+        # framework pin still points at a tree that does not contain the bump.
+        from project_studio.gitops import framework_name
+
+        print(f"Nested pins were staged inside {framework_name()}. Commit there "
+              f"first (Commit nested), then advance the game repo's "
+              f"{framework_name()} pin so the port records the change.")
+    return 0 if all(r.ok for r in results) else 1
 
 
 def cmd_git_update_submodules(args: argparse.Namespace) -> int:
@@ -2023,6 +2128,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--no-rewrite-cmake", action="store_true")
         p.add_argument("--no-gitignore", action="store_true")
         p.add_argument("--no-probe", action="store_true")
+        p.add_argument("--no-readme", action="store_true",
+                       help="Leave README.md and the GitHub About blurb alone "
+                            "(skips the check as well as the op)")
         p.add_argument("--no-pins", action="store_true")
         p.add_argument("--force", action="store_true", help="Overwrite existing stubs")
         p.add_argument("--only", help="Comma-separated op ids")
@@ -2033,6 +2141,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit = sub.add_parser("audit", help="Audit a title repo")
     add_root(p_audit)
     p_audit.add_argument("--json", action="store_true")
+    p_audit.add_argument("--no-readme", action="store_true",
+                         help="Skip the README / GitHub About check")
     p_audit.set_defaults(func=cmd_audit)
 
     p_plan = sub.add_parser("plan", help="Show migration plan")
@@ -2400,6 +2510,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gu.add_argument("--paths", help="Comma-separated submodule paths")
     p_gu.set_defaults(func=cmd_git_update_submodules)
+
+    p_gap = git_sub.add_parser(
+        "advance-pins",
+        help="Move submodule pins to their tracked branch tip and stage the move",
+    )
+    add_git_root(p_gap)
+    p_gap.add_argument(
+        "--paths",
+        help="Comma-separated submodule paths (default: this platform's framework + recomp-ui)",
+    )
+    p_gap.add_argument(
+        "--ref",
+        default="",
+        help="Explicit revision instead of the tracked branch tip",
+    )
+    p_gap.add_argument(
+        "--modules",
+        action="store_true",
+        help="The game repo's own submodules (framework + recomp-ui); the default",
+    )
+    p_gap.add_argument(
+        "--nested",
+        action="store_true",
+        help="Modules inside the framework checkout (recomp-net, rbengine)",
+    )
+    p_gap.add_argument(
+        "--no-stage",
+        action="store_true",
+        help="Move the checkouts but leave the gitlinks unstaged",
+    )
+    p_gap.add_argument("--json", action="store_true")
+    p_gap.set_defaults(func=cmd_git_advance_pins)
+
+    p_gmu = git_sub.add_parser(
+        "module-urls",
+        help="Show where each submodule / nested module is fetched from and pushed to",
+    )
+    add_git_root(p_gmu)
+    p_gmu.add_argument("--json", action="store_true")
+    p_gmu.set_defaults(func=cmd_git_module_urls)
+
+    p_gsu = git_sub.add_parser(
+        "set-module-url",
+        help="Point a module at a different remote (e.g. your fork)",
+    )
+    add_git_root(p_gsu)
+    p_gsu.add_argument("--path", required=True, help="Module path, e.g. psxrecomp or lib/recomp-net")
+    p_gsu.add_argument("--url", default="", help="New remote URL")
+    p_gsu.add_argument(
+        "--nested",
+        action="store_true",
+        help="The path is inside the framework checkout",
+    )
+    p_gsu.add_argument(
+        "--scope",
+        choices=("local", "gitmodules"),
+        default="local",
+        help="local: this clone only, nothing tracked changes (default). "
+             "gitmodules: rewrite the tracked URL for everyone (must be committed)",
+    )
+    p_gsu.add_argument(
+        "--reset",
+        action="store_true",
+        help="Drop the local override and go back to .gitmodules",
+    )
+    p_gsu.add_argument("--json", action="store_true")
+    p_gsu.set_defaults(func=cmd_git_set_module_url)
 
     p_gun = git_sub.add_parser(
         "update-nested",

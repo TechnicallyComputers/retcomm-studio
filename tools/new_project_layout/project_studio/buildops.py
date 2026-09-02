@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import platforms
+from . import snes_paths as _snes_paths
 from .gitops import CmdResult
 
 DEFAULT_BUILD_DIR = "build-release"
@@ -503,6 +504,112 @@ def snes_regen_script(root: Path) -> Path | None:
     return p if p.is_file() else None
 
 
+# Locating the pinned framework and asking what its CLI offers live in
+# snes_paths, because the migration ops need the same two answers before they
+# emit a regen.sh that framework would not be able to run.
+snes_framework_root = _snes_paths.regen_framework_root
+snes_cli_commands = _snes_paths.cli_commands
+
+
+def framework_gap_message(cli: Path, missing: list[str], have: set[str]) -> str:
+    """One wording for the skew, wherever it is noticed.
+
+    Both the Generate preflight and the migration ops that write regen.sh have
+    to say this, and a user who meets it twice should not have to work out that
+    it is the same problem.
+    """
+    return (
+        f"The snesrecomp this port is pinned to is older than its own "
+        f"tools/regen.sh: {cli.name} has no "
+        + ", ".join(repr(c) for c in missing)
+        + f" (it offers {', '.join(sorted(have)) or 'nothing'}). Update the "
+        "snesrecomp submodule to a revision that has "
+        + ("it" if len(missing) == 1 else "them")
+        + ", or re-emit regen.sh from the framework you are actually pinned to."
+    )
+
+
+def preflight_snes_generate(root: Path, *, verify: bool = True) -> CmdResult | None:
+    """Reasons regen.sh cannot succeed, found before it is run.
+
+    Every one of these otherwise surfaces as somebody else's error text — an
+    argparse "invalid choice", an empty digest silently accepted — attributed
+    to Studio's Generate button. Naming the actual mismatch, and what to do
+    about it, is the whole point.
+    """
+    root = Path(root).expanduser().resolve()
+    script = snes_regen_script(root)
+    if script is None:
+        return None  # generate_snes_c reports the missing script itself.
+    try:
+        regen_text = script.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        regen_text = ""
+
+    fw = snes_framework_root(root)
+    cli = fw / "snesrecomp_cli.py"
+    if not cli.is_file():
+        return CmdResult(
+            False,
+            f"{cli} is missing — the snesrecomp checkout regen.sh needs is not "
+            "there. Run: git submodule update --init --recursive snesrecomp",
+        )
+
+    # The skew that produced "invalid choice: 'verify-rom'": a regen.sh emitted
+    # from a newer wizard than the framework the port is pinned to. Read out of
+    # the script's own call sites rather than a list kept here, which would go
+    # stale the next time regen.sh grows a step.
+    gap = _snes_paths.regen_framework_gap(root, regen_text, verify=verify)
+    if gap is not None:
+        missing, have = gap
+        return CmdResult(False, framework_gap_message(cli, missing, have))
+
+    # regen.sh reads its digests out of rom_identity.txt on current wizards. An
+    # absent or empty file makes --verify a check against nothing, which is the
+    # failure mode the digests exist to prevent.
+    if verify and "rom_identity.txt" in regen_text:
+        from .snesops import parse_identity_file
+
+        ident = root / "rom_identity.txt"
+        data = parse_identity_file(ident) if ident.is_file() else {}
+        if not (data.get("expected_crc32") and data.get("expected_sha256")):
+            why = "is missing" if not ident.is_file() else "carries no digests"
+            return CmdResult(
+                False,
+                f"tools/regen.sh reads its ROM digests from rom_identity.txt, "
+                f"which {why}, so --verify would check the ROM against nothing. "
+                "Run Migrate with the ROM path to write it (Probe ROM), or "
+                "generate with verification off if you accept that the C may "
+                "not match what this port was pinned against.",
+            )
+    return None
+
+
+_GENERATE_HINTS: tuple[tuple[str, str], ...] = (
+    ("invalid choice: 'verify-rom'",
+     "The pinned snesrecomp predates `verify-rom`. Update the snesrecomp "
+     "submodule, or re-emit tools/regen.sh from the framework this port is "
+     "actually pinned to (Migrate → Emit tools/regen.sh)."),
+    ("invalid choice: 'generate'",
+     "The pinned snesrecomp predates the standalone `generate` command — it "
+     "only scaffolds via `build`. Update the snesrecomp submodule."),
+    ("missing — run: git submodule update",
+     "The snesrecomp submodule is not checked out. Run: "
+     "git submodule update --init --recursive"),
+    ("no ROM found",
+     "Point Generate at the ROM (the image field), or set SNESRECOMP_ROM."),
+)
+
+
+def diagnose_generate_failure(detail: str, root: Path) -> str | None:
+    """Extra hint appended to a failed SNES generate message."""
+    blob = detail or ""
+    for needle, hint in _GENERATE_HINTS:
+        if needle in blob:
+            return hint
+    return None
+
+
 def generate_snes_c(
     root: Path,
     *,
@@ -527,6 +634,13 @@ def generate_snes_c(
             False,
             f"No tools/regen.sh in {root} — run Migrate → Emit tools/regen.sh first",
         )
+    # Preflight before the ROM path is even resolved: a framework that cannot
+    # run this regen.sh will not start running it correctly once a ROM is named.
+    pre = preflight_snes_generate(root, verify=verify)
+    if pre is not None:
+        if log:
+            log(pre.message)
+        return pre
     cmd = ["sh", str(script)]
     if rom:
         rom_p = Path(rom).expanduser()
@@ -547,6 +661,11 @@ def generate_snes_c(
         gen = root / "src" / "gen"
         n = len(list(gen.glob("*.c"))) if gen.is_dir() else 0
         return CmdResult(True, f"Generated {n} C file(s) into src/gen", r.detail)
+    # Anything the preflight could not foresee still gets read rather than
+    # passed through as somebody else's stack trace.
+    hint = diagnose_generate_failure(r.detail or "", root)
+    if hint:
+        return CmdResult(False, f"{r.message} — {hint}", r.detail)
     return r
 
 

@@ -819,6 +819,31 @@ bool load_repos_from_json(StudioModel& model, const std::string& json_text, std:
     }
 }
 
+bool load_module_urls_from_json(StudioModel& model, const std::string& json_text,
+                                std::string* err) {
+    try {
+        auto j = nlohmann::json::parse(json_text);
+        std::lock_guard<std::mutex> lock(model.mu);
+        model.git_urls.clear();
+        for (const auto& m : j.at("modules")) {
+            StudioModel::ModuleUrlRow row;
+            row.path = json_str(m, "path");
+            row.nested = m.value("nested", false);
+            row.gitmodules_url = json_str(m, "gitmodules_url");
+            row.local_url = json_str(m, "local_url");
+            row.origin_url = json_str(m, "origin_url");
+            row.effective_url = json_str(m, "effective_url");
+            row.present = m.value("present", false);
+            std::snprintf(row.edit, sizeof(row.edit), "%s", row.effective_url.c_str());
+            if (!row.path.empty()) model.git_urls.push_back(std::move(row));
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        if (err) *err = ex.what();
+        return false;
+    }
+}
+
 bool load_audit_from_json(StudioModel& model, const std::string& json_text, std::string* err) {
     try {
         auto j = nlohmann::json::parse(json_text);
