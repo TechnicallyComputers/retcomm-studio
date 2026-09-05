@@ -137,6 +137,39 @@ bool game_toml_debug_port(const fs::path& game_toml, int& out) {
 
 namespace {
 
+// A line with any trailing comment removed, leading whitespace trimmed.
+//
+// Quote-aware, because these files carry absolute paths from a user's dump
+// library and a '#' is legal in a directory name. Cutting at the first '#'
+// unconditionally would truncate such a path to something that does not exist,
+// and the symptom -- "disc not found" for a disc that is right there -- names
+// nothing that would lead you here.
+std::string toml_body(const std::string& line) {
+    bool quoted = false;
+    size_t end = line.size();
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '"' && (i == 0 || line[i - 1] != '\\')) quoted = !quoted;
+        else if (line[i] == '#' && !quoted) { end = i; break; }
+    }
+    std::string body = line.substr(0, end);
+    const size_t b = body.find_first_not_of(" \t");
+    return b == std::string::npos ? std::string() : body.substr(b);
+}
+
+// Does `body` assign `key`, as opposed to merely starting with its letters?
+//
+// A prefix test is not enough in [game]: `disc`, `discs` and `disc_serials`
+// all live there, so looking for "disc" matched `disc_serials = ["SCUS-94163",
+// ...]` and handed back a serial where a path was expected. The next character
+// has to be whitespace or the '='.
+bool toml_key_is(const std::string& body, const char* key) {
+    const size_t n = std::strlen(key);
+    if (body.compare(0, n, key) != 0) return false;
+    if (body.size() == n) return false;
+    const char c = body[n];
+    return c == '=' || c == ' ' || c == '\t';
+}
+
 // Minimal, targeted TOML read, same approach as the debug_port lookup: pull one
 // key out of one table rather than growing a parser for a schema the runtime
 // already owns.
@@ -147,18 +180,14 @@ bool game_toml_string(const fs::path& game_toml, const char* table,
     std::string line;
     bool in_table = false;
     const std::string want_table = std::string("[") + table + "]";
-    const std::string want_key = key;
     while (std::getline(in, line)) {
-        const size_t hash = line.find('#');
-        std::string body = hash == std::string::npos ? line : line.substr(0, hash);
-        const size_t b = body.find_first_not_of(" \t");
-        if (b == std::string::npos) continue;
-        body = body.substr(b);
+        const std::string body = toml_body(line);
+        if (body.empty()) continue;
         if (body[0] == '[') {
             in_table = body.rfind(want_table, 0) == 0;
             continue;
         }
-        if (!in_table || body.rfind(want_key, 0) != 0) continue;
+        if (!in_table || !toml_key_is(body, key)) continue;
         const size_t eq = body.find('=');
         if (eq == std::string::npos) continue;
         const size_t q1 = body.find('"', eq);
@@ -169,6 +198,83 @@ bool game_toml_string(const fs::path& game_toml, const char* table,
         return !out.empty();
     }
     return false;
+}
+
+// The same read for an integer value: settings.toml's `[disc] selected`.
+bool game_toml_int(const fs::path& toml, const char* table, const char* key,
+                   int& out) {
+    std::ifstream in(toml);
+    if (!in) return false;
+    std::string line;
+    bool in_table = false;
+    const std::string want_table = std::string("[") + table + "]";
+    while (std::getline(in, line)) {
+        const std::string body = toml_body(line);
+        if (body.empty()) continue;
+        if (body[0] == '[') {
+            in_table = body.rfind(want_table, 0) == 0;
+            continue;
+        }
+        if (!in_table || !toml_key_is(body, key)) continue;
+        const size_t eq = body.find('=');
+        if (eq == std::string::npos) continue;
+        out = std::atoi(body.c_str() + eq + 1);
+        return true;
+    }
+    return false;
+}
+
+// An array-of-strings value: `[game] discs` and `[game] disc_serials`.
+//
+// Both are written one entry per line by probe_disc.py and may be hand-edited
+// onto one line, so this accumulates from the '=' until the closing ']'
+// wherever it falls. Still not a TOML parser -- it takes the quoted strings out
+// of that span, which is the only shape the schema documents for these keys.
+bool game_toml_string_array(const fs::path& toml, const char* table,
+                            const char* key, std::vector<std::string>& out) {
+    std::ifstream in(toml);
+    if (!in) return false;
+    std::string line;
+    bool in_table = false, collecting = false;
+    std::string span;
+    const std::string want_table = std::string("[") + table + "]";
+    while (std::getline(in, line)) {
+        const std::string body = toml_body(line);
+        if (!collecting) {
+            if (body.empty()) continue;
+            if (body[0] == '[') {
+                in_table = body.rfind(want_table, 0) == 0;
+                continue;
+            }
+            if (!in_table || !toml_key_is(body, key)) continue;
+            const size_t open = body.find('[', body.find('='));
+            if (open == std::string::npos) return false;   // not an array
+            span = body.substr(open + 1);
+            collecting = true;
+        } else {
+            span += "\n" + body;
+        }
+        // Unquoted ']' ends the array. A path may legally contain one, so the
+        // scan has to know which side of a quote it is on.
+        bool quoted = false;
+        for (size_t i = 0; i < span.size(); ++i) {
+            if (span[i] == '"' && (i == 0 || span[i - 1] != '\\')) quoted = !quoted;
+            else if (span[i] == ']' && !quoted) { span.resize(i); collecting = false; break; }
+        }
+        if (!collecting) break;
+    }
+    if (span.empty()) return false;
+    out.clear();
+    for (size_t i = 0; i < span.size(); ++i) {
+        if (span[i] != '"') continue;
+        const size_t start = i + 1;
+        size_t end = start;
+        while (end < span.size() && !(span[end] == '"' && span[end - 1] != '\\')) ++end;
+        if (end >= span.size()) break;
+        if (end > start) out.push_back(span.substr(start, end - start));
+        i = end;
+    }
+    return !out.empty();
 }
 
 } // namespace
@@ -193,15 +299,135 @@ uint32_t game_text_end(const std::string& root) {
     return base + size;
 }
 
-std::string game_disc_for(const std::string& root) {
-    if (root.empty()) return {};
-    std::string rel;
-    if (!game_toml_string(fs::path(root) / "game.toml", "game", "disc", rel))
-        return {};
-    fs::path p(rel);
-    if (!p.is_absolute()) p = fs::path(root) / p;
+std::vector<DiscEntry> game_discs_for(const std::string& root) {
+    std::vector<DiscEntry> out;
+    if (root.empty()) return out;
+    const fs::path toml = fs::path(root) / "game.toml";
+
+    // `discs` first, then `disc`. That is the loader's own precedence -- the
+    // schema calls `disc` "sugar for discs = [disc]" -- and it is the half that
+    // was missing here: probe_disc.py writes `discs` ONLY for a set, never both,
+    // so reading `disc` alone reported a verified three-disc title as having no
+    // image at all and greyed out Start oracle on exactly the games that need a
+    // disc chosen.
+    std::vector<std::string> rel;
+    if (!game_toml_string_array(toml, "game", "discs", rel)) {
+        std::string one;
+        if (!game_toml_string(toml, "game", "disc", one)) return out;
+        rel.push_back(one);
+    }
+    std::vector<std::string> serials;
+    game_toml_string_array(toml, "game", "disc_serials", serials);
+
     std::error_code ec;
-    return fs::is_regular_file(p, ec) ? p.string() : std::string();
+    out.reserve(rel.size());
+    for (size_t i = 0; i < rel.size(); ++i) {
+        DiscEntry e;
+        fs::path path(rel[i]);
+        if (!path.is_absolute()) path = fs::path(root) / path;
+        e.path = path.string();
+        e.label = path.stem().string();
+        e.present = fs::is_regular_file(path, ec);
+        if (i < serials.size()) e.serial = serials[i];
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+std::string game_disc_for(const std::string& root) {
+    const std::vector<DiscEntry> discs = game_discs_for(root);
+    if (discs.empty() || !discs.front().present) return {};
+    return discs.front().path;
+}
+
+namespace {
+// The launcher-written settings.toml, which the runtime keeps NEXT TO ITS
+// EXECUTABLE -- not at the project root. Empty when this project has no built
+// binary to sit beside.
+fs::path settings_toml_for(const StudioModel& model, const std::string& root) {
+    const std::string exe = selected_game_exe(model, root);
+    if (exe.empty()) return {};
+    const fs::path p = fs::path(exe).parent_path() / "settings.toml";
+    std::error_code ec;
+    return fs::is_regular_file(p, ec) ? p : fs::path{};
+}
+} // namespace
+
+int runtime_selected_disc(const StudioModel& model, const std::string& root) {
+    const fs::path settings = settings_toml_for(model, root);
+    if (settings.empty()) return 0;
+    int n = 0;
+    if (!game_toml_int(settings, "disc", "selected", n)) return 0;
+    return n > 0 ? n : 0;
+}
+
+MemcardRef game_memcard_for(const StudioModel& model, const std::string& root) {
+    MemcardRef ref;
+    if (root.empty()) return ref;
+    std::error_code ec;
+
+    // Asked in the order of what is most likely to be the card the runtime
+    // actually opened. settings.toml is written BY the runtime and carries an
+    // absolute [memcard] card1, so when it exists it is not a guess.
+    const fs::path settings = settings_toml_for(model, root);
+    if (!settings.empty()) {
+        std::string card1;
+        if (game_toml_string(settings, "memcard", "card1", card1)) {
+            fs::path p(card1);
+            if (!p.is_absolute()) p = fs::path(root) / p;
+            if (fs::is_regular_file(p, ec)) {
+                ref.path = p.string();
+                ref.source = "settings.toml [memcard] card1";
+                ref.present = true;
+                return ref;
+            }
+        }
+        std::string dir;
+        if (game_toml_string(settings, "memcard", "dir", dir)) {
+            fs::path p(dir);
+            if (!p.is_absolute()) p = fs::path(root) / p;
+            p /= "card1.mcd";
+            if (fs::is_regular_file(p, ec)) {
+                ref.path = p.string();
+                ref.source = "settings.toml [memcard] dir";
+                ref.present = true;
+                return ref;
+            }
+        }
+    }
+
+    // game.toml's compiled-in default. `memcard_dir` is relative to the project
+    // root and defaults to "." -- which is why a hardcoded "saves/" missed
+    // every project that did not override it.
+    {
+        std::string dir;
+        if (!game_toml_string(fs::path(root) / "game.toml", "runtime",
+                              "memcard_dir", dir))
+            dir = ".";
+        fs::path p(dir);
+        if (!p.is_absolute()) p = fs::path(root) / p;
+        p /= "card1.mcd";
+        if (fs::is_regular_file(p, ec)) {
+            ref.path = p.string();
+            ref.source = "game.toml [runtime] memcard_dir";
+            ref.present = true;
+            return ref;
+        }
+    }
+
+    // Where the cards sat before memcard_dir was consulted at all. Kept so a
+    // project that has one but names it nowhere still gets a save-carrying
+    // oracle rather than a silent empty card.
+    for (const char* rel : {"saves/card1.mcd", "psxrecomp/card1.mcd"}) {
+        const fs::path p = fs::path(root) / rel;
+        if (fs::is_regular_file(p, ec)) {
+            ref.path = p.string();
+            ref.source = rel;
+            ref.present = true;
+            return ref;
+        }
+    }
+    return ref;
 }
 
 // beetle_oracle.py answers in its own shape — it manages a different build

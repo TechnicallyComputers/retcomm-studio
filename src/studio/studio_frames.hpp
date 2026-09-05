@@ -78,10 +78,33 @@ PauseState parse_pause_state(const std::string& reply);
 // Returns 0 when game.toml does not say.
 uint32_t game_text_end(const std::string& root);
 
-// `[game] disc` from the project's game.toml, resolved against the repo root.
-// The oracle is only meaningful booted on the SAME disc psx-runtime is running,
-// and this is the only place Studio knows which that is.
+// The project's disc roster from game.toml, in disc order, index 0 the disc
+// that boots. `[game] discs` when present, else `[game] disc` as a one-image
+// set -- the loader's own precedence, where `disc` is sugar for `discs =
+// [disc]`. A multi-disc title written by probe_disc.py carries `discs` only.
+//
+// Entries that are not on disk are KEPT, marked !present: these positions are
+// what settings.toml's `[disc] selected` indexes, so dropping a missing row
+// would renumber the ones after it.
+std::vector<DiscEntry> game_discs_for(const std::string& root);
+
+// The boot disc from that roster, resolved against the repo root, or "" when
+// the project names none or the image is gone. The oracle is only meaningful
+// booted on the SAME disc psx-runtime is running.
 std::string game_disc_for(const std::string& root);
+
+// 1-based disc psx-runtime last booted, from the `[disc] selected` the launcher
+// persists in the settings.toml beside the built executable. 0 when there is no
+// build, no settings file, or no such key.
+//
+// This is what makes the oracle's disc default to the right one instead of
+// always disc 1: a comparison against a different disc of the set is not a
+// comparison at all.
+int runtime_selected_disc(const StudioModel& model, const std::string& root);
+
+// The memory card the runtime uses for this project. ONE card serves the whole
+// set -- see MemcardRef.
+MemcardRef game_memcard_for(const StudioModel& model, const std::string& root);
 
 // The game product binary under a CMake build tree, or "" if there is none.
 // Mirrors buildops.py's find_runtime_exe() ranking so the Frames tab launches

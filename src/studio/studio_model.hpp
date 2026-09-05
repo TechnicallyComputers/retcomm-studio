@@ -279,6 +279,32 @@ struct OracleStatus {
     std::string error;
 };
 
+// One image in a project's disc roster.
+//
+// A PSX set is one program on N images, and `[game] discs` is the roster in
+// disc order -- index 0 is the disc that boots. `present` is kept rather than
+// silently dropping a missing entry: the roster positions are what
+// settings.toml's `[disc] selected` indexes, so dropping row 2 would renumber
+// row 3 and point the oracle at the wrong image.
+struct DiscEntry {
+    std::string path;      // absolute, resolved against the repo root
+    std::string label;     // the image's file stem -- what the dropdown shows
+    std::string serial;    // its `[game] disc_serials` entry, or empty
+    bool present = false;  // the image is actually on disk
+};
+
+// The memory card the runtime uses for a project, and where that was learned.
+//
+// ONE card serves a whole disc set. The runtime names it
+// <memcard_dir>/card1.mcd whichever disc is mounted, and that is the point of
+// a multi-disc save: the save that ends disc 1 is the save that starts disc 2.
+// So this does not vary with the selected disc, and the UI says so.
+struct MemcardRef {
+    std::string path;
+    std::string source;    // provenance, shown to the user
+    bool present = false;
+};
+
 // Reply to {"cmd":"pause_state"}. `auto_resumed` means a park ended because the
 // runtime stopped hearing from us — a Pause button showing "paused" has to be
 // able to correct itself when that happens.
@@ -1112,6 +1138,24 @@ struct StudioModel {
     std::string oracle_caps_error;
     bool oracle_caps_loaded = false;
     std::string frm_oracle_note;
+
+    // Multi-disc. The roster and the shared card are read off disk once per
+    // project (sync_dirs, and the oracle Refresh button) rather than every
+    // frame -- the oracle row would otherwise open game.toml sixty times a
+    // second to draw one dropdown.
+    std::vector<DiscEntry> frm_discs;
+    MemcardRef  frm_memcard;
+    // 0-based index into frm_discs: which image the oracle will be started on.
+    // Seeded from the disc psx-runtime last booted, because that is the only
+    // disc a comparison is meaningful on; the user may then override it.
+    int         frm_oracle_disc = 0;
+    // 1-based disc psx-runtime last booted (settings.toml [disc] selected), or
+    // 0 when it has not said. Kept beside the selection so the row can show a
+    // disagreement instead of quietly comparing two different discs.
+    int         frm_runtime_disc = 0;
+    // Which roster row the RUNNING oracle was started on, or -1 when Studio
+    // did not start it and therefore does not know.
+    int         frm_oracle_disc_started = -1;
 
     // Widescreen site scan
     std::vector<WsSite>   ws_sites;

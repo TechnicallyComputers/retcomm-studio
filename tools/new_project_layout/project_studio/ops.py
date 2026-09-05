@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -1049,6 +1050,146 @@ def op_annotate_legacy_packaging(root: Path, options: MigrateOptions) -> ApplyRe
     )
 
 
+# ---------------------------------------------------------------------------
+# probe_disc writes whole files. render_game_toml() is a generator, not an
+# updater: it emits a complete scaffold every time. Pointed at a project that
+# has been worked on, it silently replaces hand-authored configuration --
+# recompiler mod-hook lists, measured audio buffers, widescreen sections, and
+# any comment explaining WHY a value is what it is. Observed on a live port:
+# a refresh dropped mod_function_entry_funcs (the entry hooks behind three
+# shipped features), [audio] buffer_ms, [video] supersampling, both
+# [widescreen] sections, and reinstated a hardcoded `disc` path whose own
+# comment said it had been removed on purpose.
+#
+# So the probe's output is treated as a SOURCE OF IDENTITY FACTS, not as the
+# file. Only the keys the probe actually owns are carried across, in place;
+# everything else in the existing file -- keys, sections, ordering, comments --
+# is left exactly as it was.
+
+# Keys probe_disc genuinely determines from the dump, by section.
+# Deliberately absent: [game] name and [runtime] window_title (curated display
+# strings the probe fills with the project slug), and disc / discs (a mature
+# project may have removed `disc` on purpose so the player supplies the dump).
+_PROBE_OWNED_KEYS = {
+    "game": ("id", "exe", "load_address", "entry_pc", "text_size", "stack_base"),
+    "prepare_disc": ("out_dir", "bin_name", "cue_name", "boot_exe", "known_sizes",
+                     "known_md5", "known_sha1", "known_crc32"),
+    "netplay": ("require_cue", "required_tracks", "required_disc_fp"),
+}
+
+
+def _toml_sections(text: str) -> dict[str, tuple[int, int]]:
+    """Map section name -> (start_line, end_line) over the file's lines."""
+    lines = text.split("\n")
+    bounds: dict[str, tuple[int, int]] = {}
+    cur, start = None, 0
+    for i, line in enumerate(lines):
+        m = re.match(r"^\[([^\]]+)\]\s*$", line.strip())
+        if m:
+            if cur is not None:
+                bounds[cur] = (start, i)
+            cur, start = m.group(1), i + 1
+    if cur is not None:
+        bounds[cur] = (start, len(lines))
+    return bounds
+
+
+def _toml_extract_key(lines: list[str], lo: int, hi: int, key: str) -> tuple[int, int] | None:
+    """Line span of `key = ...` within [lo, hi), following a multi-line array."""
+    for i in range(lo, min(hi, len(lines))):
+        if re.match(rf"^[ \t]*{re.escape(key)}[ \t]*=", lines[i]):
+            j = i
+            if "[" in lines[i].split("=", 1)[1] and "]" not in lines[i].split("=", 1)[1]:
+                while j + 1 < hi and "]" not in lines[j]:
+                    j += 1
+            return (i, j + 1)
+    return None
+
+
+def _merge_probe_game_toml(existing: Path, generated_text: str) -> list[str]:
+    """Carry probe-owned keys into an existing game.toml, in place."""
+    old = existing.read_text(encoding="utf-8", errors="replace")
+    new_lines = generated_text.split("\n")
+    old_lines = old.split("\n")
+    gen_sec = _toml_sections(generated_text)
+    changed: list[str] = []
+
+    for section, keys in _PROBE_OWNED_KEYS.items():
+        if section not in gen_sec:
+            continue
+        glo, ghi = gen_sec[section]
+        for key in keys:
+            gspan = _toml_extract_key(new_lines, glo, ghi, key)
+            if gspan is None:
+                continue
+            value = new_lines[gspan[0]:gspan[1]]
+            # Recompute bounds each time: edits shift later lines.
+            old_sec = _toml_sections("\n".join(old_lines))
+            if section not in old_sec:
+                continue          # never invent a section the project omitted
+            olo, ohi = old_sec[section]
+            ospan = _toml_extract_key(old_lines, olo, ohi, key)
+            if ospan is None:
+                # Present in the probe, absent here: append inside the section.
+                end = ohi
+                while end > olo and not old_lines[end - 1].strip():
+                    end -= 1
+                if old_lines[olo:end] != value:
+                    old_lines[end:end] = value
+                    changed.append(f"{section}.{key} (added)")
+            elif old_lines[ospan[0]:ospan[1]] != value:
+                old_lines[ospan[0]:ospan[1]] = value
+                changed.append(f"{section}.{key}")
+
+    if changed:
+        existing.write_text("\n".join(old_lines), encoding="utf-8")
+    return changed
+
+
+# Curated catalog fields: human-written, and the probe has no better source
+# for them than the project slug and empty strings. Never overwritten once set.
+# game.name is the one that bites -- the probe fills it from the directory name.
+_CATALOG_CURATED = frozenset({
+    "game.name",
+    "marketing.description", "marketing.publisher",
+    "marketing.year", "marketing.region",
+})
+
+
+def _merge_probe_catalog(existing: Path, generated: Path) -> list[str]:
+    """Merge probe identity into catalog_identity.json without blanking."""
+    try:
+        old = json.loads(existing.read_text(encoding="utf-8"))
+        new = json.loads(generated.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"(catalog merge skipped: {exc})"]
+    changed: list[str] = []
+
+    def walk(dst: dict, src: dict, path: str) -> None:
+        for k, v in src.items():
+            here = f"{path}.{k}" if path else k
+            if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                walk(dst[k], v, here)
+            elif k not in dst:
+                dst[k] = v
+                changed.append(f"{here} (added)")
+            elif dst[k] != v:
+                # A curated value is never replaced by an empty generated one:
+                # this is what blanked publisher/year/region on a live port.
+                if v in ("", None, [], {}) and dst[k] not in ("", None, [], {}):
+                    continue
+                # ...nor by a guess. game.name arrives as the directory name.
+                if here in _CATALOG_CURATED and dst[k] not in ("", None):
+                    continue
+                dst[k] = v
+                changed.append(here)
+
+    walk(old, new, "")
+    if changed:
+        existing.write_text(json.dumps(old, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
 def op_probe_disc_refresh(root: Path, options: MigrateOptions) -> ApplyResult:
     if not options.disc:
         return ApplyResult(
@@ -1067,14 +1208,25 @@ def op_probe_disc_refresh(root: Path, options: MigrateOptions) -> ApplyResult:
 
     name = options.project_name or infer_project_name(root)
     players = options.players
+
+    # Render into a scratch dir whenever the real files already exist, then
+    # merge only the probe-owned keys back. Writing straight over them
+    # replaces a worked-on config with a fresh scaffold (see _PROBE_OWNED_KEYS).
+    game_toml = root / "game.toml"
+    catalog = root / "catalog_identity.json"
+    merging = game_toml.is_file() or catalog.is_file()
+    tmpdir = Path(tempfile.mkdtemp(prefix="probe_disc_")) if merging else None
+    game_toml_out = (tmpdir / "game.toml") if merging else game_toml
+    catalog_out = (tmpdir / "catalog_identity.json") if merging else catalog
+
     cmd = [
         sys.executable,
         str(probe),
         str(disc),
         "--write-game-toml",
-        str(root / "game.toml"),
+        str(game_toml_out),
         "--write-catalog",
-        str(root / "catalog_identity.json"),
+        str(catalog_out),
         "--write-seeds",
         str(root / "seeds" / "ghidra_funcs.txt"),
         "--out-dir",
@@ -1097,13 +1249,40 @@ def op_probe_disc_refresh(root: Path, options: MigrateOptions) -> ApplyResult:
     (root / "seeds").mkdir(parents=True, exist_ok=True)
     ok, out = _run(cmd, root, dry_run=False)
     if not ok:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         return ApplyResult("probe_disc_refresh", False, out, [])
-    return ApplyResult(
-        "probe_disc_refresh",
-        True,
-        out or "probe_disc completed",
-        ["game.toml", "catalog_identity.json", "seeds/ghidra_funcs.txt"],
-    )
+
+    changed = ["seeds/ghidra_funcs.txt"]
+    notes: list[str] = []
+    if merging:
+        try:
+            if game_toml.is_file() and game_toml_out.is_file():
+                keys = _merge_probe_game_toml(
+                    game_toml, game_toml_out.read_text(encoding="utf-8"))
+                if keys:
+                    changed.append("game.toml")
+                    notes.append("game.toml: " + ", ".join(keys))
+            elif game_toml_out.is_file():
+                shutil.copy2(game_toml_out, game_toml)
+                changed.append("game.toml")
+            if catalog.is_file() and catalog_out.is_file():
+                keys = _merge_probe_catalog(catalog, catalog_out)
+                if keys:
+                    changed.append("catalog_identity.json")
+                    notes.append("catalog_identity.json: " + ", ".join(keys))
+            elif catalog_out.is_file():
+                shutil.copy2(catalog_out, catalog)
+                changed.append("catalog_identity.json")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        summary = ("merged probe identity; everything else left as authored — "
+                   + ("; ".join(notes) if notes else "no identity key changed"))
+    else:
+        changed += ["game.toml", "catalog_identity.json"]
+        summary = out or "probe_disc completed"
+
+    return ApplyResult("probe_disc_refresh", True, summary, changed)
 
 
 def op_record_framework_pins(root: Path, options: MigrateOptions) -> ApplyResult:
@@ -1319,69 +1498,175 @@ _PSX_GAME_RUNTIME_RE = re.compile(
     r"psxrecomp_add_game_runtime\(", re.M)
 
 
-def op_enable_netplay(root: Path, options: MigrateOptions) -> ApplyResult:
-    """Add ENABLE_NETPLAY_IF_PRESENT to psxrecomp_add_game_runtime(...).
+# An ACTIVE pre-include flip. Anchored so a commented template line can never
+# satisfy it -- the old check fell back to a bare substring test, which a
+# "# set(PSX_NETPLAY ON ...)" line matched, making the op report success on a
+# project where netplay was still entirely off.
+_NETPLAY_SET_ACTIVE_RE = re.compile(
+    r"^[ \t]*set\s*\(\s*PSX_NETPLAY\s+ON\b", re.M)
 
-    Build-side flip: runtime.cmake then sets PSX_NETPLAY when recomp-net is
-    present. The setup-host template already carries the host wiring, so on
-    PSX the flag alone lights the feature.
+# The scaffold's commented-out netplay block, as fill_tokens emits it when
+# netplay is off: a run of comment lines from the if(EXISTS ...recomp-net...)
+# down to its endif().
+_NETPLAY_BLOCK_COMMENTED_RE = re.compile(
+    r"^[ \t]*#[ \t]*if\s*\(\s*EXISTS[^\n]*recomp-net[^\n]*\)[ \t]*\n"
+    r"(?:[ \t]*#[^\n]*\n)*?"
+    r"[ \t]*#[ \t]*endif\s*\([ \t]*\)[ \t]*\n",
+    re.M)
+
+_NETPLAY_BLOCK_ACTIVE = (
+    'if(EXISTS "${PSXRECOMP_ROOT}/lib/recomp-net/CMakeLists.txt")\n'
+    "    set(PSX_NETPLAY ON CACHE BOOL\n"
+    '        "Link recomp-net delay-sync (opt-in; needs recomp-net)" FORCE)\n'
+    "endif()\n"
+)
+
+
+def _netplay_uncomment_runtime_arg(body: str, arg: str) -> tuple[str, bool]:
+    """Uncomment a commented `# ARG ...` line inside the runtime call."""
+    rx = re.compile(rf"^(?P<indent>[ \t]*)#[ \t]*(?P<arg>{arg}\b[^\n]*)$", re.M)
+    if re.search(rf"^[ \t]*{arg}\b", body, re.M):
+        return body, False          # already active
+    new, n = rx.subn(r"\g<indent>\g<arg>", body, count=1)
+    return new, bool(n)
+
+
+def op_enable_netplay(root: Path, options: MigrateOptions) -> ApplyResult:
+    """Turn netplay on in the title's CMakeLists.
+
+    ENABLE_NETPLAY_IF_PRESENT alone does NOT light the feature. runtime.cmake
+    resolves recomp-net and decides whether the netplay TUs are real or stubs
+    while it is being INCLUDED; the flag is only read later, from inside
+    psxrecomp_add_game_runtime(), where its `if(NOT DEFINED PSX_NETPLAY)` has
+    already been made false by the `option(PSX_NETPLAY ... OFF)` at include
+    time. The switch that works is the pre-include block the scaffold emits
+    above the include() -- so set that, and carry the runtime args along to
+    match the template.
     """
     op = "enable_netplay"
     cml = root / "CMakeLists.txt"
     if not cml.is_file():
         return ApplyResult(op, False, "No CMakeLists.txt")
-    text = cml.read_text(encoding="utf-8", errors="replace")
-    m = _PSX_GAME_RUNTIME_RE.search(text)
-    if not m:
+
+    # Precondition. Without recomp-net the block's own EXISTS test fails and
+    # netplay stays off however the file is edited -- report that rather than
+    # writing CMake that cannot fire and calling it success.
+    net_cml = root / "psxrecomp" / "lib" / "recomp-net" / "CMakeLists.txt"
+    if not net_cml.is_file():
         return ApplyResult(
             op, False,
-            "CMakeLists.txt does not call psxrecomp_add_game_runtime — "
-            "rewrite to the setup-host helper first (rewrite_cmake_setup_host).")
-    # Find the matching close paren of the call.
-    depth = 0
-    end = None
-    for i in range(m.end() - 1, len(text)):
-        if text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            depth -= 1
-            if depth == 0:
-                end = i
-                break
-    if end is None:
-        return ApplyResult(op, False, "Unbalanced psxrecomp_add_game_runtime call")
-    body = text[m.end():end]
-    if re.search(r"^\s*ENABLE_NETPLAY_IF_PRESENT\s*$", body, re.M) or \
-            "ENABLE_NETPLAY_IF_PRESENT" in body:
-        return ApplyResult(op, True, "ENABLE_NETPLAY_IF_PRESENT already present")
-    indent = "    "
-    lm = re.search(r"\n([ \t]+)\S", body)
-    if lm:
-        indent = lm.group(1)
-    insert = f"\n{indent}ENABLE_NETPLAY_IF_PRESENT"
-    new_text = text[:end] + insert + "\n" + text[end:]
+            "recomp-net is not checked out (psxrecomp/lib/recomp-net is empty), "
+            "so PSX_NETPLAY cannot be enabled. Run: "
+            "git -C psxrecomp submodule update --init lib/recomp-net")
+
+    text = cml.read_text(encoding="utf-8", errors="replace")
+    original = text
+    notes: list[str] = []
+
+    # 1. The pre-include flip -- the part that actually decides the build.
+    if _NETPLAY_SET_ACTIVE_RE.search(text):
+        notes.append("PSX_NETPLAY block already active")
+    else:
+        text, n = _NETPLAY_BLOCK_COMMENTED_RE.subn(
+            _NETPLAY_BLOCK_ACTIVE, text, count=1)
+        if n:
+            notes.append("uncommented the PSX_NETPLAY block")
+        else:
+            im = re.search(r"^[ \t]*include\s*\(", text, re.M)
+            if not im:
+                return ApplyResult(
+                    op, False,
+                    "No PSX_NETPLAY block and no include() to place one before")
+            text = text[:im.start()] + _NETPLAY_BLOCK_ACTIVE + text[im.start():]
+            notes.append("inserted a PSX_NETPLAY block before include()")
+
+    # 2. The runtime args, kept consistent with the scaffold template.
+    m = _PSX_GAME_RUNTIME_RE.search(text)
+    if m:
+        depth, end = 0, None
+        for i in range(m.end() - 1, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            return ApplyResult(op, False, "Unbalanced psxrecomp_add_game_runtime call")
+        body = text[m.end():end]
+        body, did_flag = _netplay_uncomment_runtime_arg(
+            body, "ENABLE_NETPLAY_IF_PRESENT")
+        body, did_url = _netplay_uncomment_runtime_arg(body, "NETPLAY_LOBBY_URL")
+        if not did_flag and not re.search(
+                r"^[ \t]*ENABLE_NETPLAY_IF_PRESENT\b", body, re.M):
+            indent = "    "
+            lm = re.search(r"\n([ \t]+)\S", body)
+            if lm:
+                indent = lm.group(1)
+            body = body.rstrip("\n") + f"\n{indent}ENABLE_NETPLAY_IF_PRESENT\n"
+            did_flag = True
+        if did_flag:
+            notes.append("ENABLE_NETPLAY_IF_PRESENT active")
+        if did_url:
+            notes.append("NETPLAY_LOBBY_URL active")
+        text = text[:m.end()] + body + text[end:]
+
+    if text == original:
+        return ApplyResult(op, True, "Netplay already enabled; nothing to change")
     if options.dry_run:
-        return ApplyResult(op, True, "[dry-run] would add ENABLE_NETPLAY_IF_PRESENT")
-    cml.write_text(new_text, encoding="utf-8", newline="\n")
-    return ApplyResult(op, True, "Added ENABLE_NETPLAY_IF_PRESENT",
-                       ["CMakeLists.txt"])
+        return ApplyResult(op, True, "[dry-run] " + "; ".join(notes))
+    cml.write_text(text, encoding="utf-8", newline="\n")
+    return ApplyResult(op, True, "; ".join(notes), ["CMakeLists.txt"])
 
 
 def op_disable_netplay(root: Path, options: MigrateOptions) -> ApplyResult:
-    """Remove ENABLE_NETPLAY_IF_PRESENT from psxrecomp_add_game_runtime(...)."""
+    """Turn netplay off again: the pre-include block AND the runtime args.
+
+    Mirrors op_enable_netplay. Dropping only ENABLE_NETPLAY_IF_PRESENT would
+    leave the pre-include set(PSX_NETPLAY ON) standing, which is the half that
+    actually decides the build -- netplay would stay on.
+
+    Both removals are anchored to the start of a line. The old unanchored
+    pattern also matched inside "# ENABLE_NETPLAY_IF_PRESENT", cutting the
+    token out of the comment and leaving a stray "# " behind.
+    """
     op = "disable_netplay"
     cml = root / "CMakeLists.txt"
     if not cml.is_file():
         return ApplyResult(op, False, "No CMakeLists.txt")
     text = cml.read_text(encoding="utf-8", errors="replace")
-    new_text, n = re.subn(r"[ \t]*ENABLE_NETPLAY_IF_PRESENT[ \t]*\n", "", text)
-    if n == 0:
+    original = text
+    notes: list[str] = []
+
+    # Comment the block rather than delete it, so re-enabling finds it again.
+    def _comment_block(mo: "re.Match[str]") -> str:
+        return "".join(
+            (line if not line.strip() or line.lstrip().startswith("#")
+             else re.sub(r"^([ \t]*)", r"\1# ", line)) + "\n"
+            for line in mo.group(0).rstrip("\n").split("\n")
+        )
+
+    block_rx = re.compile(
+        r"^[ \t]*if\s*\(\s*EXISTS[^\n]*recomp-net[^\n]*\)[ \t]*\n"
+        r"(?:(?![ \t]*endif)[^\n]*\n)*?"
+        r"[ \t]*endif\s*\([ \t]*\)[ \t]*\n",
+        re.M)
+    text, n_block = block_rx.subn(_comment_block, text, count=1)
+    if n_block:
+        notes.append("commented the PSX_NETPLAY block")
+
+    for arg in ("ENABLE_NETPLAY_IF_PRESENT", "NETPLAY_LOBBY_URL"):
+        text, n = re.subn(rf"^[ \t]*{arg}\b[^\n]*\n", "", text, flags=re.M)
+        if n:
+            notes.append(f"removed {arg}")
+
+    if text == original:
         return ApplyResult(op, True, "Netplay already not enabled")
     if options.dry_run:
-        return ApplyResult(op, True, "[dry-run] would remove ENABLE_NETPLAY_IF_PRESENT")
-    cml.write_text(new_text, encoding="utf-8", newline="\n")
-    return ApplyResult(op, True, "Removed ENABLE_NETPLAY_IF_PRESENT",
-                       ["CMakeLists.txt"])
+        return ApplyResult(op, True, "[dry-run] " + "; ".join(notes))
+    cml.write_text(text, encoding="utf-8", newline="\n")
+    return ApplyResult(op, True, "; ".join(notes), ["CMakeLists.txt"])
 
 
 _OPS = {

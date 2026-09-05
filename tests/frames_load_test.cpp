@@ -812,6 +812,105 @@ int run_fixtures() {
         check(game_disc_for("").empty(), "an empty root yields nothing");
     }
 
+    // ---- the disc SET ------------------------------------------------------
+    // One program on N images. probe_disc.py writes `discs` and no `disc` for a
+    // verified set, so a reader that knows only `disc` reports a three-disc
+    // title as having no image at all — which is what greyed out Start oracle
+    // on exactly the games where the disc has to be chosen.
+    {
+        const fs::path g = dir / "discset";
+        write_file(g / "game.toml",
+                   "[game]\n"
+                   "name = \"FF7\"\n"
+                   "id = \"SCUS-94163\"\n"
+                   "# a comment between the key and its array\n"
+                   "discs = [\n"
+                   "    \"/nonexistent/Game (Disc 1).cue\",\n"
+                   "    \"images/Game (Disc 2).cue\",\n"
+                   "    \"images/Game (Disc 3).cue\",\n"
+                   "]\n"
+                   "disc_serials = [\"SCUS-94163\", \"SCUS-94164\", \"SCUS-94165\"]\n"
+                   "load_address = \"0x80010000\"\n");
+        write_file(g / "images" / "Game (Disc 2).cue", "FILE\n");
+        write_file(g / "images" / "Game (Disc 3).cue", "FILE\n");
+        std::vector<DiscEntry> set = game_discs_for(g.string());
+        check(set.size() == 3, "reads all three images out of [game] discs");
+        if (set.size() == 3) {
+            check(set[0].path == "/nonexistent/Game (Disc 1).cue" && !set[0].present,
+                  "keeps an absolute path verbatim, and marks a missing one");
+            check(set[1].path == (g / "images" / "Game (Disc 2).cue").string() &&
+                      set[1].present,
+                  "resolves a relative one against the repo root");
+            check(set[1].label == "Game (Disc 2)", "labels a row by its file stem");
+            check(set[2].serial == "SCUS-94165",
+                  "pairs each row with its own disc_serials entry");
+        }
+        // The missing boot disc must NOT be dropped: settings.toml's
+        // [disc] selected indexes these positions, so renumbering them points
+        // the oracle at the wrong image.
+        check(game_disc_for(g.string()).empty(),
+              "the boot disc being absent is reported, not skipped past");
+
+        // `disc`, `discs` and `disc_serials` share a prefix. A prefix-match
+        // reader hands back "SCUS-94163" as if it were a path.
+        const fs::path h = dir / "prefix";
+        write_file(h / "game.toml",
+                   "[game]\n"
+                   "disc_serials = [\"SCUS-94163\"]\n"
+                   "disc = \"boot.cue\"\n");
+        write_file(h / "boot.cue", "FILE\n");
+        check(game_disc_for(h.string()) == (h / "boot.cue").string(),
+              "a key is matched whole, never as a prefix of disc_serials");
+        std::vector<DiscEntry> one = game_discs_for(h.string());
+        check(one.size() == 1 && one[0].present,
+              "[game] disc alone is a one-image set");
+        check(game_discs_for(dir.string()).empty(),
+              "a root with no game.toml has no roster");
+    }
+
+    // ---- the memory card the SET shares -------------------------------------
+    // One card, whichever disc is mounted: the save that ends disc 1 is the
+    // save that starts disc 2. It was hardcoded to "saves/", which silently
+    // missed every project that leaves memcard_dir at its "." default.
+    {
+        StudioModel m;
+        const fs::path g = dir / "cards";
+        write_file(g / "game.toml",
+                   "[game]\ndisc = \"boot.cue\"\n\n"
+                   "[runtime]\nmemcard_dir = \"my saves\"\n");
+        check(!game_memcard_for(m, g.string()).present,
+              "a named memcard_dir with no card in it is not invented");
+        write_file(g / "my saves" / "card1.mcd", "MC\n");
+        MemcardRef c = game_memcard_for(m, g.string());
+        check(c.present && c.path == (g / "my saves" / "card1.mcd").string(),
+              "follows [runtime] memcard_dir, spaces and all");
+
+        // settings.toml is written BY the runtime and names the card it opened,
+        // so it outranks the compiled-in default. It sits beside the built
+        // executable, not at the project root.
+        const fs::path b = g / "build";
+        write_file(b / "CMakeCache.txt", "CMAKE_BUILD_TYPE:STRING=Release\n");
+        write_file(b / "psx-runtime", "#!/bin/sh\n");
+        std::error_code pec;
+        fs::permissions(b / "psx-runtime", fs::perms::owner_all,
+                        fs::perm_options::add, pec);
+        write_file(g / "elsewhere" / "card1.mcd", "MC\n");
+        const std::string settings =
+            std::string("[disc]\npath = \"/x/Game (Disc 2).bin\"\nselected = 2\n\n") +
+            "[memcard]\ncard1   = \"" +
+            (g / "elsewhere" / "card1.mcd").string() + "\"\n";
+        write_file(b / "settings.toml", settings.c_str());
+        std::snprintf(m.build_dir, sizeof(m.build_dir), "build");
+        c = game_memcard_for(m, g.string());
+        check(c.present && c.path == (g / "elsewhere" / "card1.mcd").string(),
+              "settings.toml [memcard] card1 outranks the game.toml default");
+        check(runtime_selected_disc(m, g.string()) == 2,
+              "and [disc] selected says which disc psx-runtime last booted");
+        StudioModel fresh;
+        check(runtime_selected_disc(fresh, dir.string()) == 0,
+              "no build, no settings.toml, no claim about a disc");
+    }
+
     // ---- GP0 ring span -----------------------------------------------------
     // The replacement for pause/step: which frames can still be reached.
     {

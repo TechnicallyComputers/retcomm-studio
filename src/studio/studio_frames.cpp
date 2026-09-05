@@ -276,6 +276,38 @@ void refresh_oracle(StudioModel& model, const std::string& root) {
                             /*log_stdout=*/false, JobSlot::Global);
 }
 
+// Re-read the project's disc roster, its shared memory card, and the disc
+// psx-runtime last booted.
+//
+// Off the per-frame path on purpose: drawing the disc dropdown from
+// game_discs_for() directly would open game.toml, settings.toml and stat every
+// image in the set once per rendered frame. Called where the answer can
+// actually change -- a project switch, and the oracle Refresh button, which is
+// also the undo for "I just edited game.toml".
+void refresh_disc_roster(StudioModel& model, const std::string& root) {
+    model.frm_discs = game_discs_for(root);
+    model.frm_memcard = game_memcard_for(model, root);
+    model.frm_runtime_disc = runtime_selected_disc(model, root);
+    const int n = static_cast<int>(model.frm_discs.size());
+    // Default to the disc the runtime is on. Any other default silently
+    // compares two different discs, which is the one thing this widget exists
+    // to prevent.
+    model.frm_oracle_disc =
+        (model.frm_runtime_disc >= 1 && model.frm_runtime_disc <= n)
+            ? model.frm_runtime_disc - 1
+            : 0;
+}
+
+// The image the oracle would be started on: the selected roster row, or "" when
+// the project names no disc at all or that image is not on disk.
+std::string oracle_disc_path(const StudioModel& model) {
+    const int n = static_cast<int>(model.frm_discs.size());
+    if (n == 0) return {};
+    const size_t i = static_cast<size_t>(
+        std::min(std::max(model.frm_oracle_disc, 0), n - 1));
+    return model.frm_discs[i].present ? model.frm_discs[i].path : std::string();
+}
+
 // ---- paths -----------------------------------------------------------------
 
 void sync_dirs(StudioModel& model, const std::string& root) {
@@ -295,6 +327,10 @@ void sync_dirs(StudioModel& model, const std::string& root) {
         // never clobbered mid-session.
         model.frm_port = probe_debug_tools(root, model.build_dir).port;
         model.frm_oracle_queried = false;   // the tool path is per-checkout
+        // The disc set and the card are per-project too, and the oracle row
+        // reads them out of the model rather than off disk every frame.
+        refresh_disc_roster(model, root);
+        model.frm_oracle_disc_started = -1;
     }
 }
 
@@ -386,7 +422,6 @@ std::vector<std::string> oracle_start_args(const StudioModel& model,
                                            const std::string& root,
                                            const std::string& disc) {
     std::vector<std::string> a{"start", "--disc", disc, "--wait", "90"};
-    std::error_code ec;
     if (model.frm_oracle_kind == OracleKind::Beetle) {
         // Required: the core loads a BIOS itself, and psx-beetle exits early
         // without one. Beetle has no memory-card wiring at all, so there is
@@ -401,13 +436,16 @@ std::vector<std::string> oracle_start_args(const StudioModel& model,
     }
     // DuckStation: boot from a COPY of the game's own card so the oracle can
     // reach the same scene as the runtime it is compared against.
-    for (const char* rel : {"saves/card1.mcd", "psxrecomp/card1.mcd"}) {
-        const fs::path c = fs::path(root) / rel;
-        if (fs::is_regular_file(c, ec)) {
-            a.push_back("--memcard");
-            a.push_back(c.string());
-            break;
-        }
+    //
+    // The card does NOT vary with the selected disc, and that is deliberate.
+    // A multi-disc set is one program with one save: the runtime opens
+    // <memcard_dir>/card1.mcd whichever image is mounted, so the save that ends
+    // disc 1 is the save that starts disc 2. Handing the oracle a per-disc card
+    // would put it on a disc the player's save has never seen.
+    const MemcardRef card = game_memcard_for(model, root);
+    if (card.present) {
+        a.push_back("--memcard");
+        a.push_back(card.path);
     }
     return a;
 }
@@ -3151,6 +3189,9 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
                 model.frm_oracle = OracleStatus{};
                 model.frm_oracle_queried = false;
                 model.frm_oracle_note.clear();
+                // Which disc we started belongs to the emulator we started, so
+                // it does not survive a switch to the other one.
+                model.frm_oracle_disc_started = -1;
                 model.append_log(std::string("Oracle: ") + oracle_display(want) +
                                  " (" + oracle_tool(want) + ")");
             }
@@ -3231,7 +3272,10 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
                                     true, JobSlot::Global);
         }
     } else if (!orc.answering) {
-        const std::string disc = game_disc_for(root);
+        // The SELECTED disc of the set, not the boot disc. On a multi-disc
+        // title those differ, and starting the oracle on disc 1 while
+        // psx-runtime runs disc 3 produces a diff of two different games.
+        const std::string disc = oracle_disc_path(model);
         const bool need_bios = model.frm_oracle_kind == OracleKind::Beetle;
         const std::string bios = need_bios ? game_bios_for(root) : std::string();
         ImGui::BeginDisabled(disc.empty() || (need_bios && bios.empty()));
@@ -3240,14 +3284,23 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
             // Boots from a COPY of the game's memory card, so the oracle can
             // reach the same scene as the runtime it is being compared with.
             // Without it any breakpoint on overlay code never fires: that
-            // overlay is only resident partway into the game.
+            // overlay is only resident partway into the game. One card serves
+            // the whole set, so this does not change with the disc.
+            model.frm_oracle_disc_started = model.frm_oracle_disc;
             start_oracle(model, orc_tool, root, disc);
         }
         ImGui::EndDisabled();
-        if (disc.empty()) {
+        if (model.frm_discs.empty()) {
             ImGui::SameLine();
-            muted(th, "no [game] disc in game.toml — the oracle must boot the "
-                      "same image psx-runtime does");
+            muted(th, "no [game] disc or discs in game.toml — the oracle must "
+                      "boot the same image psx-runtime does");
+        } else if (disc.empty()) {
+            ImGui::SameLine();
+            const DiscEntry& miss = model.frm_discs[static_cast<size_t>(
+                std::min(std::max(model.frm_oracle_disc, 0),
+                         static_cast<int>(model.frm_discs.size()) - 1))];
+            muted(th, "Disc %d is not on disk: %s", model.frm_oracle_disc + 1,
+                  miss.path.c_str());
         } else if (need_bios && bios.empty()) {
             ImGui::SameLine();
             muted(th, "no BIOS under psxrecomp/bios/ — Beetle loads one itself "
@@ -3255,6 +3308,7 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         }
     } else {
         if (ImGui::Button("Stop oracle")) {
+            model.frm_oracle_disc_started = -1;
             run_python_script_async(model, orc_tool, {"stop"},
                                     [&model](RunResult) {
                                         refresh_oracle(model, model.selected_root());
@@ -3263,12 +3317,106 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Refresh##orc")) refresh_oracle(model, root);
+    if (ImGui::Button("Refresh##orc")) {
+        refresh_oracle(model, root);
+        refresh_disc_roster(model, root);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+        ImGui::SetTooltip("Re-ask the oracle manager, and re-read game.toml's "
+                          "disc set, the project's memory card, and the disc\n"
+                          "psx-runtime last booted. The disc below is re-seeded "
+                          "from psx-runtime's, so a hand-picked one is reset.");
     ImGui::EndDisabled();
 
     if (orc_busy) {
         ImGui::SameLine();
         ImGui::TextColored(th.accent, "working…");
+    }
+
+    // ---- the disc, on a multi-disc set --------------------------------------
+    //
+    // A set is one program on N images, and which image is mounted changes what
+    // the program IS at that moment. game.toml carries the roster; the runtime
+    // remembers the player's choice in settings.toml [disc] selected. Both are
+    // read here so the oracle can be started on the SAME disc rather than on
+    // whichever one happens to boot.
+    //
+    // Nothing here swaps a disc under a running emulator: that is a faithful
+    // lid in cdrom.c (MULTI_DISC.md P3) and it does not exist on either side.
+    // Choosing a disc means choosing it before the game starts.
+    if (model.frm_discs.size() > 1) {
+        const int n = static_cast<int>(model.frm_discs.size());
+        if (model.frm_oracle_disc < 0 || model.frm_oracle_disc >= n)
+            model.frm_oracle_disc = 0;
+        const DiscEntry& cur =
+            model.frm_discs[static_cast<size_t>(model.frm_oracle_disc)];
+
+        left_label("Disc", 90.f);
+        // Wide enough for "Disc 3 — Final Fantasy VII (USA) (Disc 3)": a set's
+        // images are named after the release, and a truncated preview hides the
+        // one word — the disc number — the row exists to show.
+        ImGui::SetNextItemWidth(430.f);
+        char preview[320];
+        std::snprintf(preview, sizeof(preview), "Disc %d — %s",
+                      model.frm_oracle_disc + 1, cur.label.c_str());
+        ImGui::BeginDisabled(orc_busy || orc.answering);
+        if (ImGui::BeginCombo("##orc_disc", preview)) {
+            for (int i = 0; i < n; ++i) {
+                const DiscEntry& d = model.frm_discs[static_cast<size_t>(i)];
+                char item[320];
+                std::snprintf(item, sizeof(item), "Disc %d — %s%s", i + 1,
+                              d.label.c_str(),
+                              d.present ? "" : "   (not on disk)");
+                if (ImGui::Selectable(item, i == model.frm_oracle_disc))
+                    model.frm_oracle_disc = i;
+                if (ImGui::IsItemHovered()) {
+                    // The paths in a set are absolute and machine-specific, and
+                    // each disc carries its own serial — both are what you
+                    // check when a disc turns out to be the wrong one.
+                    if (d.serial.empty()) ImGui::SetTooltip("%s", d.path.c_str());
+                    else ImGui::SetTooltip("%s\n%s", d.path.c_str(), d.serial.c_str());
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (orc.answering) {
+            if (model.frm_oracle_disc_started >= 0)
+                muted(th, "running on Disc %d — stop the oracle to change discs",
+                      model.frm_oracle_disc_started + 1);
+            else
+                muted(th, "already running when Studio found it, so which disc it "
+                          "booted is not known here");
+        } else if (model.frm_runtime_disc >= 1 &&
+                   model.frm_runtime_disc != model.frm_oracle_disc + 1) {
+            wrapped(th.warn, "psx-runtime last booted Disc %d — a diff across two "
+                             "different discs of a set answers nothing",
+                    model.frm_runtime_disc);
+        } else if (model.frm_runtime_disc >= 1) {
+            muted(th, "the disc psx-runtime last booted");
+        } else {
+            muted(th, "psx-runtime has not recorded a disc yet — no settings.toml "
+                      "beside the build");
+        }
+
+        // Said out loud because it is the question a multi-disc save raises:
+        // the card belongs to the SET, not to the disc. Whichever disc is
+        // selected above, the oracle is handed this one card — the save that
+        // ends disc 1 is the save that starts disc 2.
+        left_label("", 90.f);
+        if (model.frm_oracle_kind == OracleKind::Beetle) {
+            muted(th, "Beetle has no memory-card wiring — a save-dependent "
+                      "comparison needs DuckStation");
+        } else if (model.frm_memcard.present) {
+            muted(th, "one card serves all %d discs: %s  (%s)", n,
+                  model.frm_memcard.path.c_str(),
+                  model.frm_memcard.source.c_str());
+        } else {
+            muted(th, "no card1.mcd found for this project — whichever disc you "
+                      "pick, the oracle boots on an empty card and cannot reach "
+                      "an in-game save");
+        }
     }
     if (orc.valid && !orc.installed && orc.container_needed) {
         left_label("", 90.f);
