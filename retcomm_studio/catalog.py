@@ -40,6 +40,37 @@ def load_title(path: Path) -> CatalogTitle:
     )
 
 
+def title_paths(catalog_root: Path, index: dict[str, Any]) -> list[tuple[str, Path]]:
+    """(id, manifest path) pairs in index order.
+
+    Catalog schema 2 groups manifests by platform: ``platforms.<p>.dir`` +
+    ``platforms.<p>.titles`` resolve to ``<dir>/<id>.json``. Schema 1 listed
+    ids only, under ``titles/<id>.json``. The flat ``titles`` list exists in
+    both, so it is the fallback for ids the platform map does not cover.
+    """
+    out: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    platforms = index.get("platforms")
+    if isinstance(platforms, dict):
+        for plat, entry in platforms.items():
+            if not isinstance(entry, dict):
+                continue
+            rel = str(entry.get("dir") or f"titles/{plat}")
+            for tid in entry.get("titles") or []:
+                tid = str(tid)
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                out.append((tid, catalog_root / rel / f"{tid}.json"))
+    for tid in index.get("titles") or []:
+        tid = str(tid)
+        if tid in seen:
+            continue
+        seen.add(tid)
+        out.append((tid, catalog_root / "titles" / f"{tid}.json"))
+    return out
+
+
 def load_catalog(catalog_root: Path) -> list[CatalogTitle]:
     catalog_root = catalog_root.expanduser().resolve()
     index_path = catalog_root / "index.json"
@@ -50,11 +81,9 @@ def load_catalog(catalog_root: Path) -> list[CatalogTitle]:
         raise FileNotFoundError(f"catalog titles/ missing: {titles_dir}")
 
     index = json.loads(index_path.read_text(encoding="utf-8"))
-    ids = list(index.get("titles") or [])
     out: list[CatalogTitle] = []
     missing: list[str] = []
-    for tid in ids:
-        path = titles_dir / f"{tid}.json"
+    for tid, path in title_paths(catalog_root, index):
         if not path.is_file():
             missing.append(tid)
             continue
