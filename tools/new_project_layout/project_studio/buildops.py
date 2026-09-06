@@ -1729,6 +1729,111 @@ def _stage_local_bundle(
     return ""
 
 
+def snes_build_is_setup_host(build_dir: Path) -> bool:
+    """Was this build dir configured -DSNESRECOMP_SETUP_HOST=ON?
+
+    The two SNES build shapes need different packaging and the cache is the
+    only honest way to tell them apart: a SETUP HOST carries no recompiled
+    code and ships as a source pack the player rebuilds, while an ordinary
+    build links src/gen and is playable as it stands. An absent or unreadable
+    cache reads as "not a setup host", which is the safe answer -- it routes
+    to the local stager, which ships no source tree and claims nothing.
+    """
+    return cache_entry(build_dir, "SNESRECOMP_SETUP_HOST").upper() == "ON"
+
+
+# Files a build dir accumulates that are the developer's machine, not the
+# game: logs, the local LAN room registry, and config.ini (player name and
+# controller GUIDs). Shipping them is a privacy leak and hands the player
+# someone else's settings.
+_SNES_LOCAL_SKIP = {
+    "config.ini",
+    "netplay_lan_lobby.txt",
+    "snes-diag.log",
+    "mesen.log",
+}
+
+
+def _stage_snes_local_bundle(
+    root: Path,
+    exe: Path,
+    stage: Path,
+    *,
+    log: LogFn | None = None,
+) -> str:
+    """Stage a PLAYABLE SNES build: what the game loads, and nothing else.
+
+    This is the local counterpart of the MinGW script's zip, for the build
+    that is already sitting in the build dir -- not a release. A release is a
+    setup pack (scripts/package_release.sh), built from a tree with no
+    generated C; this binary has the recompiled code linked in, so the zip
+    is for the machines its author chooses, and it carries no source tree and
+    no README promising a rebuild.
+
+    Never stages ROM bytes: no .sfc/.smc/.zip is copied from anywhere, and
+    src/gen (recompiler OUTPUT, not input) is not part of the payload either
+    -- only the compiled exe is.
+    """
+    exe_dir = exe.parent
+    _stage_copy(exe, stage / exe.name)
+
+    # Runtime shared libs sitting next to the exe (dynamic builds).
+    for pattern in ("*.dll", "*.DLL", "*.so", "*.so.*", "*.dylib"):
+        for lib in sorted(exe_dir.glob(pattern)):
+            if lib.is_file():
+                _stage_copy(lib, stage / lib.name)
+
+    staged_assets = False
+    for sub in ("fonts", "img"):
+        src = exe_dir / "assets" / sub
+        if src.is_dir():
+            _stage_copy(src, stage / "assets" / sub)
+            staged_assets = True
+    if not staged_assets:
+        return f"assets/fonts + assets/img missing next to {exe.name} — rebuild first"
+
+    # Exe-relative runtime data, from beside the binary where the runtime
+    # resolves it. mods/ carries the netplay mod plan; without it the Mods
+    # page is empty and a lobby can never agree on one.
+    staged_extra = []
+    for sub in ("mods", "translations"):
+        src = exe_dir / sub
+        if not src.is_dir():
+            src = root / sub
+        if src.is_dir():
+            _stage_copy(src, stage / sub)
+            staged_extra.append(sub)
+    # The packaging machine's own enable/disable state. Preloaded catalogs
+    # ship default-disabled; travelling with this file would hand every
+    # player whatever was toggled here when the zip was made.
+    for leftover in ("state.toml", "state.toml.tmp"):
+        stale = stage / "mods" / "preloaded" / leftover
+        if stale.is_file():
+            stale.unlink()
+        stale = stage / "mods" / leftover
+        if stale.is_file():
+            stale.unlink()
+
+    for name in ("VERSION", "keybinds.ini", "LICENSE"):
+        for src in (exe_dir / name, root / name):
+            if src.is_file():
+                _stage_copy(src, stage / name)
+                break
+
+    for name in _SNES_LOCAL_SKIP:
+        stale = stage / name
+        if stale.is_file():
+            stale.unlink()
+
+    _flush_log(
+        log,
+        f"    staged {exe.name} + assets"
+        + (f" + {', '.join(staged_extra)}" if staged_extra else "")
+        + " (playable build; no ROM, no source tree)",
+    )
+    return ""
+
+
 def package_local(
     root: Path,
     *,
@@ -1759,24 +1864,30 @@ def package_local(
     dist = root / "dist"
     script = root / "scripts" / "package_release.sh"
     bash = shutil.which("bash")
-    use_script = use_repo_script and script.is_file() and bool(bash)
+    snes = platforms.current().key == "snes"
+    script_ok = use_repo_script and script.is_file() and bool(bash)
+    # A SNES repo's package_release.sh packages SETUP HOSTS only: it refuses a
+    # build dir without -DSNESRECOMP_SETUP_HOST=ON, and CMake in turn refuses
+    # that option while src/gen holds generated C. So an ordinary playable
+    # build could never be packaged at all -- the button failed with
+    # "was not configured with -DSNESRECOMP_SETUP_HOST=ON" and no way forward.
+    # Route on what the build dir actually is instead.
+    setup_host = snes and snes_build_is_setup_host(bdir)
+    use_script = script_ok and (not snes or setup_host)
+
+    if snes and setup_host and not script_ok:
+        return PackageResult(
+            False,
+            "This build dir is a SETUP HOST, which ships as a source pack — "
+            "that needs scripts/package_release.sh (emit it from the Migrate "
+            "tab, snes_emit_packager) and bash.",
+        )
 
     if dry_run:
         how = f"{script.name} {bdir.name} {tag}" if use_script else f"built-in stager ({tag})"
         msg = f"dry-run: package {binary.name} via {how} → {dist}"
         _flush_log(log, msg)
         return PackageResult(True, msg)
-
-    if platforms.current().key == "snes" and not use_script:
-        # The built-in stager bundles OpenBIOS, game.toml and the psxrecomp
-        # mods/bezels layout — none of which a SNES port has. Its own packager
-        # is the only correct answer, and it also enforces the no-ROM-bytes
-        # rule that a generic stager would not.
-        return PackageResult(
-            False,
-            "No scripts/package_release.sh in this repo — emit it from the "
-            "Migrate tab (snes_emit_packager) before packaging.",
-        )
 
     if use_script:
         _flush_log(log, f"==> package {tag} via scripts/package_release.sh")
@@ -1797,16 +1908,29 @@ def package_local(
             return PackageResult(False, f"package_release.sh produced no zip under {dist}", r.detail)
         return PackageResult(True, f"Packaged {zip_path.name}", r.detail, zip_path)
 
-    _flush_log(log, f"==> package {tag} (built-in stager)")
+    if snes and script_ok:
+        _flush_log(
+            log,
+            f"==> package {tag} (playable build; {script.name} packages setup "
+            "hosts only, and this build dir is not one)",
+        )
+    else:
+        _flush_log(log, f"==> package {tag} (built-in stager)")
     stage = dist / f"stage-local-{tag}"
     if stage.exists():
         shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True, exist_ok=True)
     try:
-        err = _stage_local_bundle(root, binary, stage, log=log)
+        if snes:
+            err = _stage_snes_local_bundle(root, binary, stage, log=log)
+        else:
+            err = _stage_local_bundle(root, binary, stage, log=log)
         if err:
             return PackageResult(False, err)
-        zip_path = dist / f"{_zip_prefix(root)}-{version}-{tag}.zip"
+        # "-local" so a playable build is never mistaken for a release: a
+        # setup pack from the repo script is <zip-prefix>-<ver>-<tag>.zip.
+        suffix = "-local" if snes else ""
+        zip_path = dist / f"{_zip_prefix(root)}-{version}-{tag}{suffix}.zip"
         _write_zip(stage, zip_path)
     except OSError as exc:
         return PackageResult(False, f"Packaging failed: {exc}")

@@ -2883,10 +2883,14 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
                                "port was pinned against, and divergence you then chase will not "
                                "be in the recompiler.");
         }
-        ImGui::TextColored(th.text_muted,
-                           "Bundle + Export zips the build dir as it stands into dist/ and "
-                           "opens a save dialog. Build first — it does not rebuild, and it "
-                           "refuses to package ROM data.");
+        wrapped(th.text_muted,
+                "Bundle + Export zips the build dir as it stands into dist/ and opens a "
+                "save dialog. Build first — it does not rebuild, and it refuses to package "
+                "ROM data. An ordinary (playable) build dir gives a "
+                "<prefix>-<ver>-<tag>-local.zip: exe, assets, mods and translations, no "
+                "source tree — a local build, not a release. A build dir configured "
+                "-DSNESRECOMP_SETUP_HOST=ON instead gets the repo's own "
+                "scripts/package_release.sh, i.e. the setup pack a release ships.");
     } else {
         ImGui::TextColored(th.text_muted,
                            "Bundle + Export zips the build dir as it stands (exe + assets + "
