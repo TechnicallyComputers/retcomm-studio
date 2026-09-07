@@ -23,7 +23,9 @@
 #                   dist/*.zip (Studio Bundle+Export). Implies --package.
 #
 # Prerequisites (Arch / CachyOS):
-#   pacman -S --needed mingw-w64-gcc mingw-w64-sdl2 cmake ninja zip
+#   pacman -S --needed mingw-w64-gcc cmake ninja zip
+#   (mingw-w64-sdl2 only for --extra -DPSX_SDL_BACKEND=SDL2; the default SDL3
+#    backend is fetched and linked statically by psxrecomp)
 #
 # Writes:
 #   <root>/<build-dir>/<Product>.exe
@@ -393,8 +395,20 @@ else
     echo "error: missing ${TRIPLE}-pkg-config (need MinGW SDL2 + pkg-config)" >&2
     exit 1
   fi
-  if ! "${TRIPLE}-pkg-config" --exists sdl2; then
+  # Only the SDL2 backend consumes the MinGW sdl2.pc. The default backend is
+  # SDL3, which has no MinGW distro package here and is fetched and built
+  # statically by runtime.cmake, so demanding sdl2.pc turned a package nobody
+  # links against into a hard prerequisite for every cross build.
+  want_sdl2=0
+  for _a in "${EXTRA_CMAKE[@]+"${EXTRA_CMAKE[@]}"}"; do
+    if [[ "${_a}" == *PSX_SDL_BACKEND*SDL2* ]]; then
+      want_sdl2=1
+      break
+    fi
+  done
+  if [[ "${want_sdl2}" -eq 1 ]] && ! "${TRIPLE}-pkg-config" --exists sdl2; then
     echo "error: MinGW sdl2.pc not found via ${TRIPLE}-pkg-config" >&2
+    echo "  needed by -DPSX_SDL_BACKEND=SDL2" >&2
     echo "  Arch: pacman -S mingw-w64-sdl2" >&2
     exit 1
   fi
