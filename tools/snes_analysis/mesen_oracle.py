@@ -93,7 +93,7 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------
 
 def data_root() -> Path:
-    """The RetComM shared data root.
+    """The Retro shared data root.
 
     Precedence must match duckstation_oracle.py's data_root() and
     studio_runner.cpp's retcomm_data_dir(); if they disagree, Studio reports an

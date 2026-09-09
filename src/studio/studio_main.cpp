@@ -1371,7 +1371,7 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 88.f;
 
     // Title row — push Check updates to the right using remaining width.
-    ImGui::TextColored(th.accent, "RetComM Studio");
+    ImGui::TextColored(th.accent, "Retro Studio");
     ImGui::SameLine();
     ImGui::TextDisabled("v%s", model.version.c_str());
     const bool picked = model.platform != Platform::None;
@@ -3705,7 +3705,7 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
     SDL_Window* window =
-        SDL_CreateWindow("RetComM Studio", 1280, 860, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+        SDL_CreateWindow("Retro Studio", 1280, 860, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
                                                           SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -3853,7 +3853,7 @@ int main(int argc, char** argv) {
         if (model.toolchain_gate_open) {
             ImGui::TextColored(th.warn, "Portable toolchain required");
             ImGui::TextWrapped(
-                "RetComM Studio uses the shared cmake-clang-v1 toolchain (portable Python + "
+                "Retro Studio uses the shared cmake-clang-v1 toolchain (portable Python + "
                 "cmake/ninja/clang). It is not installed yet. Install once to continue — "
                 "downloads use github.com release files (not the GitHub API).");
             ImGui::Spacing();

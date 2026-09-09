@@ -8,13 +8,13 @@ from pathlib import Path
 
 
 def main() -> int:
-    # Prefer sibling RetComM-Studio binary (onedir / AppImage / install prefix).
+    # Prefer sibling Retro-Studio binary (onedir / AppImage / install prefix).
     here = Path(__file__).resolve().parent
     for cand in (
-        here / "RetComM-Studio",
-        here / "RetComM-Studio.exe",
-        here.parent / "bin" / "RetComM-Studio",
-        here.parent / "bin" / "RetComM-Studio.exe",
+        here / "Retro-Studio",
+        here / "Retro-Studio.exe",
+        here.parent / "bin" / "Retro-Studio",
+        here.parent / "bin" / "Retro-Studio.exe",
     ):
         if cand.is_file() and os.access(cand, os.X_OK):
             os.execv(str(cand), [str(cand), *sys.argv[1:]])

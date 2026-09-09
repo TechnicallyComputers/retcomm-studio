@@ -518,7 +518,7 @@ def _read_studio_toml(path: Path) -> dict:
 
 
 def resolve_catalog_root(studio_toml: Path | None = None) -> Path | None:
-    """Prefer the shared RetComM catalog cache (launcher/Studio sync), then studio.toml.
+    """Prefer the shared Retro catalog cache (launcher/Studio sync), then studio.toml.
 
     Override with ``RETCOMM_CATALOG_DIR``. Local ``studio.toml`` catalog= remains a
     fallback for developers without a synced cache.

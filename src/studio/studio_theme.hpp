@@ -1,6 +1,6 @@
 #pragma once
 
-// RetComM Studio visual tokens — CRT violet base (hub / recomp-ui), teal Studio accent.
+// Retro Studio visual tokens — CRT violet base (hub / recomp-ui), teal Studio accent.
 
 #include "imgui.h"
 

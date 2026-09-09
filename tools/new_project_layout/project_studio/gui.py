@@ -1,4 +1,4 @@
-"""GUI entry — launches the native Dear ImGui RetComM Studio binary."""
+"""GUI entry — launches the native Dear ImGui Retro Studio binary."""
 
 from __future__ import annotations
 
@@ -15,15 +15,15 @@ def _candidates(repo: Path) -> list[Path]:
     if env_bin:
         out.append(Path(env_bin))
     for rel in (
-        Path("build") / "RetComM-Studio",
-        Path("build") / "Release" / "RetComM-Studio.exe",
-        Path("build") / "RetComM-Studio.exe",
-        Path("build-release") / "RetComM-Studio",
-        Path("out") / "bin" / "RetComM-Studio",
-        Path("out") / "bin" / "RetComM-Studio.exe",
+        Path("build") / "Retro-Studio",
+        Path("build") / "Release" / "Retro-Studio.exe",
+        Path("build") / "Retro-Studio.exe",
+        Path("build-release") / "Retro-Studio",
+        Path("out") / "bin" / "Retro-Studio",
+        Path("out") / "bin" / "Retro-Studio.exe",
     ):
         out.append(repo / rel)
-    which = shutil.which("RetComM-Studio") or shutil.which("retcomm-studio")
+    which = shutil.which("Retro-Studio") or shutil.which("retcomm-studio")
     if which:
         out.append(Path(which))
     return out
@@ -45,10 +45,10 @@ def run_gui(*, initial_root: Path | None = None) -> int:
         return int(subprocess.call([str(cand)]))
 
     print(
-        "RetComM Studio GUI is Dear ImGui (native).\n"
+        "Retro Studio GUI is Dear ImGui (native).\n"
         "Build it first:\n"
         "  cmake -S . -B build && cmake --build build\n"
-        "  ./build/RetComM-Studio\n"
+        "  ./build/Retro-Studio\n"
         "Or set RETCOMM_STUDIO_BIN to the executable path.\n"
         "Requires Python 3.11+ on PATH for the toolkit engine.",
         file=sys.stderr,

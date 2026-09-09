@@ -639,7 +639,7 @@ def main() -> int:
     ap.add_argument(
         "--write-catalog",
         default="",
-        help="write catalog_identity.json for RetComM / submission autofill",
+        help="write catalog_identity.json for Retro / submission autofill",
     )
     ap.add_argument(
         "--write-seeds",

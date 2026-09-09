@@ -1,4 +1,4 @@
-; RetComM Studio — per-user Inno Setup installer (no admin).
+; Retro Studio — per-user Inno Setup installer (no admin).
 ; Built by packaging/windows/package.ps1
 ;
 ; Defines (passed via ISCC):
@@ -17,10 +17,10 @@
   #define Arch "x64"
 #endif
 
-#define MyAppName "RetComM Studio"
-#define MyAppPublisher "TechnicallyComputers"
+#define MyAppName "Retro Studio"
+#define MyAppPublisher "RetroPortingToolkit"
 #define MyAppURL "https://github.com/RetroPortingToolKit/Retro-Studio"
-#define MyAppExeName "RetComM-Studio.exe"
+#define MyAppExeName "Retro-Studio.exe"
 
 [Setup]
 AppId={{B8F7D3C2-5E0A-4F9B-8D42-9A3C7E2F1B58}
@@ -29,13 +29,13 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
-DefaultDirName={localappdata}\Programs\RetComM Studio
+DefaultDirName={localappdata}\Programs\Retro Studio
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir={#OutputDir}
-OutputBaseFilename=RetComM-Studio-windows-{#Arch}-setup
+OutputBaseFilename=Retro-Studio-windows-{#Arch}-setup
 SetupIconFile={#StageDir}\assets\retcomm-studio.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2

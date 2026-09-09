@@ -1,6 +1,6 @@
 # Studio tooling — hooks in the runtime, tools in Studio
 
-RetComM Studio is the debugging suite for the recomp runtimes. This file is the
+Retro Studio is the debugging suite for the recomp runtimes. This file is the
 rule that decides where a given piece of that suite lives, and why.
 
 > **Hooks belong to the runtime. Tools belong to Studio.**

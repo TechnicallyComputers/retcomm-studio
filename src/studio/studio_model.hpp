@@ -285,7 +285,7 @@ struct FrameSummary {
 // State of the machine-wide DuckStation oracle, from
 // `duckstation_oracle.py status --json`.
 //
-// The oracle is deliberately NOT per-repo: it installs into the RetComM data
+// The oracle is deliberately NOT per-repo: it installs into the Retro data
 // root and one build serves every title. Studio only ever reads this — the tool
 // owns the install, so a headless setup and this row cannot disagree about what
 // exists.

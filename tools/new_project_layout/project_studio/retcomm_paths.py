@@ -1,4 +1,4 @@
-"""Shared RetComM data/config roots (same layout as retcomm-launcher)."""
+"""Shared Retro data/config roots (same layout as retcomm-launcher)."""
 
 from __future__ import annotations
 
@@ -64,7 +64,7 @@ class RetcommPaths:
 
 
 def default_paths() -> RetcommPaths:
-    """Resolve the shared RetComM roots (honors RETCOMM_* overrides)."""
+    """Resolve the shared Retro roots (honors RETCOMM_* overrides)."""
     data_override = (os.environ.get("RETCOMM_DATA_DIR") or "").strip()
     if data_override:
         data = Path(data_override).expanduser().resolve()

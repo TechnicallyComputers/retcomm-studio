@@ -1,6 +1,6 @@
-# RetComM Studio
+# Retro Studio
 
-Developer studio for RetComM recomp titles: catalog-backed bulk Git/GitHub ops
+Developer studio for Retro recomp titles: catalog-backed bulk Git/GitHub ops
 and the Project Studio toolkit (migrate / audit / new project / GUI), for
 **PlayStation** (psxrecomp), **Super Nintendo** (snesrecomp) and
 **Nintendo 64** (n64lle).
@@ -233,7 +233,7 @@ Two things it deliberately will **not** do:
   carrying made-up digests verifies a ROM nobody owns and fails at the least
   useful moment.
 
-**README & About** is a switch, not a step. README badges, boxart, the RetComM
+**README & About** is a switch, not a step. README badges, boxart, the Retro
 Launcher section, the R.A.I.D. footer and the repository's GitHub About blurb
 are one op, so one checkbox governs them — and it governs the *audit* as well
 as the apply, which none of the other checkboxes do. A port whose README is
@@ -267,13 +267,13 @@ cp studio.toml.example studio.toml
 ```
 
 Requires Python 3.11+ (toolkit engine), `git`, and `gh` (for release dispatch).  
-GUI is a native **Dear ImGui** app (SDL3 + OpenGL3), same stack as RetComM Hub.
+GUI is a native **Dear ImGui** app (SDL3 + OpenGL3), same stack as Retro Hub.
 
 ```bash
 # Build + run GUI
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/RetComM-Studio
+./build/Retro-Studio
 
 # Or via Python entry (locates the binary / prints build help)
 python3 project_studio_gui.py
@@ -306,7 +306,7 @@ connects to a running game, captures a frame's GP0 stream, and answers it.
 * **Layers** — one image per function, so you can see each one's contribution
   in isolation.
 * **Oracle** — set up, start and stop the patched DuckStation used for parity.
-  It installs **machine-wide**, into the RetComM data root
+  It installs **machine-wide**, into the Retro data root
   (`~/.local/share/retcomm/oracle/duckstation`, the same root as the toolchains
   and catalog), so one build serves every title and none of these buttons take a
   repo. Start uses the selected project's `[game] disc`, because parity is
@@ -354,9 +354,9 @@ message rather than queued.
 
 On startup (and via **Check updates** in the header) Studio checks GitHub for:
 
-1. A newer **RetComM Studio** release (`RetroPortingToolKit/Retro-Studio`)
+1. A newer **Retro Studio** release (`RetroPortingToolKit/Retro-Studio`)
 2. A newer shared **retcomm-toolchain** pack (`RetroPortingToolKit/RetroPorting-Toolchains`)
-3. A newer **retcomm-catalog** zip (same shared cache as RetComM Hub/Launcher)
+3. A newer **retcomm-catalog** zip (same shared cache as Retro Hub/Launcher)
 
 Catalog sync writes into the shared data root and immediately refreshes:
 
@@ -368,7 +368,7 @@ Catalog sync writes into the shared data root and immediately refreshes:
 | Linux / macOS | `~/.local/share/retcomm/catalog/` |
 | Windows | `%LOCALAPPDATA%\retcomm\catalog\` |
 
-Toolchain packs install into the same cache as RetComM Launcher and game apps:
+Toolchain packs install into the same cache as Retro Launcher and game apps:
 
 | OS | Path |
 |----|------|
@@ -392,11 +392,11 @@ Manual workflow: Actions → **Release**. Leave **version** empty to auto-bump
 
 | Asset | Platform |
 |-------|----------|
-| `RetComM-Studio-linux-x86_64.AppImage` | Linux |
-| `RetComM-Studio-portable-windows.zip` | Windows portable |
-| `RetComM-Studio-windows-x64-setup.exe` | Windows installer |
-| `RetComM-Studio-macos-arm64.dmg` | macOS Apple Silicon |
-| `RetComM-Studio-macos-x86_64.dmg` | macOS Intel |
+| `Retro-Studio-linux-x86_64.AppImage` | Linux |
+| `Retro-Studio-portable-windows.zip` | Windows portable |
+| `Retro-Studio-windows-x64-setup.exe` | Windows installer |
+| `Retro-Studio-macos-arm64.dmg` | macOS Apple Silicon |
+| `Retro-Studio-macos-x86_64.dmg` | macOS Intel |
 
 Icon: `assets/retcomm-studio.svg` (teal-on-dark, launcher-matched). Packaging under `packaging/`.
 
@@ -408,7 +408,7 @@ retcomm-studio/
   retcomm_studio_cli.py
   migrate_project.py
   project_studio_gui.py      # launches native ImGui binary
-  CMakeLists.txt             # RetComM-Studio (Dear ImGui)
+  CMakeLists.txt             # Retro-Studio (Dear ImGui)
   src/studio/                # ImGui shell + Python runner
     studio_functions.*       #   Functions tab (static discovery)
     studio_frames.*          #   Frames tab (live GP0 capture / attribution)
@@ -446,7 +446,7 @@ cmake --build build --target snes_platform_test   # or: python3 tests/snes_platf
 
 ## License
 
-RetComM Studio is licensed under the **PolyForm Noncommercial License 1.0.0** —
+Retro Studio is licensed under the **PolyForm Noncommercial License 1.0.0** —
 use, modification and distribution are permitted for **noncommercial purposes
 only**. See [`LICENSE`](LICENSE).
 

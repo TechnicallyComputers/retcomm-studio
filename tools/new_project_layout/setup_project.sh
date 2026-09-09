@@ -602,7 +602,7 @@ fi
 
 if [ "$ENABLE_NETPLAY" -eq 1 ]; then
     # PSX_NETPLAY defaults RNET_ENABLE_ICE=ON; recomp-net FetchContents
-    # libjuice via pinned URL (not git) so RetComM AppImage builds configure.
+    # libjuice via pinned URL (not git) so Retro AppImage builds configure.
     printf '%s\n' \
 'if(EXISTS "${PSXRECOMP_ROOT}/lib/recomp-net/CMakeLists.txt")
     set(PSX_NETPLAY ON CACHE BOOL
@@ -738,7 +738,7 @@ if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
 fi
 git submodule update --init --recursive
 
-# RetComM-themed default app icon (Windows .ico + PNG for packaging).
+# Retro-themed default app icon (Windows .ico + PNG for packaging).
 if [ -d psxrecomp/assets ]; then
     mkdir -p "$ROOT/assets"
     for _icon in psxrecomp.svg psxrecomp.png psxrecomp.ico; do

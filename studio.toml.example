@@ -1,4 +1,4 @@
-# RetComM Studio workspace — copy to studio.toml and adjust paths.
+# Retro Studio workspace — copy to studio.toml and adjust paths.
 # Paths are relative to this file unless absolute.
 
 catalog = "../retcomm-catalog"

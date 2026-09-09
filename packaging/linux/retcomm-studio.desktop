@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=RetComM Studio
-Comment=RetComM Project Studio — new projects, migrate, bulk Git
-Exec=RetComM-Studio
+Name=Retro Studio
+Comment=Retro Project Studio — new projects, migrate, bulk Git
+Exec=Retro-Studio
 Icon=retcomm-studio
 Categories=Development;Utility;
 Terminal=false

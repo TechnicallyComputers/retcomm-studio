@@ -3135,7 +3135,7 @@ void draw_frames(StudioModel& model, const Theme& th, SDL_Window* /*window*/) {
     ImGui::Checkbox("tint textures", &model.frm_tex_tint);
 
     // ---- oracle -------------------------------------------------------------
-    // Machine-wide, installed under the RetComM data root — one build serves
+    // Machine-wide, installed under the Retro data root — one build serves
     // every title, which is why none of this takes a --root.
     //
     // Two of them, and they are not interchangeable. DuckStation answers about

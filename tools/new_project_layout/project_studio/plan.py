@@ -56,7 +56,7 @@ _OP_TITLES = {
     "enable_netplay": "Enable netplay (ENABLE_NETPLAY_IF_PRESENT)",
     "disable_netplay": "Disable netplay (remove ENABLE_NETPLAY_IF_PRESENT)",
     "record_framework_pins": "Write framework_pins.txt",
-    "patch_readme_metrics": "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
+    "patch_readme_metrics": "Patch README badges, Retro Launcher, and R.A.I.D. footer",
 }
 
 

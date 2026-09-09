@@ -1,6 +1,6 @@
-# Package RetComM Studio Windows portable zip + Inno Setup installer.
+# Package Retro Studio Windows portable zip + Inno Setup installer.
 #
-# Expects cmake --install prefix with bin/RetComM-Studio.exe (+ SDL3.dll) and
+# Expects cmake --install prefix with bin/Retro-Studio.exe (+ SDL3.dll) and
 # share/retcomm-studio/{toolkit,fonts,assets}.
 param(
     [Parameter(Mandatory = $true)][string]$Prefix,
@@ -14,9 +14,9 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $OutDir = Join-Path $Root "dist"
 $Stage = Join-Path $OutDir "windows-stage"
-$PortableZipName = "RetComM-Studio-portable-windows.zip"
-$FriendlyExe = "RetComM Studio.exe"
-$MainExe = "RetComM-Studio.exe"
+$PortableZipName = "Retro-Studio-portable-windows.zip"
+$FriendlyExe = "Retro Studio.exe"
+$MainExe = "Retro-Studio.exe"
 
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null

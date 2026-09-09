@@ -32,9 +32,9 @@ It is a reason to fix the screenshot command.* This is the fixed command.
 ## The recipe
 
 ```sh
-./build/RetComM-Studio &                       # your own instance, not the user's
+./build/Retro-Studio &                       # your own instance, not the user's
 sleep 5
-WID=$(xdotool search --name "^RetComM Studio$" | tail -1)
+WID=$(xdotool search --name "^Retro Studio$" | tail -1)
 xdotool windowmove "$WID" 0 60
 xdotool windowsize "$WID" 924 900
 wmctrl -i -a "$WID"                            # see "activation" below

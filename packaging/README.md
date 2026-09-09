@@ -1,4 +1,4 @@
-# Packaging RetComM Studio
+# Packaging Retro Studio
 
 Native Dear ImGui app (SDL3 + OpenGL3) with the Python Project Studio toolkit
 shipped beside the binary. Packaged builds expect **Python 3.11+ on PATH**.
@@ -9,7 +9,7 @@ shipped beside the binary. Packaged builds expect **Python 3.11+ on PATH**.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 cmake --install build --prefix out
-./out/bin/RetComM-Studio
+./out/bin/Retro-Studio
 ```
 
 ## Outputs
@@ -23,7 +23,7 @@ cmake --install build --prefix out
 
 ## Icon
 
-`assets/retcomm-studio.svg` — same dark/teal language as RetComM Launcher, with
+`assets/retcomm-studio.svg` — same dark/teal language as Retro Launcher, with
 code-bracket motif. Run `packaging/make-icons.sh` for PNG/ICO/(ICNS on macOS).
 
 Fonts: `assets/fonts/LatoLatin-*.ttf` (required for UI).

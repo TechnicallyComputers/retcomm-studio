@@ -1,6 +1,6 @@
 # Commercial licensing
 
-RetComM Studio is released under the [PolyForm Noncommercial License
+Retro Studio is released under the [PolyForm Noncommercial License
 1.0.0](LICENSE). That license permits use, modification and distribution **for
 noncommercial purposes only**.
 

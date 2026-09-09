@@ -98,7 +98,7 @@ def load_workspace(path: Path | None = None) -> Workspace:
     if not catalog:
         raise ValueError(f"{cfg}: missing required 'catalog' path")
     catalog_root = _as_path(base, str(catalog))
-    # Prefer the shared RetComM catalog cache when Studio/Hub has synced it.
+    # Prefer the shared Retro catalog cache when Studio/Hub has synced it.
     env_cat = (os.environ.get("RETCOMM_CATALOG_DIR") or "").strip()
     if env_cat:
         env_path = Path(env_cat).expanduser().resolve()

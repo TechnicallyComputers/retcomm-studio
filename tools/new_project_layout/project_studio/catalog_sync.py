@@ -1,4 +1,4 @@
-"""Sync retcomm-catalog into the shared RetComM cache (same as the launcher).
+"""Sync retcomm-catalog into the shared Retro cache (same as the launcher).
 
 Downloads ``catalog.zip`` from GitHub releases into
 ``~/.local/share/retcomm/catalog`` (Windows: ``%LOCALAPPDATA%\\retcomm\\catalog``).
@@ -25,7 +25,7 @@ DEFAULT_CATALOG_ASSET = "catalog.zip"
 DEFAULT_CATALOG_URL = (
     f"https://github.com/{DEFAULT_CATALOG_SLUG}/releases/latest/download/{DEFAULT_CATALOG_ASSET}"
 )
-USER_AGENT = "RetComM-Studio-Catalog/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
+USER_AGENT = "Retro-Studio-Catalog/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
 
 
 @dataclass

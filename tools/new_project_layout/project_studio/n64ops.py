@@ -747,7 +747,7 @@ def _op_merge_gitignore(root: Path, opts: MigrateOptions) -> ApplyResult:
         return ApplyResult(op, True, ".gitignore already carries the N64 rules")
     if _dry(opts):
         return ApplyResult(op, True, f"[dry-run] would append {len(missing)} rule(s)")
-    block = "\n# --- n64lle port rules (RetComM Studio) ---\n" + "\n".join(missing) + "\n"
+    block = "\n# --- n64lle port rules (Retro Studio) ---\n" + "\n".join(missing) + "\n"
     text = have
     if text and not text.endswith("\n"):
         text += "\n"

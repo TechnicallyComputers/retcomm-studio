@@ -80,7 +80,7 @@ OP_TITLES: dict[str, str] = {
     "snes_relocate_boxart": "Relocate boxart → launcher_assets/img/",
     "snes_emit_boxart_stub": "Create launcher_assets/img stub dir",
     "snes_patch_readme_metrics":
-        "Patch README badges, RetComM Launcher, and R.A.I.D. footer",
+        "Patch README badges, Retro Launcher, and R.A.I.D. footer",
     "snes_enable_netplay": "Wire netplay (snesrecomp_enable_recomp_net)",
     "snes_disable_netplay": "Unwire netplay (comment the call out)",
 }
@@ -505,7 +505,7 @@ def _audit_readme(root: Path, add: Callable[..., None]) -> None:
         if not readme_has_boxart(readme_text):
             missing_readme.append("libretro boxart")
         if not readme_has_launcher(readme_text):
-            missing_readme.append("RetComM Launcher section")
+            missing_readme.append("Retro Launcher section")
         if not readme_has_raid(readme_text):
             missing_readme.append("R.A.I.D. Discord footer")
     if not (root / ".github" / "raid-discord.png").is_file():
@@ -519,7 +519,7 @@ def _audit_readme(root: Path, add: Callable[..., None]) -> None:
     else:
         add("readme_metrics", "README download metrics / launcher / RAID / boxart",
             CheckStatus.PASS, Severity.RECOMMENDED,
-            "Badges, boxart, RetComM Launcher, and R.A.I.D. footer present.")
+            "Badges, boxart, Retro Launcher, and R.A.I.D. footer present.")
 
 
 def audit_project(root: Path, options: MigrateOptions | None = None) -> AuditReport:
@@ -1508,7 +1508,7 @@ def _ensure_boxart_png(root: Path, opts: MigrateOptions) -> list[str]:
 
 
 def _op_patch_readme_metrics(root: Path, opts: MigrateOptions) -> ApplyResult:
-    """Upsert download badges, boxart, RetComM Launcher, and R.A.I.D. footer."""
+    """Upsert download badges, boxart, Retro Launcher, and R.A.I.D. footer."""
     op = "snes_patch_readme_metrics"
     from .paths import templates_dir as _toolkit_templates
     from .readme_metrics import (

@@ -1,4 +1,4 @@
-"""Self-update for RetComM Studio + shared retcomm-toolchain packs.
+"""Self-update for Retro Studio + shared retcomm-toolchain packs.
 
 Uses the same data root as retcomm-launcher / game launchers:
   ~/.local/share/retcomm/toolchains/<id>/<tag>/   (Windows: %LOCALAPPDATA%\\retcomm\\…)
@@ -42,7 +42,7 @@ TOOLCHAIN_ASSETS = {
     "windows": "cmake-clang-v1-windows-x64.zip",
     "macos": "cmake-clang-v1-macos-universal.zip",
 }
-USER_AGENT = "RetComM-Studio-Updater/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
+USER_AGENT = "Retro-Studio-Updater/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
 # Soft TTL for github.com /releases/latest tag lookups (avoid hammering).
 TAG_CACHE_TTL_SEC = 6 * 60 * 60
 
@@ -198,7 +198,7 @@ def detect_install_info() -> InstallInfo:
         )
 
     if sys.platform == "darwin":
-        # …/RetComM Studio.app/Contents/MacOS/<bin>
+        # …/Retro Studio.app/Contents/MacOS/<bin>
         for cand in (parent, *parent.parents):
             if cand.suffix == ".app" and cand.name.endswith(".app"):
                 writable = os.access(cand.parent, os.W_OK)
@@ -821,8 +821,8 @@ def _studio_asset_candidates(channel: str, tag: str) -> list[str]:
         for ver in (t, bare, ""):
             mid = f"-{ver}" if ver else ""
             names += [
-                f"RetComM-Studio{mid}-linux-x86_64.AppImage",
-                f"RetComM-Studio{mid}-linux.AppImage",
+                f"Retro-Studio{mid}-linux-x86_64.AppImage",
+                f"Retro-Studio{mid}-linux.AppImage",
             ]
     elif channel == "macos-app":
         machine = platform.machine().lower()
@@ -830,22 +830,22 @@ def _studio_asset_candidates(channel: str, tag: str) -> list[str]:
         for ver in (t, bare, ""):
             mid = f"-{ver}" if ver else ""
             names += [
-                f"RetComM-Studio{mid}-macos-{arch}.dmg",
-                f"RetComM-Studio{mid}-macos.dmg",
+                f"Retro-Studio{mid}-macos-{arch}.dmg",
+                f"Retro-Studio{mid}-macos.dmg",
             ]
     elif channel == "windows-installer":
         for ver in (t, bare, ""):
             mid = f"-{ver}" if ver else ""
             names += [
-                f"RetComM-Studio{mid}-windows-setup.exe",
-                f"RetComM-Studio{mid}-windows-x64-setup.exe",
+                f"Retro-Studio{mid}-windows-setup.exe",
+                f"Retro-Studio{mid}-windows-x64-setup.exe",
             ]
     elif channel == "windows-portable":
         for ver in (t, bare, ""):
             mid = f"-{ver}" if ver else ""
             names += [
-                f"RetComM-Studio{mid}-portable-windows.zip",
-                f"RetComM-Studio{mid}-windows.zip",
+                f"Retro-Studio{mid}-portable-windows.zip",
+                f"Retro-Studio{mid}-windows.zip",
             ]
     # Dedupe preserving order
     out: list[str] = []
@@ -1017,7 +1017,7 @@ def apply_studio_update(
 
     channel = install.channel
     if channel == "appimage":
-        staged = dl_dir / "RetComM-Studio.AppImage.new"
+        staged = dl_dir / "Retro-Studio.AppImage.new"
         shutil.copy2(archive, staged)
         staged.chmod(0o755)
         _schedule_unix_replace(staged, install.path, [str(install.path)])
@@ -1052,7 +1052,7 @@ def apply_studio_update(
         root = unwrap_single_subdir(extract_to)
         # Prefer friendly exe name if present
         new_exe = None
-        for name in ("RetComM Studio.exe", "RetComM-Studio.exe"):
+        for name in ("Retro Studio.exe", "Retro-Studio.exe"):
             cand = root / name
             if cand.is_file():
                 new_exe = cand

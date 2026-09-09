@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wrap a CMake install prefix into RetComM Studio.app + DMG.
+# Wrap a CMake install prefix into Retro Studio.app + DMG.
 #
 # Usage:
 #   packaging/macos/build-dmg.sh <install-prefix> <version> [arch]
@@ -10,10 +10,10 @@ VERSION="${2:?version}"
 ARCH="${3:-$(uname -m)}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_DIR="${ROOT}/dist"
-APP_NAME="RetComM Studio"
+APP_NAME="Retro Studio"
 APP="${OUT_DIR}/${APP_NAME}.app"
-DMG="${OUT_DIR}/RetComM-Studio-macos-${ARCH}.dmg"
-BIN_NAME="RetComM-Studio"
+DMG="${OUT_DIR}/Retro-Studio-macos-${ARCH}.dmg"
+BIN_NAME="Retro-Studio"
 
 rm -rf "${APP}"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
@@ -49,7 +49,7 @@ if [[ -d "${PREFIX}/lib" ]]; then
   shopt -u nullglob
 fi
 
-cat > "${APP}/Contents/MacOS/RetComM-Studio-launch" <<'EOF'
+cat > "${APP}/Contents/MacOS/Retro-Studio-launch" <<'EOF'
 #!/bin/bash
 HERE="$(cd "$(dirname "$0")" && pwd)"
 export DYLD_LIBRARY_PATH="${HERE}/../Frameworks:${DYLD_LIBRARY_PATH:-}"
@@ -62,9 +62,9 @@ fi
 if [[ -d "${HERE}/assets" ]]; then
   export RETCOMM_STUDIO_ASSETS="${HERE}/assets"
 fi
-exec "${HERE}/RetComM-Studio" "$@"
+exec "${HERE}/Retro-Studio" "$@"
 EOF
-chmod +x "${APP}/Contents/MacOS/RetComM-Studio-launch"
+chmod +x "${APP}/Contents/MacOS/Retro-Studio-launch"
 
 sed "s|@VERSION@|${VERSION}|g" "${ROOT}/packaging/macos/Info.plist.in" \
   > "${APP}/Contents/Info.plist"

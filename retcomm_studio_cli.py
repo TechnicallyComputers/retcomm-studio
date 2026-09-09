@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RetComM Studio entrypoint."""
+"""Retro Studio entrypoint."""
 
 from __future__ import annotations
 

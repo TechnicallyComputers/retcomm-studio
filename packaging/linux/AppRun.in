@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AppImage entry for RetComM Studio (native Dear ImGui + Python toolkit).
+# AppImage entry for Retro Studio (native Dear ImGui + Python toolkit).
 set -euo pipefail
 HERE="$(dirname "$(readlink -f "$0")")"
 export APPDIR="${APPDIR:-${HERE}}"
@@ -22,4 +22,4 @@ if [[ -d "${HERE}/usr/share/retcomm-studio/assets" ]]; then
 elif [[ -d "${HERE}/usr/bin/assets" ]]; then
   export RETCOMM_STUDIO_ASSETS="${HERE}/usr/bin/assets"
 fi
-exec "${HERE}/usr/bin/RetComM-Studio" "$@"
+exec "${HERE}/usr/bin/Retro-Studio" "$@"

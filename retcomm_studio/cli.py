@@ -76,7 +76,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps({"catalog": str(ws.catalog_root), "titles": rows}, indent=2))
         return 0
-    print(f"RetComM Studio v{__version__}")
+    print(f"Retro Studio v{__version__}")
     print(f"  config:  {ws.config_path}")
     print(f"  catalog: {ws.catalog_root}")
     print()
@@ -96,7 +96,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps([s.to_dict() for s in statuses], indent=2))
         return 0 if all(s.resolved and not s.error for s in statuses) else 1
-    print(f"RetComM Studio status  v{__version__}")
+    print(f"Retro Studio status  v{__version__}")
     for s in statuses:
         if not s.resolved:
             print(f"  [MISS] {s.title_id}: {s.error}")
@@ -249,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="retcomm-studio",
         description=(
-            "Catalog-backed bulk Git/GitHub ops across RetComM recomp titles "
+            "Catalog-backed bulk Git/GitHub ops across Retro recomp titles "
             "(plugin API per platform)."
         ),
     )

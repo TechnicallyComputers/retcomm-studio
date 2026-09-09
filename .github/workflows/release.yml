@@ -103,7 +103,7 @@ jobs:
 
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Building RetComM Studio ${VER} (tag ${TAG})"
+          echo "Building Retro Studio ${VER} (tag ${TAG})"
 
   linux:
     needs: version
@@ -149,7 +149,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$HOME/sdl3"
           cmake --build build -j"$(nproc)"
           cmake --install build
-          test -f out/bin/RetComM-Studio
+          test -f out/bin/Retro-Studio
           test -d out/share/retcomm-studio/toolkit/project_studio
           test -f out/share/retcomm-studio/fonts/LatoLatin-Regular.ttf
           mkdir -p out/lib
@@ -160,12 +160,12 @@ jobs:
           export PATH="$HOME/sdl3/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
           ./packaging/linux/build-appimage.sh "$PWD/out" "${{ needs.version.outputs.version }}" x86_64
-          test -f dist/RetComM-Studio-linux-x86_64.AppImage
+          test -f dist/Retro-Studio-linux-x86_64.AppImage
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: dist/RetComM-Studio-linux-x86_64.AppImage
+          path: dist/Retro-Studio-linux-x86_64.AppImage
           retention-days: 5
 
   windows:
@@ -220,7 +220,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PWD/out"
           cmake --build build --config Release -j
           cmake --install build --config Release
-          test -f out/bin/RetComM-Studio.exe
+          test -f out/bin/Retro-Studio.exe
           test -d out/share/retcomm-studio/toolkit/project_studio
 
       - name: Install Inno Setup
@@ -240,8 +240,8 @@ jobs:
             -VcpkgBin "$env:RETCOMM_VCPKG/installed/x64-windows/bin" `
             -InnoSetup "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           $need = @(
-            "RetComM-Studio-portable-windows.zip",
-            "RetComM-Studio-windows-x64-setup.exe"
+            "Retro-Studio-portable-windows.zip",
+            "Retro-Studio-windows-x64-setup.exe"
           )
           foreach ($n in $need) {
             $p = Join-Path dist $n
@@ -252,8 +252,8 @@ jobs:
         with:
           name: windows-x64
           path: |
-            dist/RetComM-Studio-portable-windows.zip
-            dist/RetComM-Studio-windows-x64-setup.exe
+            dist/Retro-Studio-portable-windows.zip
+            dist/Retro-Studio-windows-x64-setup.exe
           retention-days: 5
 
   macos:
@@ -288,7 +288,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$PWD/out"
           cmake --build build -j
           cmake --install build
-          test -f out/bin/RetComM-Studio
+          test -f out/bin/Retro-Studio
           test -d out/share/retcomm-studio/toolkit/project_studio
 
       - name: Package DMG
@@ -297,12 +297,12 @@ jobs:
             "$PWD/out" \
             "${{ needs.version.outputs.version }}" \
             "${{ matrix.arch }}"
-          test -f "dist/RetComM-Studio-macos-${{ matrix.arch }}.dmg"
+          test -f "dist/Retro-Studio-macos-${{ matrix.arch }}.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}
-          path: dist/RetComM-Studio-macos-${{ matrix.arch }}.dmg
+          path: dist/Retro-Studio-macos-${{ matrix.arch }}.dmg
           retention-days: 5
 
   publish:
@@ -323,11 +323,11 @@ jobs:
           find artifacts -type f \( -name '*.AppImage' -o -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec cp -v {} dist/ \;
           ls -lah dist/
           test -n "$(ls -A dist)" || { echo "No release artifacts found" >&2; exit 1; }
-          test -f dist/RetComM-Studio-linux-x86_64.AppImage
-          test -f dist/RetComM-Studio-windows-x64-setup.exe
-          test -f dist/RetComM-Studio-portable-windows.zip
-          test -f dist/RetComM-Studio-macos-arm64.dmg
-          test -f dist/RetComM-Studio-macos-x86_64.dmg
+          test -f dist/Retro-Studio-linux-x86_64.AppImage
+          test -f dist/Retro-Studio-windows-x64-setup.exe
+          test -f dist/Retro-Studio-portable-windows.zip
+          test -f dist/Retro-Studio-macos-arm64.dmg
+          test -f dist/Retro-Studio-macos-x86_64.dmg
 
       - name: Ensure release tag exists
         env:
@@ -344,7 +344,7 @@ jobs:
             git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}"
           else
             echo "Creating annotated tag ${TAG} at ${GITHUB_SHA}"
-            git tag -a "${TAG}" "${GITHUB_SHA}" -m "RetComM Studio ${VERSION}"
+            git tag -a "${TAG}" "${GITHUB_SHA}" -m "Retro Studio ${VERSION}"
             git push origin "refs/tags/${TAG}"
           fi
 
@@ -352,7 +352,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: RetComM Studio ${{ needs.version.outputs.version }}
+          name: Retro Studio ${{ needs.version.outputs.version }}
           target_commitish: ${{ github.sha }}
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true

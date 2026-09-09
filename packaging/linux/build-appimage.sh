@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Assemble RetComM Studio AppImage from a CMake install prefix.
+# Assemble Retro Studio AppImage from a CMake install prefix.
 #
 # Usage:
 #   packaging/linux/build-appimage.sh <install-prefix> <version> [arch]
@@ -10,9 +10,9 @@ VERSION="${2:?version}"
 ARCH="${3:-$(uname -m)}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT_DIR="${ROOT}/dist"
-APPDIR="${OUT_DIR}/RetComM-Studio.AppDir"
+APPDIR="${OUT_DIR}/Retro-Studio.AppDir"
 TOOL_DIR="${OUT_DIR}/tools"
-APP_NAME="RetComM-Studio"
+APP_NAME="Retro-Studio"
 
 rm -rf "${APPDIR}"
 mkdir -p "${APPDIR}/usr" "${TOOL_DIR}" "${OUT_DIR}"
@@ -71,7 +71,7 @@ else
   fi
 fi
 
-OUT="${OUT_DIR}/RetComM-Studio-linux-${ARCH}.AppImage"
+OUT="${OUT_DIR}/Retro-Studio-linux-${ARCH}.AppImage"
 rm -f "${OUT}"
 ARCH="${ARCH}" VERSION="${VERSION}" "${APPIMAGETOOL}" "${APPDIR}" "${OUT}"
 chmod +x "${OUT}"

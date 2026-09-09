@@ -35,13 +35,13 @@ patches*, builds, and reports precisely what is missing. See `doctor`.
 Where it lives
 --------------
 NOT in the game repo. Shared by every recomp title, so it installs into the
-RetComM data root alongside the toolchains, catalog and the DuckStation oracle:
+Retro data root alongside the toolchains, catalog and the DuckStation oracle:
 
     ~/.local/share/retcomm/oracle/beetle/          (Linux / macOS)
     %LOCALAPPDATA%\\retcomm\\oracle\\beetle\\        (Windows)
 
 Override with RETCOMM_BEETLE_DIR, or move the whole root with RETCOMM_DATA_DIR
-(the same variables RetComM Launcher and Studio already honour).
+(the same variables Retro Launcher and Studio already honour).
 
     <root>/src/          pinned upstream checkout with our hook patches applied
     <root>/build/        cmake/ninja tree for the psx-beetle frontend
@@ -110,7 +110,7 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 def data_root() -> Path:
-    """The RetComM shared data root.
+    """The Retro shared data root.
 
     Precedence mirrors duckstation_oracle.py's data_root() and
     studio_runner.cpp's retcomm_data_dir() exactly, XDG_DATA_HOME included. If
@@ -753,7 +753,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("status", help="where it is and what state it is in")
     p.add_argument("--json", action="store_true",
-                   help="machine-readable, for RetComM Studio")
+                   help="machine-readable, for Retro Studio")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("path", help="print the install root")

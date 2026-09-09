@@ -97,7 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake --install build --config Release
-          test -f out/bin/RetComM-Studio.exe
+          test -f out/bin/Retro-Studio.exe
           test -d out/share/retcomm-studio/toolkit/project_studio
           test -d out/share/retcomm-studio/psx_analysis
 
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           cmake --install build
-          test -f out/bin/RetComM-Studio
+          test -f out/bin/Retro-Studio
           test -d out/share/retcomm-studio/toolkit/project_studio
 
       # spawn_test and pipe_drain_test are POSIX-only (CMake excludes them on

@@ -18,7 +18,7 @@ from typing import Any
 from . import platforms
 
 DEFAULT_PSXRECOMP_URL = "https://github.com/mstan/psxrecomp.git"
-DEFAULT_RECOMP_UI_URL = "https://github.com/mstan/recomp-ui.git"
+DEFAULT_RECOMP_UI_URL = "https://github.com/RetroPortingToolKit/recomp-ui.git"
 DEFAULT_RECOMP_NET_URL = "https://github.com/RetroPortingToolKit/recomp-net.git"
 DEFAULT_RBENGINE_URL = "https://github.com/RetroPortingToolKit/rbengine.git"
 DEFAULT_BRANCH = "master"
@@ -33,6 +33,7 @@ MOVED_REPOS: dict[str, str] = {
     "technicallycomputers/recomp-net": DEFAULT_RECOMP_NET_URL,
     "technicallycomputers/retcomm-rbengine": DEFAULT_RBENGINE_URL,
     "mstan/n64lle": "https://github.com/RetroPortingToolKit/n64lle.git",
+    "mstan/recomp-ui": DEFAULT_RECOMP_UI_URL,
 }
 _GITHUB_SLUG_RE = re.compile(
     r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/*$", re.I

@@ -13,7 +13,7 @@ private copy that can drift:
     the tools run on a bare python3 the way the psx_analysis set does.
 
 Division of labour (mirrors tools/psx_analysis/psx_gpu_frame.py): these tools
-own the protocol and the decode; RetComM Studio is a viewer and a launcher.
+own the protocol and the decode; Retro Studio is a viewer and a launcher.
 """
 
 from __future__ import annotations

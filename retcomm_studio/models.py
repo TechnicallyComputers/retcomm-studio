@@ -1,4 +1,4 @@
-"""Shared data models for RetComM Studio."""
+"""Shared data models for Retro Studio."""
 
 from __future__ import annotations
 

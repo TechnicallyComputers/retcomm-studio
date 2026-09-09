@@ -189,7 +189,7 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # Friendly name for packaging / desktop launchers
-set_target_properties(retcomm-studio PROPERTIES OUTPUT_NAME "RetComM-Studio")
+set_target_properties(retcomm-studio PROPERTIES OUTPUT_NAME "Retro-Studio")
 
 install(TARGETS retcomm-studio RUNTIME DESTINATION bin)
 install(DIRECTORY tools/new_project_layout/

@@ -83,7 +83,7 @@ GUI). CLI stays stdlib-only. The GUI is built from the repo root:
 
 ```bash
 cmake -S ../.. -B ../../build && cmake --build ../../build
-../../build/RetComM-Studio
+../../build/Retro-Studio
 # or
 python3 tools/new_project_layout/project_studio_gui.py
 ```
