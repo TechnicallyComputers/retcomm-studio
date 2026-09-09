@@ -24,6 +24,26 @@
 #endif
 
 namespace retcomm::studio {
+
+std::string tool_error(const RunResult& r) {
+    std::string text = r.stderr_text.empty() ? r.stdout_text : r.stderr_text;
+    std::string last;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        const size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos
+                                                ? std::string::npos
+                                                : nl - pos);
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        if (!line.empty()) last = line;
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    if (last.empty()) last = "exit code " + std::to_string(r.exit_code);
+    if (last.size() > 240) last = last.substr(0, 240) + " …";
+    return last;
+}
 namespace {
 
 struct PendingDone {
@@ -833,6 +853,7 @@ bool load_module_urls_from_json(StudioModel& model, const std::string& json_text
             row.local_url = json_str(m, "local_url");
             row.origin_url = json_str(m, "origin_url");
             row.effective_url = json_str(m, "effective_url");
+            row.moved_to = json_str(m, "moved_to");
             row.present = m.value("present", false);
             std::snprintf(row.edit, sizeof(row.edit), "%s", row.effective_url.c_str());
             if (!row.path.empty()) model.git_urls.push_back(std::move(row));

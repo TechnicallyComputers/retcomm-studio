@@ -19,7 +19,7 @@
 
 #define MyAppName "RetComM Studio"
 #define MyAppPublisher "TechnicallyComputers"
-#define MyAppURL "https://github.com/TechnicallyComputers/retcomm-studio"
+#define MyAppURL "https://github.com/RetroPortingToolKit/Retro-Studio"
 #define MyAppExeName "RetComM-Studio.exe"
 
 [Setup]

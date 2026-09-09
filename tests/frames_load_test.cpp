@@ -1013,6 +1013,56 @@ int run_fixtures() {
     check(probe_debug_tools("", "b").configured == false,
           "an empty root probes cleanly");
 
+    // ---- SNES execution policy ---------------------------------------------
+    // The load-bearing case is `supported`. Most ports are pinned to a
+    // snesrecomp without SNESRECOMP_EXECUTION_DEFAULT, and the Build tab must
+    // not offer a control that sends a define cmake reports as unused.
+    const fs::path xroot = dir / "exec";
+    check(!probe_exec_mode(xroot.string(), "b").supported,
+          "a tree with no snesrecomp/ is not a snesrecomp port");
+    check(probe_exec_mode(xroot.string(), "b").summary.find("Not a snesrecomp port") !=
+              std::string::npos,
+          "and says which, rather than reporting a policy it cannot know");
+
+    write_file(xroot / "snesrecomp" / "runner" / "runner.cmake",
+               "option(SNESRECOMP_ENABLE_TRACE \"...\" OFF)\n");
+    check(!probe_exec_mode(xroot.string(), "b").supported,
+          "a snesrecomp pinned before the option is unsupported, not defaulted");
+    check(probe_exec_mode(xroot.string(), "b").summary.find("pin") != std::string::npos,
+          "and names the pin as the thing to change");
+
+    write_file(xroot / "snesrecomp" / "runner" / "runner.cmake",
+               "option(SNESRECOMP_ENABLE_TRACE \"...\" OFF)\n"
+               "set(SNESRECOMP_EXECUTION_DEFAULT \"off\" CACHE STRING \"...\")\n");
+    {
+        ExecModeInfo i = probe_exec_mode(xroot.string(), "b");
+        check(i.supported && !i.configured,
+              "a supported port with no build dir is supported but unconfigured");
+        check(i.mode.empty() || i.mode == "off",
+              "and does not invent a configured policy");
+    }
+
+    write_file(xroot / "b" / "CMakeCache.txt",
+               "CMAKE_BUILD_TYPE:STRING=Release\n"
+               "SNESRECOMP_EXECUTION_DEFAULT:STRING=verify\n");
+    {
+        ExecModeInfo i = probe_exec_mode(xroot.string(), "b");
+        check(i.supported && i.configured && i.from_cache && i.mode == "verify",
+              "reads the configured policy out of the cache");
+        check(i.summary.find("override") != std::string::npos,
+              "and says the runtime env still overrides it, so the tab never "
+              "claims to know what the next run will do");
+    }
+
+    write_file(xroot / "b" / "CMakeCache.txt", "CMAKE_BUILD_TYPE:STRING=Release\n");
+    {
+        ExecModeInfo i = probe_exec_mode(xroot.string(), "b");
+        check(i.configured && !i.from_cache && i.mode == "off",
+              "a cache without the entry falls back to the framework default");
+        check(i.summary.find("inferred") != std::string::npos, "and marks it inferred");
+    }
+    check(!probe_exec_mode("", "b").supported, "an empty root probes cleanly");
+
     fs::remove_all(dir);
     return failures;
 }

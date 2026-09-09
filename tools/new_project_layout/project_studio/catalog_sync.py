@@ -20,12 +20,12 @@ from .retcomm_paths import RetcommPaths, default_paths, ensure_dirs
 
 ProgressFn = Callable[[str], None]
 
-DEFAULT_CATALOG_SLUG = "TechnicallyComputers/retcomm-catalog"
+DEFAULT_CATALOG_SLUG = "RetroPortingToolKit/Retro-Catalog"
 DEFAULT_CATALOG_ASSET = "catalog.zip"
 DEFAULT_CATALOG_URL = (
     f"https://github.com/{DEFAULT_CATALOG_SLUG}/releases/latest/download/{DEFAULT_CATALOG_ASSET}"
 )
-USER_AGENT = "RetComM-Studio-Catalog/1.0 (+https://github.com/TechnicallyComputers/retcomm-studio)"
+USER_AGENT = "RetComM-Studio-Catalog/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
 
 
 @dataclass

@@ -19,17 +19,51 @@ from . import platforms
 
 DEFAULT_PSXRECOMP_URL = "https://github.com/mstan/psxrecomp.git"
 DEFAULT_RECOMP_UI_URL = "https://github.com/mstan/recomp-ui.git"
-DEFAULT_RECOMP_NET_URL = "https://github.com/TechnicallyComputers/recomp-net.git"
-DEFAULT_RBENGINE_URL = "https://github.com/TechnicallyComputers/retcomm-rbengine.git"
+DEFAULT_RECOMP_NET_URL = "https://github.com/RetroPortingToolKit/recomp-net.git"
+DEFAULT_RBENGINE_URL = "https://github.com/RetroPortingToolKit/rbengine.git"
 DEFAULT_BRANCH = "master"
 DEFAULT_NESTED_BRANCH = "main"
+# Modules whose repo changed owner or name. A .gitmodules entry naming one of
+# these is a dead pointer that only still resolves because GitHub redirects the
+# old slug — not a deliberate fork choice — so Studio says so on the row, and
+# Reset lands on the live URL instead of faithfully restoring the stale one.
+# Keyed by lowercased "owner/repo": a genuine fork lives under some other
+# owner, is absent from this map, and is left alone.
+MOVED_REPOS: dict[str, str] = {
+    "technicallycomputers/recomp-net": DEFAULT_RECOMP_NET_URL,
+    "technicallycomputers/retcomm-rbengine": DEFAULT_RBENGINE_URL,
+    "mstan/n64lle": "https://github.com/RetroPortingToolKit/n64lle.git",
+}
+_GITHUB_SLUG_RE = re.compile(
+    r"github\.com[:/]+([^/\s]+)/([^/\s]+?)(?:\.git)?/*$", re.I
+)
+
+
+def github_slug(url: str) -> str:
+    """Lowercased ``owner/repo`` from any GitHub remote spelling, else ""."""
+    m = _GITHUB_SLUG_RE.search((url or "").strip())
+    return f"{m.group(1).lower()}/{m.group(2).lower()}" if m else ""
+
+
+def moved_url(url: str) -> str:
+    """Where a repo that has since moved now lives, or "" if ``url`` is current."""
+    return MOVED_REPOS.get(github_slug(url), "")
 # Nested under the framework checkout (game/<framework> or the engine repo
 # itself). Both consoles vendor the same two libraries at the same paths.
 KNOWN_NESTED_SUBMODULES: tuple[tuple[str, str, str], ...] = (
     ("lib/recomp-net", DEFAULT_RECOMP_NET_URL, DEFAULT_NESTED_BRANCH),
     ("lib/retcomm-rbengine", DEFAULT_RBENGINE_URL, DEFAULT_NESTED_BRANCH),
 )
+# Every nested module Studio knows how to manage, across all consoles. Which
+# of them a given session actually has is PlatformProfile.nested_paths — n64lle
+# vendors neither, so an N64 session's tuple is empty and the --modules ops
+# report "none" instead of hunting for a lib/recomp-net that was never there.
 NESTED_PATHS = tuple(p for p, _, _ in KNOWN_NESTED_SUBMODULES)
+
+
+def nested_paths() -> tuple[str, ...]:
+    """Nested modules THIS session's framework actually carries."""
+    return platforms.current().nested_paths
 
 
 # ---------------------------------------------------------------------------
@@ -456,10 +490,20 @@ resolve_psxrecomp_dir = resolve_framework_dir
 
 
 def list_nested_modules(root: Path) -> list[SubmoduleInfo]:
+    """Nested modules inside the framework that THIS session manages.
+
+    Empty when the framework carries none. n64lle's own .gitmodules does list
+    two (ares, rabbitizer), but those are its vendored build dependencies —
+    its build initialises them and Studio has no business advancing their pins.
+    Listing them here would put an Advance-pins button in front of something
+    every --modules op then declines to touch.
+    """
+    if not nested_paths():
+        return []
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
         return []
-    return _list_submodules(psx, known=NESTED_PATHS)
+    return _list_submodules(psx, known=nested_paths())
 
 
 def repo_status(root: Path) -> RepoStatus:
@@ -518,7 +562,7 @@ def repo_status(root: Path) -> RepoStatus:
         st.psxrecomp_root = str(psx)
         if psx == root:
             # Engine checkout: top-level known slots are the nested libs.
-            st.submodules = _list_submodules(root, known=NESTED_PATHS)
+            st.submodules = _list_submodules(root, known=nested_paths())
             st.nested_submodules = list(st.submodules)
             st.notes.append(
                 f"Root is a {framework_name()} checkout (nested modules are direct)."
@@ -591,9 +635,21 @@ class ModuleUrl:
         """What git will actually reach for, in the order git resolves it."""
         return self.origin_url or self.local_url or self.gitmodules_url
 
+    @property
+    def moved_to(self) -> str:
+        """Live URL when the URL git will actually use points at a moved repo.
+
+        Judged on the effective URL alone. A stale ``.gitmodules`` behind a
+        reset override is already reported by the row's ".gitmodules says …"
+        line, and flagging it here too left the row still saying "moved" after
+        a Reset had already moved it.
+        """
+        return moved_url(self.effective_url)
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["effective_url"] = self.effective_url
+        d["moved_to"] = self.moved_to
         return d
 
 
@@ -713,18 +769,41 @@ def reset_module_url(
     nested: bool = False,
     dry_run: bool = False,
 ) -> CmdResult:
-    """Drop the local override and go back to what ``.gitmodules`` says."""
+    """Drop the local override and go back to what ``.gitmodules`` says.
+
+    Except where ``.gitmodules`` names a repo that has since moved: restoring a
+    dead pointer is not a useful reset, and ``git submodule sync`` would write
+    that stale URL straight back over both ``.git/config`` and the submodule's
+    origin. There the live URL goes in as a local override instead. Either way
+    nothing tracked changes — rewriting ``.gitmodules`` is Save's job, under the
+    scope the user picked.
+    """
     root = root.expanduser().resolve()
     path = _normalize_module_path(path, nested=nested)
     owner = _url_owner(root, nested=nested)
     if owner is None:
         return CmdResult(False, f"No {framework_name()} checkout found")
+    tracked = _gitmodules_url(owner, path) or _default_url_for_path(path)
+    live = moved_url(tracked)
     if dry_run:
+        if live:
+            return CmdResult(
+                True,
+                f"[dry-run] {path}: would drop the override and use {live} "
+                f"({tracked} moved)")
         return CmdResult(True, f"[dry-run] {path}: would drop the local override")
     _git(owner, "config", "--local", "--unset", f"submodule.{path}.url")
     _git(owner, "submodule", "sync", "--", path)
-    back = _gitmodules_url(owner, path) or _default_url_for_path(path)
-    return CmdResult(True, f"{path} → {back} (back to .gitmodules)")
+    if not live:
+        return CmdResult(True, f"{path} → {tracked} (back to .gitmodules)")
+    _git(owner, "config", "--local", f"submodule.{path}.url", live)
+    sub_dir = owner / path
+    if (sub_dir / ".git").exists():
+        _git(sub_dir, "remote", "set-url", "origin", live)
+    return CmdResult(
+        True,
+        f"{path} → {live} (this clone only; .gitmodules still says {tracked}, "
+        "which moved — Save with the .gitmodules scope to fix it for everyone)")
 
 
 def ensure_submodule(
@@ -826,8 +905,18 @@ def ensure_nested_modules(
         "lib/recomp-net": recomp_net_branch or DEFAULT_NESTED_BRANCH,
         "lib/retcomm-rbengine": rbengine_branch or DEFAULT_NESTED_BRANCH,
     }
+    want = set(nested_paths())
+    if not want:
+        return [
+            CmdResult(
+                True,
+                f"{framework_name()} carries no nested modules — nothing to ensure",
+            )
+        ]
     results: list[CmdResult] = []
     for path, url, default_branch in KNOWN_NESTED_SUBMODULES:
+        if path not in want:
+            continue
         results.append(
             ensure_submodule(
                 psx,
@@ -852,7 +941,11 @@ def update_nested_modules(
     psx = resolve_psxrecomp_dir(root)
     if psx is None:
         return CmdResult(False, f"No {framework_name()} checkout found")
-    want = paths or list(NESTED_PATHS)
+    want = paths or list(nested_paths())
+    if not want:
+        return CmdResult(
+            True, f"{framework_name()} carries no nested modules — nothing to update"
+        )
     # Allow callers to pass game-relative paths
     normalized: list[str] = []
     for p in want:
@@ -1620,7 +1713,7 @@ def resolve_module_dir(
 
 def default_module_paths(*, nested: bool = False) -> tuple[str, ...]:
     """Module paths a --modules op covers, for THIS session's platform."""
-    return NESTED_PATHS if nested else known_submodules()
+    return nested_paths() if nested else known_submodules()
 
 
 def _tracking_branch_for(owner: Path, path: str) -> str:
@@ -1838,7 +1931,21 @@ def install_and_push_release_ci(
     """
     from .models import MigrateOptions
 
-    if platforms.current().key == "snes":
+    profile = platforms.current()
+    if profile.key == "n64":
+        # n64lle ships no release-workflow and no packager template, so there
+        # is nothing to emit and nothing this could write that its scaffolder
+        # would recognise. Refusing here beats writing a psxrecomp workflow
+        # into an N64 port, which would fail in Actions on someone else's
+        # machine days later.
+        return CmdResult(
+            False,
+            "n64lle ships no release workflow or packager template, so there "
+            "is no CI to set up for an N64 port. Package a local build from "
+            "the Build tab instead (Package), and file the missing template "
+            "against n64lle rather than working around it here.",
+        )
+    if profile.key == "snes":
         from .snesops import op_emit_ci_workflow, op_emit_packager
     else:
         from .ops import op_emit_ci_workflow, op_emit_packager

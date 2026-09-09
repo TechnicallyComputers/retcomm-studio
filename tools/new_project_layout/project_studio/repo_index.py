@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -199,11 +200,54 @@ def discover_cue(root: Path) -> str:
     return ""
 
 
+# SNES's answer, kept as a module constant because callers outside this file
+# import it. New code asks rom_globs(), which reads the current profile.
 ROM_EXTS: tuple[str, ...] = ("*.sfc", "*.smc")
 ROM_DIRS_ENV = "RETCOMM_SNES_ROM_DIRS"
-# A headered SNES dump tops out well under this; the cap only exists so a
-# stray same-named file cannot cost a multi-gigabyte read to reject.
+# Per-console override for where dumps are kept, so an N64 library folder is
+# not searched for SNES cartridges and vice versa. The SNES name is the one
+# that already existed and keeps working.
+_ROM_DIRS_ENV_BY_KEY = {
+    "snes": ROM_DIRS_ENV,
+    "n64": "RETCOMM_N64_ROM_DIRS",
+}
+# The env var naming a single dump directly, per console. Each is the same
+# variable that console's own tooling honours: regen.sh reads SNESRECOMP_ROM,
+# and n64lle's runtime/tools read N64LLE_ROM.
+_ROM_ENV_BY_KEY = {
+    "snes": "SNESRECOMP_ROM",
+    "n64": "N64LLE_ROM",
+}
+# A headered SNES dump tops out well under this. N64 carts reach 64 MiB
+# (Resident Evil 2), so the cap is per-console: it exists only so a stray
+# same-named file cannot cost a multi-gigabyte read to reject, and setting it
+# below a legitimate dump would silently refuse to match the real ROM.
 _MAX_ROM_BYTES = 16 * 1024 * 1024
+_MAX_ROM_BYTES_BY_KEY = {
+    "snes": _MAX_ROM_BYTES,
+    "n64": 64 * 1024 * 1024,
+}
+
+
+def rom_globs(profile=None) -> tuple[str, ...]:
+    """Glob patterns for this console's dumps, from its image extensions."""
+    profile = profile or platforms.current()
+    return tuple(f"*{ext}" for ext in profile.image_exts)
+
+
+def rom_dirs_env(profile=None) -> str:
+    profile = profile or platforms.current()
+    return _ROM_DIRS_ENV_BY_KEY.get(profile.key, ROM_DIRS_ENV)
+
+
+def rom_env(profile=None) -> str:
+    profile = profile or platforms.current()
+    return _ROM_ENV_BY_KEY.get(profile.key, "")
+
+
+def max_rom_bytes(profile=None) -> int:
+    profile = profile or platforms.current()
+    return _MAX_ROM_BYTES_BY_KEY.get(profile.key, _MAX_ROM_BYTES)
 
 # `for cand in "A.sfc" "B.sfc"; do` — the only place a scaffolded repo records
 # what its ROM is *called*. The wizard writes it; nothing writes where it lives.
@@ -249,7 +293,7 @@ def regen_expected_crc32(root: Path) -> str:
 
 def _crc32_of(path: Path) -> str:
     try:
-        if path.stat().st_size > _MAX_ROM_BYTES:
+        if path.stat().st_size > max_rom_bytes():
             return ""
         crc = 0
         with path.open("rb") as fh:
@@ -261,8 +305,8 @@ def _crc32_of(path: Path) -> str:
 
 
 def rom_library_dirs() -> list[Path]:
-    """Directories the user keeps dumps in (``RETCOMM_SNES_ROM_DIRS``)."""
-    raw = os.environ.get(ROM_DIRS_ENV) or ""
+    """Directories the user keeps dumps in (``RETCOMM_<CONSOLE>_ROM_DIRS``)."""
+    raw = os.environ.get(rom_dirs_env()) or ""
     out: list[Path] = []
     for part in raw.split(os.pathsep):
         part = part.strip()
@@ -277,27 +321,68 @@ def rom_library_dirs() -> list[Path]:
     return out
 
 
+# `sha256 = "…"` in an n64lle port's game.toml [game] section. The scaffolder
+# writes it from the dump it probed and tags it [MEASURED], so it is the one
+# digest in that file that is known to describe the ROM this port was cut
+# against. Anchored to the key so the CIC's own hex values cannot match.
+_GAME_TOML_SHA256_RE = re.compile(
+    r'^\s*sha256\s*=\s*["\']([0-9a-fA-F]{64})["\']', re.MULTILINE
+)
+
+
+def game_toml_sha256(root: Path) -> str:
+    """The ROM digest an n64lle port's ``game.toml`` records, or ""."""
+    toml = Path(root).expanduser().resolve() / "game.toml"
+    if not toml.is_file():
+        return ""
+    try:
+        text = toml.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = _GAME_TOML_SHA256_RE.search(text)
+    return m.group(1).lower() if m else ""
+
+
+def _sha256_of(path: Path) -> str:
+    try:
+        if path.stat().st_size > max_rom_bytes():
+            return ""
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
 def discover_rom(root: Path, extra_dirs: "Sequence[Path | str]" = ()) -> str:
-    """Best-effort SNES ROM path for a title repo.
+    """Best-effort cartridge ROM path for a title repo.
 
-    The ROM is never committed (snesrecomp's scaffold gitignores *.sfc/*.smc)
-    and the wizard never records where the copy it was run against lives, so
-    the repo alone is usually not enough. Three sources, in falling order of
-    how directly they were stated:
+    The ROM is never committed — both cartridge scaffolds gitignore it — and
+    neither wizard records where the copy it was run against lives, so the repo
+    alone is usually not enough. Three sources, in falling order of how
+    directly they were stated:
 
-      1. ``SNESRECOMP_ROM`` — the same variable ``regen.sh`` itself honours.
-      2. A dump parked in the working tree (root, ``rom/``, ``roms/``).
-      3. A file named by ``tools/regen.sh`` sitting in a known ROM directory —
-         ``RETCOMM_SNES_ROM_DIRS`` or a directory another indexed title's ROM
-         was already found in.
+      1. The console's own ROM variable (``SNESRECOMP_ROM`` / ``N64LLE_ROM``) —
+         the same one that console's tooling honours.
+      2. A dump parked in the working tree (root, ``rom/``, ``roms/``). On N64
+         this is usually a SYMLINK: setup_project.sh links the dump into
+         ``roms/<slug>.z64`` rather than copying it, which is why the search
+         resolves what it finds instead of reporting the link path.
+      3. A file in a known ROM directory whose DIGEST matches the one this port
+         records — ``tools/regen.sh``'s CRC32 on SNES, ``game.toml``'s sha256
+         on N64.
 
-    Source 3 is only accepted when its CRC32 matches the digest this port was
-    pinned to. A matching name in a library folder is a guess; a matching
-    digest is the ROM. Finding nothing stays a normal outcome, not a failure.
+    Source 3 is never accepted on name alone. A matching name in a library
+    folder is a guess; a matching digest is the ROM, and a wrong ROM
+    regenerates wrong C. Finding nothing stays a normal outcome, not a failure.
     """
     root = root.expanduser().resolve()
+    profile = platforms.current()
 
-    env = (os.environ.get("SNESRECOMP_ROM") or "").strip()
+    var = rom_env(profile)
+    env = (os.environ.get(var) or "").strip() if var else ""
     if env:
         p = Path(env).expanduser()
         if p.is_file():
@@ -306,20 +391,26 @@ def discover_rom(root: Path, extra_dirs: "Sequence[Path | str]" = ()) -> str:
             except OSError:
                 return str(p)
 
+    globs = rom_globs(profile)
     for sub in (root, root / "rom", root / "roms"):
         if not sub.is_dir():
             continue
         hits = sorted(
-            [p for ext in ROM_EXTS for p in sub.glob(ext)],
+            [p for g in globs for p in sub.glob(g)],
             key=lambda p: p.name.lower(),
         )
-        if hits:
-            return str(hits[0].resolve())
+        for hit in hits:
+            try:
+                resolved = hit.resolve()
+            except OSError:
+                continue
+            # A dangling symlink is the ordinary state of a cloned n64lle port
+            # on a second machine: the link is committed-looking but its target
+            # never existed here. Skipping it falls through to the digest
+            # search, which can actually find the dump.
+            if resolved.is_file():
+                return str(resolved)
 
-    names = regen_rom_names(root)
-    if not names:
-        return ""
-    want = regen_expected_crc32(root)
     seen: set[Path] = set()
     dirs: list[Path] = []
     for d in list(extra_dirs) + list(rom_library_dirs()):
@@ -331,6 +422,26 @@ def discover_rom(root: Path, extra_dirs: "Sequence[Path | str]" = ()) -> str:
             continue
         seen.add(dp)
         dirs.append(dp)
+
+    if profile.key == "n64":
+        # No filename to go on: n64lle's scaffold renames the dump to
+        # <slug>.<ext> in roms/ and records nothing about the original. The
+        # digest is the whole identity, so every candidate of the right
+        # extension is hashed rather than pre-filtered by name.
+        want = game_toml_sha256(root)
+        if not want:
+            return ""
+        for d in dirs:
+            for g in globs:
+                for cand in sorted(d.glob(g), key=lambda p: p.name.lower()):
+                    if cand.is_file() and _sha256_of(cand) == want:
+                        return str(cand.resolve())
+        return ""
+
+    names = regen_rom_names(root)
+    if not names:
+        return ""
+    want = regen_expected_crc32(root)
     for d in dirs:
         for name in names:
             cand = d / name
@@ -376,12 +487,47 @@ def looks_like_game_repo(root: Path) -> bool:
         ):
             return True
         return False
+    if profile.key == "n64":
+        # game.toml is NOT sufficient here: a PSX port has one too, and the two
+        # files are different contracts under the same name. What separates
+        # them is the framework — an n64lle port names n64lle, in its submodule
+        # or (on a not-yet-initialised clone) in .gitmodules.
+        if not (root / "CMakeLists.txt").is_file():
+            return False
+        if (root / profile.framework).exists():
+            return True
+        mods = root / ".gitmodules"
+        if mods.is_file():
+            try:
+                if profile.framework in mods.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    return True
+            except OSError:
+                pass
+        return False
+    # PSX. game.toml is its contract too, so before accepting one, rule out a
+    # port built on somebody else's framework. Without this an n64lle port —
+    # which carries a game.toml of its own — lands in the PSX index, and every
+    # later Bulk/Build op there looks for a psxrecomp that is not present.
+    if _names_foreign_framework(root, profile):
+        return False
     if (root / "game.toml").is_file():
         return True
     if (root / "CMakeLists.txt").is_file() and (
         (root / profile.framework).exists() or (root / "runtime").exists()
     ):
         return True
+    return False
+
+
+def _names_foreign_framework(root: Path, profile) -> bool:
+    """Does this tree carry another console's framework rather than ours?"""
+    for other in platforms.PROFILES.values():
+        if other.key == profile.key:
+            continue
+        if (root / other.framework).is_dir() and not (root / profile.framework).exists():
+            return True
     return False
 
 

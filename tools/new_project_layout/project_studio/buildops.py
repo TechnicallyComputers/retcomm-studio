@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import platforms
-from . import snes_paths as _snes_paths
+from . import n64_paths as _n64_paths, snes_paths as _snes_paths
 from .gitops import CmdResult
 
 DEFAULT_BUILD_DIR = "build-release"
@@ -477,25 +477,64 @@ def resolve_framework_root(root: Path) -> Path | None:
 _PROJECT_RE = re.compile(r"^\s*project\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE)
 
 
+# `n64lle_add_runtime_target(glover-runtime` — the one call an n64lle port makes
+# to build its executable. Its argument is the target name, and there is no
+# other place that carries it: the project() name is GloverRecomp, the OUTPUT
+# NAME is glover, and the target is glover-runtime. All three differ.
+_N64_RUNTIME_TARGET_RE = re.compile(
+    r"^\s*n64lle_add_runtime_target\s*\(\s*([A-Za-z0-9_.+-]+)", re.MULTILINE
+)
+
+
 def default_target(root: Path) -> str:
     """The CMake target to build for this platform's projects.
 
-    PSX ports all build one shared runtime target (``psx-runtime``). SNES ports
-    name their executable after the project, so there is no constant to use —
-    the target is read out of the repo's own ``project()`` call.
+    Three different rules, because the three scaffolds genuinely differ:
+
+    * PSX ports all build one shared runtime target (``psx-runtime``).
+    * SNES ports name their executable after the project, so the target is read
+      out of the repo's own ``project()`` call.
+    * N64 ports name it after the SLUG, which appears in neither — the project
+      is ``GloverRecomp`` and the executable is ``glover``, but the target is
+      ``glover-runtime``. It is read from the ``n64lle_add_runtime_target()``
+      call that defines it, which is the only place it is written down.
     """
-    if platforms.current().default_target:
-        return platforms.current().default_target
+    profile = platforms.current()
+    if profile.default_target:
+        return profile.default_target
     cml = Path(root).expanduser().resolve() / "CMakeLists.txt"
+    text = ""
     if cml.is_file():
         try:
-            m = _PROJECT_RE.search(cml.read_text(encoding="utf-8", errors="replace"))
+            text = cml.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            m = None
+            text = ""
+    if profile.key == "n64":
+        m = _N64_RUNTIME_TARGET_RE.search(text)
+        if m:
+            return m.group(1)
+        # No runtime target: either <SLUG>_BUILD_UI is off or this is not a
+        # scaffolded port. `all` still builds the gates and the frame probe,
+        # which is the useful answer rather than a guessed target name.
+        return "all"
+    if text:
+        m = _PROJECT_RE.search(text)
         if m:
             return m.group(1)
     # `all` builds everything the project defines — correct, if not minimal.
     return "all"
+
+
+def n64_project_slug(root: Path) -> str:
+    """The port's target prefix, derived from its runtime target name."""
+    tgt = default_target(root)
+    return tgt[: -len("-runtime")] if tgt.endswith("-runtime") else ""
+
+
+def n64_generate_target(root: Path) -> str:
+    """The CMake target that harvests the ROM and emits C: ``<slug>-generate``."""
+    slug = n64_project_slug(root)
+    return f"{slug}-generate" if slug else ""
 
 
 def snes_regen_script(root: Path) -> Path | None:
@@ -667,6 +706,183 @@ def generate_snes_c(
     if hint:
         return CmdResult(False, f"{r.message} — {hint}", r.detail)
     return r
+
+
+# ---------------------------------------------------------------------------
+# N64: generation is a target in the port's OWN CMake graph
+# ---------------------------------------------------------------------------
+# There is no regen.sh here and no framework CLI to call. A port's CMakeLists
+# declares two custom commands — n64lle-harvest (execution-derived discovery)
+# then n64emit --image — behind one target, <slug>-generate. So "generate" is
+# `cmake --build . --target <slug>-generate`, and the thing that has to be true
+# first is not a CLI vocabulary but a BUILT FRAMEWORK: the port includes
+# n64lle/runtime/runtime.cmake and calls n64lle_runtime_resolve_framework(),
+# which looks for already-built libraries and tools under build-n64lle/.
+#
+# That prerequisite is the whole reason this preflight exists. Configure with
+# it missing and CMake dies inside a resolve function, several files away from
+# the step that was actually skipped.
+
+
+def preflight_n64_framework(root: Path) -> CmdResult | None:
+    """Reasons an n64lle port cannot configure, found before cmake runs."""
+    root = Path(root).expanduser().resolve()
+    fw = root / "n64lle"
+    if not (fw / _n64_paths.MARKER).is_file():
+        return CmdResult(
+            False,
+            "The n64lle submodule is not checked out — a port includes "
+            "n64lle/runtime/runtime.cmake and cannot configure without it. "
+            "Run: git submodule update --init --recursive n64lle",
+        )
+    if _n64_paths.framework_is_built(root):
+        return None
+    script = _n64_paths.framework_build_script(root)
+    if script is None:
+        return CmdResult(
+            False,
+            f"n64lle is not built ({_n64_paths.FRAMEWORK_BUILD_DIR}/ has no "
+            "n64emit) and this port has no tools/build_framework.sh to build "
+            "it. That script is scaffolded into every n64lle port and carries "
+            "the flags the framework revision it is pinned to needs; without "
+            "it, build n64lle out of tree by hand into "
+            f"{_n64_paths.FRAMEWORK_BUILD_DIR}/.",
+        )
+    return CmdResult(
+        False,
+        f"n64lle is not built yet — {_n64_paths.FRAMEWORK_BUILD_DIR}/ carries "
+        "no n64emit, so n64lle_runtime_resolve_framework() would fail inside "
+        f"cmake. Run: {script.relative_to(root)} Release",
+    )
+
+
+def build_n64_framework(
+    root: Path,
+    *,
+    config: str = "Release",
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Run the port's own ``tools/build_framework.sh``.
+
+    The port's copy, never a Studio reimplementation, for the same reason
+    Studio runs SNES's regen.sh rather than calling snesrecomp_cli: that script
+    carries the workarounds the framework revision THIS port is pinned to needs
+    (GloverRecomp's, for one, adds -frounding-math and -lm and documents why
+    each belongs upstream). Rebuilding the framework without them produces a
+    silently mis-rounding FPU.
+    """
+    root = Path(root).expanduser().resolve()
+    script = _n64_paths.framework_build_script(root)
+    if script is None:
+        return CmdResult(
+            False,
+            f"No tools/build_framework.sh in {root} — it is scaffolded into "
+            "every n64lle port; this tree is missing it.",
+        )
+    fw = root / "n64lle"
+    if not (fw / _n64_paths.MARKER).is_file():
+        return CmdResult(
+            False,
+            "The n64lle submodule is not checked out. Run: "
+            "git submodule update --init --recursive n64lle",
+        )
+    cmd = ["sh", str(script), config]
+    if dry_run:
+        msg = "dry-run: " + " ".join(cmd)
+        if log:
+            log(msg)
+        return CmdResult(True, msg)
+    r = _run_stream(cmd, root, log=log)
+    if not r.ok:
+        return r
+    if not _n64_paths.framework_is_built(root):
+        # Exit 0 without the artifact is the case worth naming: it is what an
+        # SDL3-absent or option-disabled configure looks like, and treating it
+        # as success moves the failure to the next step.
+        return CmdResult(
+            False,
+            f"tools/build_framework.sh reported success but "
+            f"{_n64_paths.FRAMEWORK_BUILD_DIR}/ still has no n64emit — read "
+            "its output before building the port.",
+            r.detail,
+        )
+    return CmdResult(True, f"Built n64lle into {_n64_paths.FRAMEWORK_BUILD_DIR}/", r.detail)
+
+
+def generate_n64_c(
+    root: Path,
+    *,
+    rom: str = "",
+    build_dir: str = DEFAULT_BUILD_DIR,
+    build_type: str = DEFAULT_BUILD_TYPE,
+    generator: str = "",
+    ensure_framework: bool = True,
+    dry_run: bool = False,
+    log: LogFn | None = None,
+) -> CmdResult:
+    """Harvest the ROM and emit C: ``cmake --build … --target <slug>-generate``.
+
+    ``rom`` overrides the port's default dump by setting the ``<SLUG>_ROM``
+    cache variable — the same knob the CMakeLists declares — rather than by
+    copying a file into roms/. Studio never moves a user's dump to make a build
+    work.
+    """
+    root = Path(root).expanduser().resolve()
+    target = n64_generate_target(root)
+    if not target:
+        return CmdResult(
+            False,
+            f"No n64lle_add_runtime_target() in {root}/CMakeLists.txt, so the "
+            "generate target's name cannot be read. Is this an n64lle port?",
+        )
+    if ensure_framework:
+        pre = preflight_n64_framework(root)
+        if pre is not None:
+            if log:
+                log(pre.message)
+            return pre
+
+    defines: list[str] = []
+    if rom:
+        rom_p = Path(rom).expanduser()
+        if not rom_p.is_file():
+            return CmdResult(False, f"ROM not found: {rom}")
+        slug = n64_project_slug(root)
+        defines.append(f"-D{slug.upper()}_ROM={rom_p.resolve()}")
+
+    cfg = configure(
+        root,
+        build_dir=build_dir,
+        build_type=build_type,
+        generator=generator,
+        extra_args=defines,
+        ensure_bios=False,
+        dry_run=dry_run,
+        log=log,
+    )
+    if not cfg.ok:
+        return cfg
+    if dry_run:
+        # build() refuses a missing build dir before it looks at dry_run, and
+        # on a dry run the configure above did not create one. Reporting that
+        # as "Configure first" would be a lie about a run that never happened.
+        msg = f"dry-run: cmake --build {build_dir} --target {target}"
+        if log:
+            log(msg)
+        return CmdResult(True, msg, cfg.detail)
+    r = build(
+        root,
+        build_dir=build_dir,
+        target=target,
+        dry_run=dry_run,
+        log=log,
+    )
+    if not r.ok:
+        return r
+    gen = root / "generated"
+    n = len(list(gen.glob("*.c"))) if gen.is_dir() else 0
+    return CmdResult(True, f"Generated {n} C file(s) into generated/", r.detail)
 
 
 _MAX_PLAYERS_CMAKE_RE = re.compile(
@@ -1074,20 +1290,35 @@ def configure(
     if not (root / "CMakeLists.txt").is_file():
         return CmdResult(False, f"No CMakeLists.txt in {root}")
 
-    # The BIOS backend step is a PSX concept: a SNES cartridge boots from its
-    # own reset vector and there is nothing to stage.
-    if ensure_bios and platforms.current().key != "snes" and not _allow_no_bios(extra_args):
+    profile = platforms.current()
+
+    # The BIOS backend step is a PSX concept: a cartridge boots from its own
+    # reset vector and there is nothing to stage. Asked as has_bios rather than
+    # as "not snes", so a console added later does not inherit a BIOS hunt by
+    # being spelled differently.
+    if ensure_bios and profile.has_bios and not _allow_no_bios(extra_args):
         bios_r = ensure_bios_backends(root, dry_run=dry_run, log=log)
         if not bios_r.ok:
             return bios_r
         if log and bios_r.message:
             log(bios_r.message)
 
-    pre = preflight_max_players(root) if platforms.current().key != "snes" else None
+    # MAX_PLAYERS is psxrecomp's runtime.cmake range check; neither cartridge
+    # scaffold declares it.
+    pre = preflight_max_players(root) if profile.has_bios else None
     if pre is not None:
         if log:
             log(pre.message)
         return pre
+
+    # n64lle is resolved as a PRE-BUILT tree, not add_subdirectory()'d, so a
+    # port cannot configure until the framework has been built out of tree.
+    if profile.key == "n64":
+        pre = preflight_n64_framework(root)
+        if pre is not None:
+            if log:
+                log(pre.message)
+            return pre
 
     bdir = Path(build_dir)
     if not bdir.is_absolute():
@@ -1256,7 +1487,7 @@ def launch_rom_for(root: Path | str, rom: str = "") -> tuple[str, str]:
     rom = (rom or "").strip()
     if rom:
         return rom, "explicit"
-    if not platforms.is_snes():
+    if not platforms.current().is_cartridge:
         return "", ""
     from .repo_index import load_index
 
@@ -1834,6 +2065,85 @@ def _stage_snes_local_bundle(
     return ""
 
 
+# Files an n64lle port keeps beside its executable that belong to the machine
+# it was built on, never to a zip. settings.toml is written by the launcher and
+# input.cfg by its Configure page; both carry absolute ROM paths, pad GUIDs and
+# scancodes. The port's own .gitignore lists exactly these for the same reason.
+_N64_LOCAL_SKIP = (
+    "settings.toml",
+    "settings.toml.bad",
+    "input.cfg",
+    "keybinds.ini",
+)
+
+
+def _stage_n64_local_bundle(
+    root: Path,
+    exe: Path,
+    stage: Path,
+    *,
+    log: LogFn | None = None,
+) -> str:
+    """Stage a PLAYABLE n64lle build: what the game loads, and nothing else.
+
+    An n64lle port has no scripts/package_release.sh to defer to — n64lle ships
+    no release-workflow template yet — so this is the only packager on this
+    console, and it is a local zip rather than a release.
+
+    Never stages ROM bytes: roms/ holds the user's own dump (usually a SYMLINK
+    to it, which a naive copytree would follow), and generated/ is ROM-derived
+    C whose distribution posture n64lle has explicitly not settled
+    (docs/DISTRIBUTION-POSTURE.md is a draft). Neither is part of the payload;
+    only the compiled executable is.
+    """
+    exe_dir = exe.parent
+    _stage_copy(exe, stage / exe.name)
+
+    # Runtime shared libs sitting next to the exe (dynamic builds).
+    for pattern in ("*.dll", "*.DLL", "*.so", "*.so.*", "*.dylib"):
+        for lib in sorted(exe_dir.glob(pattern)):
+            if lib.is_file():
+                _stage_copy(lib, stage / lib.name)
+
+    # recomp_ui.cmake stages the console's fonts and art beside the executable
+    # (CONSOLE n64 selects the Nintendo 64 SystemProfile). Absent, the launcher
+    # comes up with no fonts, so this is a rebuild, not a warning.
+    staged_assets = False
+    for sub in ("fonts", "img"):
+        src = exe_dir / "assets" / sub
+        if src.is_dir():
+            _stage_copy(src, stage / "assets" / sub)
+            staged_assets = True
+    if not staged_assets:
+        return f"assets/fonts + assets/img missing next to {exe.name} — rebuild first"
+
+    # game.toml is the contract the host reads at startup (host_config.c), so a
+    # zip without it is a build that cannot resolve its own title. It is the
+    # one config file that IS source here.
+    contract = root / "game.toml"
+    if not contract.is_file():
+        return f"game.toml missing in {root} — an n64lle host reads it at startup"
+    _stage_copy(contract, stage / "game.toml")
+
+    for name in ("VERSION", "LICENSE", "README.md"):
+        for src in (exe_dir / name, root / name):
+            if src.is_file():
+                _stage_copy(src, stage / name)
+                break
+
+    for name in _N64_LOCAL_SKIP:
+        stale = stage / name
+        if stale.is_file():
+            stale.unlink()
+
+    _flush_log(
+        log,
+        f"    staged {exe.name} + assets + game.toml "
+        "(playable build; no ROM, no generated C)",
+    )
+    return ""
+
+
 def package_local(
     root: Path,
     *,
@@ -1864,7 +2174,9 @@ def package_local(
     dist = root / "dist"
     script = root / "scripts" / "package_release.sh"
     bash = shutil.which("bash")
-    snes = platforms.current().key == "snes"
+    profile = platforms.current()
+    snes = profile.key == "snes"
+    n64 = profile.key == "n64"
     script_ok = use_repo_script and script.is_file() and bool(bash)
     # A SNES repo's package_release.sh packages SETUP HOSTS only: it refuses a
     # build dir without -DSNESRECOMP_SETUP_HOST=ON, and CMake in turn refuses
@@ -1873,7 +2185,11 @@ def package_local(
     # "was not configured with -DSNESRECOMP_SETUP_HOST=ON" and no way forward.
     # Route on what the build dir actually is instead.
     setup_host = snes and snes_build_is_setup_host(bdir)
-    use_script = script_ok and (not snes or setup_host)
+    # n64lle ships no release-workflow or packager template, so a
+    # scripts/package_release.sh in an N64 port did not come from its
+    # scaffolder. Running one here would hand a psxrecomp-shaped argv to an
+    # unknown script; the built-in stager is the honest route.
+    use_script = script_ok and not n64 and (not snes or setup_host)
 
     if snes and setup_host and not script_ok:
         return PackageResult(
@@ -1908,7 +2224,13 @@ def package_local(
             return PackageResult(False, f"package_release.sh produced no zip under {dist}", r.detail)
         return PackageResult(True, f"Packaged {zip_path.name}", r.detail, zip_path)
 
-    if snes and script_ok:
+    if n64 and script_ok:
+        _flush_log(
+            log,
+            f"==> package {tag} (built-in stager; {script.name} is not an "
+            "n64lle scaffold artifact and is not run)",
+        )
+    elif snes and script_ok:
         _flush_log(
             log,
             f"==> package {tag} (playable build; {script.name} packages setup "
@@ -1923,13 +2245,17 @@ def package_local(
     try:
         if snes:
             err = _stage_snes_local_bundle(root, binary, stage, log=log)
+        elif n64:
+            err = _stage_n64_local_bundle(root, binary, stage, log=log)
         else:
             err = _stage_local_bundle(root, binary, stage, log=log)
         if err:
             return PackageResult(False, err)
         # "-local" so a playable build is never mistaken for a release: a
         # setup pack from the repo script is <zip-prefix>-<ver>-<tag>.zip.
-        suffix = "-local" if snes else ""
+        # Every N64 zip is local — there is no release packager on that console
+        # yet — so the suffix is never dropped there.
+        suffix = "-local" if (snes or n64) else ""
         zip_path = dist / f"{_zip_prefix(root)}-{version}-{tag}{suffix}.zip"
         _write_zip(stage, zip_path)
     except OSError as exc:

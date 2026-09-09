@@ -28,8 +28,8 @@ from .retcomm_paths import RetcommPaths, default_paths, ensure_dirs, host_os_key
 
 ProgressFn = Callable[[str], None]
 
-DEFAULT_STUDIO_SLUG = "TechnicallyComputers/retcomm-studio"
-DEFAULT_TOOLCHAIN_SLUG = "TechnicallyComputers/retcomm-toolchains"
+DEFAULT_STUDIO_SLUG = "RetroPortingToolKit/Retro-Studio"
+DEFAULT_TOOLCHAIN_SLUG = "RetroPortingToolKit/RetroPorting-Toolchains"
 DEFAULT_TOOLCHAIN_ID = "cmake-clang-v1"
 TOOLCHAIN_GLOBS = {
     "linux": "*cmake-clang-v1*linux*",
@@ -42,7 +42,7 @@ TOOLCHAIN_ASSETS = {
     "windows": "cmake-clang-v1-windows-x64.zip",
     "macos": "cmake-clang-v1-macos-universal.zip",
 }
-USER_AGENT = "RetComM-Studio-Updater/1.0 (+https://github.com/TechnicallyComputers/retcomm-studio)"
+USER_AGENT = "RetComM-Studio-Updater/1.0 (+https://github.com/RetroPortingToolKit/Retro-Studio)"
 # Soft TTL for github.com /releases/latest tag lookups (avoid hammering).
 TAG_CACHE_TTL_SEC = 6 * 60 * 60
 

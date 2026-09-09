@@ -21,36 +21,116 @@ namespace fs = std::filesystem;
 // framework submodule and scaffolder Studio reaches for follows from this one
 // value, which is why it is chosen before anything else is shown.
 // ---------------------------------------------------------------------------
-enum class Platform { None, PSX, SNES };
+// WHY THESE ARE SWITCHES AND NOT TERNARIES (2026-09-07, adding Nintendo 64).
+// Every one of these used to read `p == Platform::SNES ? snes : psx`, where the
+// second arm silently meant "PlayStation" AND "anything else". Adding a third
+// console is what makes those two different claims: an N64 session would have
+// been handed psxrecomp, a .cue filter and the PSX repo index without a single
+// line changing. A switch over the enum makes the next console a compile-time
+// question instead — see platforms.py, which carries the same note.
+enum class Platform { None, PSX, SNES, N64 };
 
 inline const char* platform_key(Platform p) {
-    return p == Platform::SNES ? "snes" : "psx";
+    switch (p) {
+    case Platform::SNES: return "snes";
+    case Platform::N64: return "n64";
+    default: return "psx";
+    }
 }
 
 inline const char* platform_display(Platform p) {
     switch (p) {
     case Platform::SNES: return "Super Nintendo";
     case Platform::PSX: return "PlayStation";
+    case Platform::N64: return "Nintendo 64";
     default: return "(none)";
     }
 }
 
 // The framework submodule a port of this platform carries.
 inline const char* platform_framework(Platform p) {
-    return p == Platform::SNES ? "snesrecomp" : "psxrecomp";
+    switch (p) {
+    case Platform::SNES: return "snesrecomp";
+    case Platform::N64: return "n64lle";
+    default: return "psxrecomp";
+    }
 }
 
 // UI label for the game image, and the file-dialog filter that matches it.
 inline const char* platform_image_label(Platform p) {
-    return p == Platform::SNES ? "ROM" : "Disc .cue";
+    switch (p) {
+    case Platform::SNES: return "ROM";
+    case Platform::N64: return "ROM";
+    default: return "Disc .cue";
+    }
 }
 
 inline const char* platform_image_filter_name(Platform p) {
-    return p == Platform::SNES ? "SNES ROM" : "CUE files";
+    switch (p) {
+    case Platform::SNES: return "SNES ROM";
+    case Platform::N64: return "N64 ROM";
+    default: return "CUE files";
+    }
 }
 
 inline const char* platform_image_filter_ext(Platform p) {
-    return p == Platform::SNES ? "sfc;smc" : "cue";
+    switch (p) {
+    case Platform::SNES: return "sfc;smc";
+    case Platform::N64: return "z64;n64;v64";
+    default: return "cue";
+    }
+}
+
+// --- capabilities ----------------------------------------------------------
+// The GUI's counterpart to PlatformProfile's capability fields, and they carry
+// the same rule: a tab or button is ABSENT on a console whose framework cannot
+// serve it, rather than present and dead. The CLI refuses the matching
+// subcommands with a reason, so the two layers agree.
+
+// A cartridge: one image, no BIOS, no Redump identity, no multi-disc.
+inline bool platform_is_cartridge(Platform p) {
+    return p == Platform::SNES || p == Platform::N64;
+}
+
+// psxrecomp stages a BIOS and builds separate emitters; no cartridge does.
+inline bool platform_has_bios(Platform p) { return p == Platform::PSX; }
+
+// The Functions and Diagnostics tabs. Each console that has one is backed by
+// its own toolset — PSX reads psxrecomp's analysis bundle and speaks its debug
+// protocol; SNES reads recomp/symbols.toml and drives tools/snes_analysis over
+// the Mesen oracle; N64 drives n64lle's Ares oracle and its differential gates
+// through tools/n64_analysis.
+//
+// FUNCTIONS is still absent on N64, and for the original reason: discovery is
+// execution-derived inside the harvest and a port carries no symbol table, so
+// there is nothing for that tab to read. The CLI refuses `analyze` on the same
+// grounds.
+//
+// DIAGNOSTICS was absent for a reason that has since expired. The old note here
+// said n64lle's debug server "implements only ping/ring_stats/ring_query/help",
+// which is still true of the RUNTIME's server — but the tab is not about that
+// server. n64lle's oracle (n64ref) speaks the full protocol, and as of
+// 2026-09-09 it builds off Windows, which brought the whole differential
+// toolset — command, pixel, frame and scanout — within reach of a Linux host
+// for the first time (n64lle docs/evidence/ORACLE-LINUX-PORT-STUDY.md). A tab
+// that opens onto nothing reads as a bug; so did the absence of one once there
+// was something to open onto.
+inline bool platform_has_functions(Platform p) {
+    return p == Platform::PSX || p == Platform::SNES;
+}
+inline bool platform_has_diagnostics(Platform p) {
+    return p == Platform::PSX || p == Platform::SNES || p == Platform::N64;
+}
+
+// A Windows cross-build script exists for this console.
+inline bool platform_has_mingw(Platform p) {
+    return p == Platform::PSX || p == Platform::SNES;
+}
+
+// The framework wires netplay (recomp-net + retcomm-rbengine). n64lle vendors
+// neither, and its scaffolder has no flag for either.
+inline bool platform_has_netplay(Platform p) {
+    return p == Platform::PSX || p == Platform::SNES;
 }
 
 struct RepoEntry {
@@ -660,6 +740,53 @@ struct MesenStatus {
     std::string summary;       // one line, ready to show
 };
 
+// ---- N64 Diagnostics tab ----------------------------------------------------
+// Parsed from tools/n64_analysis/n64_oracle.py `status --json`. The N64 oracle
+// is a THIRD kind from the other two: first-party (n64lle's own n64ref), BUILT
+// from a submodule pinned by n64ref/ORACLE-PIN.md rather than downloaded, and
+// it speaks the runtime's own protocol rather than answering through artifacts.
+struct N64OracleStatus {
+    bool        probed = false;
+    bool        installed = false;
+    // The one field a caller should gate "safe to grade with" on: the Ares tree
+    // present is the one ORACLE-PIN.md records. A pin change is an owner-signed
+    // event (n64lle docs/ORACLE-UPGRADE.md), never a build side effect, so a
+    // mismatch is a refusal rather than a warning.
+    bool        pin_ok = false;
+    std::string binary;
+    std::string build_dir;
+    std::string n64lle;
+    std::string root;
+    std::string logfile;
+    std::string ares_pinned;
+    std::string ares_present;
+    std::vector<std::string> patches;
+    long        running_pid = 0;
+    int         running_port = 0;
+    std::string error;
+    std::string summary;       // one line, ready to show
+};
+
+struct N64GateResult {
+    std::string name;
+    std::string status;        // "Passed" | "Failed" | "Skipped"
+    double      seconds = 0.0;
+};
+
+// Outcome of one ctest run over the gate catalogue. A SKIP is a first-class
+// outcome here and is never folded into either pass or fail: n64lle's gates
+// skip (77) when an anchor ROM is absent, and "green because it did not run"
+// is the failure mode this pane exists to make impossible to misread.
+struct N64GateRun {
+    bool        ran = false;
+    int         passed = 0;
+    int         failed = 0;
+    int         skipped = 0;
+    std::string summary;
+    std::string error;
+    std::vector<N64GateResult> results;
+};
+
 // 256 BGR555 entries decoded from a dump_cgram reply or a Mesen *_cgram.bin.
 //
 // The census is the point, not the swatches. A real SNES palette repeats a
@@ -813,11 +940,25 @@ struct StudioModel {
     bool np_build = true;
     bool np_github = false;
     char np_gh_vis[32] = "private";
-    char np_gh_owner[128] = "TechnicallyComputers";
+    char np_gh_owner[128] = "RetroPortingToolKit";
     char np_gh_repo[256] = {};
     // SNES-only scaffolder inputs. `np_disc` carries the ROM path on SNES —
     // one field for one game image, so the two can never disagree.
     char np_snes_ref[128] = "main";
+    // --- N64 ---------------------------------------------------------------
+    // Three names where the other consoles need one. n64lle's scaffolder asks
+    // for all three because a port has no single string that serves: the CMake
+    // project is GloverRecomp, every target is built from the prefix glover-,
+    // and the executable is glover. Blank means "let the scaffolder derive
+    // it", which is the default a terminal run would have offered.
+    char np_n64_slug[128] = {};
+    char np_n64_exe[128] = {};
+    // The execution-derived harvest window. n64lle records what actually ran
+    // rather than following seeds, so these two ARE the coverage decision for
+    // a new port; 0 takes the scaffolder's own defaults (900 / 3000M) rather
+    // than carrying a second copy of them here to drift.
+    int np_n64_frames = 0;
+    int np_n64_step_cap = 0;
     int  np_multitap = 0;   // 0 auto (from players), 1 port1, 2 port2, 3 both, 4 off
     bool np_rollback = false;
     // Separate from np_region, which carries the PSX default "USA". Blank here
@@ -888,6 +1029,16 @@ struct StudioModel {
     // is not the same as OFF: CMake's option() default depends on
     // CMAKE_BUILD_TYPE, and an existing cache keeps whatever it already has.
     int  build_debug_tools = 0;
+    // SNES execution policy DEFAULT: 0 = leave to the framework default, then
+    // 1..5 = off / on / force / verify / auto. Injected as
+    // -DSNESRECOMP_EXECUTION_DEFAULT=... on Configure.
+    //
+    // This is a BUILD default, not the policy a run uses: snesrecomp resolves
+    // the policy at runtime, where SNESRECOMP_EXECUTION_MODE and
+    // SNESRECOMP_FORCE_FLOOR override whatever the build was configured with.
+    // Deliberately not a compile-time split — PRINCIPLES.md requires the
+    // faithful floor to stay forceable in the shipped binary.
+    int  build_exec_mode = 0;
     char build_env[4096] =
         "# KEY=VALUE pairs (space or newline separated)\n"
         "# Example:\n"
@@ -1059,6 +1210,27 @@ struct StudioModel {
     char        snes_rom_override[512] = {};
     std::string snes_status;
 
+    // ---- N64 Diagnostics tab -------------------------------------------
+    // Two processes, never one, same as SNES: the runtime under test and the
+    // n64ref oracle are separate processes and neither is ever paused to line
+    // them up. n64lle's own coordinators do every comparison; this tab starts
+    // them and reads what they wrote.
+    char        n64_host[64] = "127.0.0.1";
+    int         n64_port = 4370;
+    std::string n64_status;
+
+    N64OracleStatus n64_oracle;
+    bool        n64_oracle_probing = false;
+    bool        n64_oracle_busy = false;
+    std::string n64_oracle_error;
+    char        n64_rom_override[512] = {};
+
+    N64GateRun        n64_gate_run;
+    bool              n64_gates_running = false;
+    std::vector<char> n64_gate_sel;      // per-catalogue-row selection
+    int               n64_pane = 0;
+    std::string       n64_ring_reply;    // last ring_stats / ring_query payload
+
     MesenStatus snes_mesen;
     bool        snes_mesen_probing = false;
     long        snes_mesen_pid = 0;
@@ -1175,6 +1347,7 @@ struct StudioModel {
         std::string local_url;
         std::string origin_url;
         std::string effective_url;
+        std::string moved_to;
         bool present = false;
         char edit[512] = {};
     };
@@ -1235,10 +1408,16 @@ struct StudioModel {
     void apply_selected_players();
 
     bool is_snes() const { return platform == Platform::SNES; }
+    bool is_n64() const { return platform == Platform::N64; }
+    bool is_cartridge() const { return platform_is_cartridge(platform); }
+    bool has_functions_tab() const { return platform_has_functions(platform); }
+    bool has_diagnostics_tab() const { return platform_has_diagnostics(platform); }
     const char* framework() const { return platform_framework(platform); }
     // Clear per-project state that belongs to the platform being left, so a
-    // PSX repo path or branch list can never survive into a SNES session.
+    // PSX repo path or branch list can never survive into a cartridge session.
     void reset_for_platform_switch();
+    // Seed the per-console New Project defaults, once a console is chosen.
+    void apply_platform_defaults();
 };
 
 } // namespace retcomm::studio

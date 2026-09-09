@@ -2,7 +2,8 @@
 
 Developer studio for RetComM recomp titles: catalog-backed bulk Git/GitHub ops
 and the Project Studio toolkit (migrate / audit / new project / GUI), for
-**PlayStation** (psxrecomp) and **Super Nintendo** (snesrecomp).
+**PlayStation** (psxrecomp), **Super Nintendo** (snesrecomp) and
+**Nintendo 64** (n64lle).
 
 ## Choosing a platform
 
@@ -13,27 +14,126 @@ drives and which migration ops exist. There is no sensible default for those
 before the question is asked, and loading "the PSX one for now" would race the
 answer.
 
-| | PlayStation | Super Nintendo |
-|---|---|---|
-| Framework | `psxrecomp` | `snesrecomp` |
-| Repo index | `project_studio_repos.json` | `project_studio_repos_snes.json` |
-| Game image | Redump `.cue` | `.sfc` / `.smc` ROM |
-| Generate | `psxrecomp_cli generate` (ROM + BIOS C) | the project's own `tools/regen.sh` |
-| Build target | `psx-runtime` | the repo's CMake `project()` name |
-| Tabs | Migrate · New Project · Git · Bulk · Build · Functions · Frames | Migrate · New Project · Git · Bulk · Build |
+| | PlayStation | Super Nintendo | Nintendo 64 |
+|---|---|---|---|
+| Framework | `psxrecomp` | `snesrecomp` | `n64lle` |
+| Repo index | `project_studio_repos.json` | `project_studio_repos_snes.json` | `project_studio_repos_n64.json` |
+| Game image | Redump `.cue` | `.sfc` / `.smc` ROM | `.z64` / `.n64` / `.v64` ROM |
+| Generate | `psxrecomp_cli generate` (ROM + BIOS C) | the project's own `tools/regen.sh` | the project's own `<slug>-generate` CMake target |
+| Build target | `psx-runtime` | the repo's CMake `project()` name | the repo's `n64lle_add_runtime_target()` name |
+| Tabs | Migrate · New Project · Git · Bulk · Build · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Functions · Diagnostics | Migrate · New Project · Git · Bulk · Build · Diagnostics |
 
 **Change** in the header returns to the picker. Each console keeps its own repo
 list, so switching loses nothing.
 
-Functions and Frames are PSX-only, and absent rather than empty under SNES:
-they read psxrecomp's `analysis/` bundle and speak its debug protocol, neither
-of which the SNES runner has. The same rule applies to the buttons that would
-be dead ends — no BIOS staging, no emitter build, no MinGW cross-build on the
-SNES Build tab, and the CLI refuses those subcommands under `--platform snes`
-rather than failing deep inside cmake.
+**Functions** is absent rather than empty on N64: n64lle's discovery is
+execution-derived inside the harvest, a port carries no symbol table, and its
+debug server implements only `ping` / `ring_stats` / `ring_query` / `help` — no
+`fn_stats`, no `fn_query`. The same rule applies to every button that would be a
+dead end — no BIOS staging, no emitter build, no MinGW cross-build, no netplay,
+no CI — and the CLI refuses those subcommands under `--platform n64` with the
+reason, rather than failing deep inside somebody else's tool.
+
+**Diagnostics** was absent on N64 for the same stated reason until 2026-09-09,
+and that reason had expired. It was about the RUNTIME's debug server, which is
+still thin — but the tab is about the ORACLE. n64lle's `n64ref` speaks the full
+protocol, and once it built off Windows the whole differential toolset it gates
+came within reach (n64lle `docs/evidence/ORACLE-LINUX-PORT-STUDY.md`). The N64
+tab has three panes:
+
+| Pane | What it drives |
+|---|---|
+| Oracle | `tools/n64_analysis/n64_oracle.py` — doctor / setup / start / stop for `n64ref`, and the ORACLE-PIN.md check |
+| Gates | `tools/n64_analysis/n64_gates.py` — n64lle's own command / pixel / frame / scanout differentials through ctest |
+| Rings | the always-on rings, over the same JSON protocol, on the runtime's port or the oracle's |
+
+A third kind of oracle, and the manifest says which: PSX patches DuckStation to
+speak our protocol, SNES takes Mesen2 unpatched and reads what its Lua wrote,
+and N64 **builds** a first-party binary from a submodule pinned by
+`ORACLE-PIN.md`. Only N64's records `speaks_runtime_protocol: true`. A pin
+mismatch is a refusal, not a warning: an off-pin oracle answers every query and
+grades every gate against a reference nothing in the evidence trail describes.
+
+That rule is enforced by a table rather than by prose. `platforms.py` carries a
+`PlatformProfile` per console whose capability fields (`has_bios`,
+`has_disc_meta`, `has_netplay`, `generate_kind`, `analysis_kind`,
+`mingw_script`, …) each replace a branch that used to read `key == "snes"` with
+an `else` that meant both "PlayStation" and "anything else". Adding N64 is what
+made those two different claims: without the table an N64 session would have
+been handed psxrecomp's BIOS hunt, Redump lookup and MinGW script without a
+line changing. `studio_model.hpp` carries the GUI's half of the same table.
 
 Every Studio → toolkit call carries `--platform`, injected once in the runner
 rather than at each of the ~90 call sites.
+
+## Nintendo 64
+
+**New Project** drives n64lle's `tools/new_project/setup_project.sh`: probe the
+cartridge, lay out the repo, wire the `n64lle` + `recomp-ui` submodules, write
+`game.toml`, then generate / build / run the gates. Studio prefers a live
+n64lle checkout (`$N64LLE_ROOT`, the selected project's own submodule, or a
+sibling checkout) and falls back to the copy vendored under
+`tools/new_project_layout/n64/`. The dump is probed where it lies and
+**symlinked** into `roms/` — Copy ROM (`--copy-rom`) is for a dump on removable
+media, and is off by default because the framework says a link "makes it
+impossible to do by accident" to commit ROM bytes.
+
+An n64lle port needs **three names**, which is why the page asks for three: the
+CMake project (`GloverRecomp`), the target prefix every target is built from
+(`glover-runtime`, `glover-cosim`, `glover-generate`) and the executable
+(`glover`). None of them can be derived from either of the others. Blank means
+"let the scaffolder derive it", and **Probe ROM** fills all three with the same
+values `--yes` would have taken.
+
+The page also carries the **harvest window** (frames / step cap), because on
+this console that *is* the coverage decision: discovery is execution-derived —
+the harvester runs the real boot on the interpreter and records what executed —
+so code outside the window is never emitted. Probe ROM additionally warns when
+a cartridge is **CIC-6105**, which walks into n64lle's KI-1 and renders black
+forever on today's framework; knowing that before scaffolding is the difference
+between a known issue and a lost day.
+
+There is deliberately **no n64lle ref** to choose: `setup_project.sh` pins the
+new project at the HEAD of the checkout it was run from — "the SHA this scaffold
+was cut against" — and has no flag to override it.
+
+**Build** knows two things this console needs that the others do not. n64lle is
+resolved as a **pre-built tree** rather than `add_subdirectory()`'d, so
+Configure first checks that `build-n64lle/` actually holds an `n64emit` and, if
+not, names `tools/build_framework.sh` instead of letting cmake die inside
+`n64lle_runtime_resolve_framework()`. And **Generate** is `cmake --build
+--target <slug>-generate` — the harvest and emit live in the port's own CMake
+graph, not in a script or a framework CLI.
+
+**Migrate** audits an N64 port against that scaffold — submodules, `.gitignore`,
+untracked generated C *and* ROM bytes, `tools/build_framework.sh`, the contract's
+`[MEASURED]` identity rows, the single `n64lle_add_runtime_target()` call, the
+scaffold stubs and `framework_pins.txt` — and applies the fixes.
+
+What it will **not** write is the point:
+
+* `game.toml` — n64lle's scaffolder writes it once from a probed ROM and tags
+  every row `[MEASURED]` / `[DECLARED]` / `[UNKNOWN]`. Its own header says no
+  program in the repo writes it, and that is what makes those tags worth
+  anything. A migration that regenerated it would launder Studio's guesses into
+  a provenance record.
+* `docs/STATUS.md` — the honesty ledger. A freshly cut one asserts that nothing
+  has been measured; writing that over a port that *has* measured things would
+  replace findings with a claim of ignorance.
+* `CMakeLists.txt` and `README.md` — the port's build graph and its prose.
+
+Migrate also reports, without a fix op, a port that still carries its own
+`host/`: the scaffolded layout has none, because the launcher, input, audio and
+run loop come from one `n64lle_add_runtime_target()` call and reach every port
+on a submodule bump. Deleting a port's host is a decision with a measurement
+behind it, not a mechanical sweep.
+
+**Packaging** is a local zip only — n64lle ships no release workflow and no
+packager template, so `git release-setup` refuses rather than writing a
+psxrecomp workflow into an N64 port. The zip carries the executable, the staged
+launcher assets, `game.toml` and `VERSION`; never ROM bytes, never `generated/`
+(whose distribution posture n64lle has explicitly not settled), never the
+user's `settings.toml` or `input.cfg`.
 
 ## Super Nintendo
 
@@ -254,8 +354,8 @@ message rather than queued.
 
 On startup (and via **Check updates** in the header) Studio checks GitHub for:
 
-1. A newer **RetComM Studio** release (`TechnicallyComputers/retcomm-studio`)
-2. A newer shared **retcomm-toolchain** pack (`TechnicallyComputers/retcomm-toolchains`)
+1. A newer **RetComM Studio** release (`RetroPortingToolKit/Retro-Studio`)
+2. A newer shared **retcomm-toolchain** pack (`RetroPortingToolKit/RetroPorting-Toolchains`)
 3. A newer **retcomm-catalog** zip (same shared cache as RetComM Hub/Launcher)
 
 Catalog sync writes into the shared data root and immediately refreshes:

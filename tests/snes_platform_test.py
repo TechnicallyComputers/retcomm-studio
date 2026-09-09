@@ -1465,6 +1465,52 @@ def test_github_about_names_the_console() -> None:
     platforms.set_current("snes")
 
 
+def test_moved_repo_urls() -> None:
+    """A .gitmodules URL naming a repo that moved is a dead pointer, not a fork.
+
+    recomp-net and rbengine changed owner. GitHub redirects the old slugs, so
+    nothing looks broken — and the stale URL survives every Reset, because
+    `git submodule sync` writes .gitmodules straight back over the override.
+    Studio therefore knows the old names, says so on the row, and resets to the
+    live URL. A fork under any other owner is absent from the map and is left
+    alone, which is the whole point of the dialog.
+    """
+    print("moved repo URLs")
+    from project_studio import gitops
+
+    check(
+        gitops.github_slug("git@github.com:TechnicallyComputers/recomp-net.git")
+        == "technicallycomputers/recomp-net",
+        "the ssh spelling of a remote parses to the same slug as https")
+    check(
+        gitops.moved_url("https://github.com/TechnicallyComputers/recomp-net.git")
+        == gitops.DEFAULT_RECOMP_NET_URL,
+        "the old recomp-net slug resolves to its new home")
+    check(
+        gitops.moved_url("https://github.com/mstan/n64lle")
+        == "https://github.com/RetroPortingToolKit/n64lle.git",
+        "a URL with no .git suffix still matches")
+    check(
+        gitops.moved_url("https://github.com/somefork/recomp-net.git") == "",
+        "somebody else's fork is not mistaken for a repo that moved")
+    check(
+        gitops.moved_url(gitops.DEFAULT_RECOMP_NET_URL) == "",
+        "and the current URL does not report itself as moved")
+
+    old = "https://github.com/TechnicallyComputers/recomp-net.git"
+    stale = gitops.ModuleUrl(path="lib/recomp-net", nested=True, gitmodules_url=old)
+    check(stale.moved_to == gitops.DEFAULT_RECOMP_NET_URL,
+          "a row still using the old URL is flagged as moved")
+    fixed = gitops.ModuleUrl(
+        path="lib/recomp-net", nested=True, gitmodules_url=old,
+        local_url=gitops.DEFAULT_RECOMP_NET_URL,
+        origin_url=gitops.DEFAULT_RECOMP_NET_URL)
+    check(fixed.moved_to == "",
+          "and stops being flagged once the override points at the live repo")
+    check(fixed.to_dict().get("moved_to") == "",
+          "the flag reaches the dialog over json")
+
+
 def main() -> int:
     if not subprocess.run(["git", "--version"], capture_output=True).returncode == 0:
         print("git not available — skipping")
@@ -1489,6 +1535,7 @@ def main() -> int:
     test_regen_framework_skew()
     test_advance_pins()
     test_module_urls()
+    test_moved_repo_urls()
     test_region_default()
     test_probe_rom_cli()
     test_dispatch_inputs()

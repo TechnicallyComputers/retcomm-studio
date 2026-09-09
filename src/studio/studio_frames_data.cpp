@@ -642,6 +642,77 @@ DebugToolsInfo probe_debug_tools(const std::string& root, const std::string& bui
     return info;
 }
 
+ExecModeInfo probe_exec_mode(const std::string& root, const std::string& build_dir) {
+    ExecModeInfo info;
+    if (root.empty()) {
+        info.summary = "No game repo selected.";
+        return info;
+    }
+
+    std::error_code ec;
+    const fs::path runner_cmake = fs::path(root) / "snesrecomp" / "runner" / "runner.cmake";
+    if (!fs::is_regular_file(runner_cmake, ec)) {
+        info.summary = "Not a snesrecomp port — no snesrecomp/runner/runner.cmake.";
+        return info;
+    }
+    {
+        // Ask the port's own pinned framework whether the option exists, rather
+        // than assuming every SNES port is on a framework new enough to have
+        // it. A grep is enough: the name appears in runner.cmake only where the
+        // cache variable is declared.
+        std::ifstream rc(runner_cmake);
+        std::string line;
+        while (std::getline(rc, line)) {
+            if (line.find("SNESRECOMP_EXECUTION_DEFAULT") != std::string::npos) {
+                info.supported = true;
+                break;
+            }
+        }
+    }
+    if (!info.supported) {
+        info.summary = "This port's pinned snesrecomp has no SNESRECOMP_EXECUTION_DEFAULT "
+                       "(the option lands in feat/execution-mode-policy). Update the "
+                       "snesrecomp pin to choose a policy here.";
+        return info;
+    }
+
+    fs::path bdir(build_dir.empty() ? "build-release" : build_dir);
+    if (!bdir.is_absolute()) bdir = fs::path(root) / bdir;
+    const fs::path cache = bdir / "CMakeCache.txt";
+    info.cache_path = cache.string();
+
+    if (!fs::is_regular_file(cache, ec)) {
+        info.summary = "Not configured yet — no CMakeCache.txt in " + bdir.string() +
+                       ". The framework default is \"off\" (the faithful floor).";
+        return info;
+    }
+    info.configured = true;
+
+    std::ifstream in(cache);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("SNESRECOMP_EXECUTION_DEFAULT:", 0) == 0) {
+            const size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                info.mode = line.substr(eq + 1);
+                info.from_cache = true;
+            }
+            break;
+        }
+    }
+    if (!info.from_cache) info.mode = "off";
+
+    // Deliberately "starts from", not "runs": SNESRECOMP_EXECUTION_MODE and
+    // SNESRECOMP_FORCE_FLOOR still decide the policy in the launched process,
+    // and a tab that claimed otherwise would be wrong every time someone used
+    // the Env box below.
+    info.summary = "Builds start from policy \"" + info.mode + "\"" +
+                   (info.from_cache ? "" : "  [inferred: option not in cache]") +
+                   ". SNESRECOMP_EXECUTION_MODE / SNESRECOMP_FORCE_FLOOR still "
+                   "override it at launch.";
+    return info;
+}
+
 namespace {
 
 // Score a candidate the way buildops.py's find_runtime_exe() does, so both

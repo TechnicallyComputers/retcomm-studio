@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# build_framework.sh — build the pinned n64lle submodule out of tree, into
+# build-n64lle/, so @PROJECT@'s CMake can link it. Mirrors what n64lle itself
+# does with Ares.
+#
+# Runs at low priority: the family rule is that a build must not starve an
+# interactive machine.
+#
+# ONE FRAMEWORK DEFECT IS WORKED AROUND HERE, FROM THE COMMAND LINE ONLY. It
+# does not edit the submodule, and it belongs upstream in n64lle.
+#
+#   -frounding-math on the whole tree.
+#   runtime/src/interp/fpu.c's round_mode_ll() sets the host rounding mode with
+#   fesetround() and then calls rint(). Without -frounding-math the compiler may
+#   assume round-to-nearest and fold the call, and at -O3 GCC does: n64lle's own
+#   fpu_fixture fails "ceil.w.s 2.5 -> 3" in Release and passes in Debug. That
+#   silently mis-rounds every R4300i ceil/floor/round/trunc and cvt.w/cvt.l in
+#   any optimized build. The A/B that proves it: build twice, once with this
+#   flag and once without, and run fpu_fixture.
+#
+# Usage:
+#   tools/build_framework.sh [Release|Debug]    build (default Release)
+#   tools/build_framework.sh Release --test     build, then run n64lle's suite
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC="$REPO/n64lle"
+BUILD="$REPO/build-n64lle"
+CONFIG="${1:-Release}"
+RUN_TESTS="${2:-}"
+
+if [ ! -f "$SRC/CMakeLists.txt" ]; then
+  echo "n64lle submodule is empty. Run:" >&2
+  echo "  git submodule update --init --recursive" >&2
+  exit 1
+fi
+if [ ! -f "$SRC/recompiler/lib/rabbitizer/include/rabbitizer.h" ]; then
+  echo "rabbitizer (nested submodule) is empty. Run:" >&2
+  echo "  git -C n64lle submodule update --init recompiler/lib/rabbitizer" >&2
+  exit 1
+fi
+
+GEN=()
+command -v ninja >/dev/null 2>&1 && GEN=(-G Ninja)
+
+# n64ref is the Ares oracle frontend. Its CMake links pre-built Ares by
+# hard-coded MinGW .obj paths and defines VK_USE_PLATFORM_WIN32_KHR, so it does
+# not configure off Windows at all. OFF here is a portability fact, not a choice
+# — and it means nothing built by this script is graded against hardware.
+nice -n 15 cmake -S "$SRC" -B "$BUILD" "${GEN[@]}" \
+  -DCMAKE_BUILD_TYPE="$CONFIG" \
+  -DN64LLE_BUILD_N64REF=OFF \
+  -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math" \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -frounding-math"
+
+nice -n 15 cmake --build "$BUILD" -j "$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+if [ "$RUN_TESTS" = "--test" ]; then
+  # The framework's own suite. Anchor-ROM gates SKIP (77) unless the user has
+  # staged n64lle/roms/; the Ares differential gates are absent entirely because
+  # n64ref is off. A green run here does NOT mean the whole suite ran.
+  ( cd "$BUILD" && nice -n 15 ctest -j 4 --output-on-failure )
+fi
+
+echo
+echo "n64lle built into $BUILD ($CONFIG)."
+echo "Now configure this repo:  cmake -S \"$REPO\" -B \"$REPO/build\" -DCMAKE_BUILD_TYPE=$CONFIG"

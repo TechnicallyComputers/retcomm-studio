@@ -6,6 +6,7 @@ tools/new_project_layout/.venv/
 tools/new_project_layout/**/__pycache__/
 tools/new_project_layout/project_studio_repos.json
 tools/new_project_layout/project_studio_repos_snes.json
+tools/new_project_layout/project_studio_repos_n64.json
 tools/new_project_layout/.cache/
 dist/
 build/

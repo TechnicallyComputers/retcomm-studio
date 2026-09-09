@@ -22,6 +22,16 @@ struct RunResult {
     bool ok() const { return exit_code == 0; }
 };
 
+// The last non-empty line of a failed tool's output, capped for a status line.
+//
+// Lives here rather than in a tab because every tab that shells out needs it:
+// the Activity log is collapsible, and a failure nobody can see is a failure
+// that looks like a button doing nothing. It was file-local, and there were
+// already TWO copies (the Frames tab's and the SNES tab's — same body,
+// different comments) before the N64 tab needed a third. That is the kind of
+// duplicate that drifts, so it lives here once now.
+std::string tool_error(const RunResult& r);
+
 // Resolve toolkit dir + python executable into model.
 bool resolve_runtime(StudioModel& model, std::string* err);
 

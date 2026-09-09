@@ -48,6 +48,36 @@ struct DebugToolsInfo {
 // unreadable build dir comes back with configured=false and says so.
 DebugToolsInfo probe_debug_tools(const std::string& root, const std::string& build_dir);
 
+// SNES only: the execution-policy DEFAULT a build was configured with.
+//
+// snesrecomp resolves off/on/force/verify/auto at RUNTIME
+// (runner/src/execution_mode.c); -DSNESRECOMP_EXECUTION_DEFAULT only picks
+// which one a run starts from, and SNESRECOMP_EXECUTION_MODE /
+// SNESRECOMP_FORCE_FLOOR still override it in the launched process. So this
+// probe answers "what does this build default to", not "what will the next
+// run do" — the tab says so rather than implying the stronger claim.
+//
+// `supported` is the load-bearing field. The option landed in snesrecomp on
+// feat/execution-mode-policy; a port pinned to an older framework has no such
+// cache variable, and sending -D for it would earn cmake's "Manually-specified
+// variables were not used by the project" warning — the exact thing the
+// toolchain-repair code takes care to avoid. Read from the port's own pinned
+// runner.cmake, so the answer is about THIS repo rather than about whichever
+// snesrecomp Studio was built beside.
+struct ExecModeInfo {
+    bool supported = false;         // this port's pinned snesrecomp has the option
+    bool configured = false;        // a CMakeCache.txt exists in the build dir
+    bool from_cache = false;        // the value below came from the cache
+    std::string mode;               // "off" | "on" | "force" | "verify" | "auto"
+    std::string cache_path;
+    std::string summary;            // one line, ready to show
+};
+
+// build_dir may be relative to root. Never throws. On a non-SNES port, or a
+// SNES port whose framework predates the option, comes back supported=false
+// with a summary that says which.
+ExecModeInfo probe_exec_mode(const std::string& root, const std::string& build_dir);
+
 // What the GP0 ring can still be asked for, parsed from a gpu_ring_stats reply.
 //
 // This is the replacement for pause/step/run_to_frame, which psx-runtime

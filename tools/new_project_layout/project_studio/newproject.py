@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -11,14 +12,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import platforms, snes_paths
+from . import n64_paths, platforms, snes_paths
 from .gitops import CmdResult, switch_modules
 from .paths import toolkit_dir
 
 # Upper bound on a PSX disc set. Four covers every PS1 release we know of; the
 # setup scripts have no limit of their own, so this is the one place that
-# decides how many rows the UI offers. SNES has no equivalent — a cartridge is
-# one image.
+# decides how many rows the UI offers. The cartridge consoles have no
+# equivalent — a cartridge is one image — which is what PlatformProfile
+# .max_images says, and this constant is now just PSX's answer to it.
 MAX_DISCS = 4
 
 
@@ -73,6 +75,23 @@ class NewProjectOptions:
     multitap: str = ""  # port1 | port2 | both | off; "" = derive from players
     enable_rollback: bool = False
 
+    # --- N64 only ----------------------------------------------------------
+    # n64lle's scaffolder asks for four names where the other two ask for one,
+    # because an n64lle port has no single one that serves: the CMake project
+    # (GloverRecomp), the target prefix every target is built from
+    # (glover-runtime, glover-cosim, glover-generate), and the executable the
+    # player launches (glover) are three different strings. `name` and
+    # `github_repo` carry the first; these carry the rest. Blank means "let the
+    # scaffolder derive it", which is what a terminal run would have offered.
+    n64_slug: str = ""  # target prefix; lowercase [a-z0-9_]
+    n64_exe: str = ""   # executable name; defaults to the slug
+    # The execution-derived discovery window. n64lle harvests what actually ran
+    # rather than following seeds, so these two ARE the coverage decision, and
+    # the scaffolder writes them into game.toml [recompiler] and mirrors them
+    # into CMake. 0 = take the scaffolder's default.
+    harvest_frames: int = 0
+    harvest_step_cap_m: int = 0
+
     dry_run: bool = False
 
 
@@ -110,8 +129,57 @@ def is_snes(opts: "NewProjectOptions") -> bool:
     return opts_platform(opts) == "snes"
 
 
+def is_n64(opts: "NewProjectOptions") -> bool:
+    return opts_platform(opts) == "n64"
+
+
+def _pascal(text: str) -> str:
+    """setup_project.sh's own pascal(): non-alnum to word breaks, then join.
+
+    Reimplemented rather than shelled out to because Studio has to know the
+    destination directory BEFORE the script runs — validate_options refuses a
+    destination that already exists, and it cannot ask a script it has not
+    started. Two implementations of one rule is a drift risk, so this is the
+    only place it is written, and n64_project_name() is the only reader.
+    """
+    parts = re.split(r"[^A-Za-z0-9]+", text or "")
+    return "".join(w[:1].upper() + w[1:] for w in parts if w)
+
+
+def _slugify(text: str) -> str:
+    """setup_project.sh's slugify(): lowercase, then drop everything else."""
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def n64_project_name(opts: "NewProjectOptions") -> str:
+    """The repo / CMake project name — and the directory the scaffold creates.
+
+    n64lle's setup_project.sh creates ``$DIR/$PROJECT``, so on N64 the repo
+    name IS the folder name; there is no separate install_dir slug to sanitise.
+    """
+    repo = (opts.github_repo or "").strip()
+    if repo:
+        return repo
+    return f"{_pascal(opts.name)}Recomp"
+
+
+def n64_slug(opts: "NewProjectOptions") -> str:
+    return (opts.n64_slug or "").strip() or _slugify(opts.name)
+
+
+def n64_exe(opts: "NewProjectOptions") -> str:
+    return (opts.n64_exe or "").strip() or n64_slug(opts)
+
+
 def project_folder_name(opts: NewProjectOptions) -> str:
     """Checkout folder = GitHub/catalog install_dir slug (not display name with spaces)."""
+    # N64 is the exception, and it is the script's rule rather than a
+    # preference: n64lle's setup_project.sh creates "$DIR/$PROJECT" verbatim.
+    # Running install_dir_name() over it here would have Studio watch for a
+    # directory the scaffolder never creates, so the run would "succeed" and
+    # then be reported as a missing project root.
+    if is_n64(opts):
+        return n64_project_name(opts)
     from fill_tokens import install_dir_name, sanitize_github_name
 
     repo = (opts.github_repo or "").strip()
@@ -135,7 +203,9 @@ def project_root_for(opts: NewProjectOptions) -> Path:
 def validate_options(opts: NewProjectOptions) -> list[str]:
     errs: list[str] = []
     snes = is_snes(opts)
+    n64 = is_n64(opts)
     profile = platforms.get(opts_platform(opts))
+    cart = profile.is_cartridge
     name = (opts.name or "").strip()
     disc = (opts.disc or "").strip()
     if not name:
@@ -145,17 +215,22 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
     else:
         p = Path(disc).expanduser()
         if not p.is_file():
-            errs.append(f"{'ROM' if snes else 'Disc'} not found: {disc}")
-        elif snes and p.suffix.lower() not in profile.image_exts:
-            errs.append(f"Not a SNES ROM (expected .sfc / .smc): {p.name}")
+            errs.append(f"{'ROM' if cart else 'Disc'} not found: {disc}")
+        elif cart and p.suffix.lower() not in profile.image_exts:
+            exts = " / ".join(profile.image_exts)
+            errs.append(
+                f"Not a {profile.display} ROM (expected {exts}): {p.name}"
+            )
 
     # Multi-disc is a PSX-only notion: a cartridge is one image.
     extras = [d for d in (opts.extra_discs or [])]
-    if extras and snes:
-        errs.append("A SNES project has one ROM — extra discs do not apply")
+    if extras and profile.max_images <= 1:
+        errs.append(
+            f"A {profile.display} project has one ROM — extra discs do not apply"
+        )
     elif extras:
-        if len(extras) + 1 > MAX_DISCS:
-            errs.append(f"At most {MAX_DISCS} discs are supported")
+        if len(extras) + 1 > profile.max_images:
+            errs.append(f"At most {profile.max_images} discs are supported")
         for i, raw in enumerate(extras, start=2):
             d = (raw or "").strip()
             if not d:
@@ -178,19 +253,38 @@ def validate_options(opts: NewProjectOptions) -> list[str]:
                 errs.append(f"Disc {i} is the same file as disc {seen[key]}: {d}")
             else:
                 seen[key] = i
-    if opts.bios and not snes:
+    if opts.bios and profile.has_bios:
         bp = Path(opts.bios).expanduser()
         if not bp.is_file():
             errs.append(f"BIOS not found: {opts.bios}")
     if opts.players < 1 or opts.players > 8:
         errs.append("Players must be 1–8")
+    if n64:
+        # The N64 has four controller ports and the scaffolder rejects anything
+        # else outright ("players must be 1-4"). Catching it here means the
+        # message names the console instead of arriving as a dead script.
+        if opts.players < 1 or opts.players > 4:
+            errs.append("The Nintendo 64 has four controller ports — players must be 1–4")
+        slug = n64_slug(opts)
+        if not slug or not re.fullmatch(r"[a-z0-9_]+", slug):
+            errs.append(
+                f"Target prefix must be lowercase letters/digits (got {slug!r})"
+            )
+        for label, value in (
+            ("Harvest frames", opts.harvest_frames),
+            ("Harvest step cap", opts.harvest_step_cap_m),
+        ):
+            if value < 0:
+                errs.append(f"{label} cannot be negative")
+        if not n64_paths.setup_script(None).is_file():
+            errs.append("n64lle setup_project.sh not found (no checkout, no vendored copy)")
     if snes:
         tap = (opts.multitap or "").strip().lower()
         if tap and tap not in ("port1", "port2", "both", "off"):
             errs.append("Multitap must be port1 / port2 / both / off")
         if not snes_paths.setup_script(None).is_file():
             errs.append("snesrecomp setup_project.sh not found (no checkout, no vendored copy)")
-    if opts.do_build and not opts.do_generate:
+    if opts.do_build and not opts.do_generate and not n64:
         errs.append("Build requires Generate")
     # Wizard/netplay without UI (and 1P netplay) are auto-corrected at run time.
     vis = (opts.github_visibility or "private").strip().lower()
@@ -281,6 +375,113 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     return cmd, env
 
 
+def build_n64_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
+    """argv + env for n64lle's ``tools/new_project/setup_project.sh``.
+
+    Only the flags that script actually has, and its flag set is the smallest
+    of the three: an unknown option is `exit 2` there, so a habitual
+    --description or --enable-ci from the PSX form would kill the run before it
+    probed the ROM. What it gains instead is the four names an n64lle port
+    needs (project / slug / exe) and the harvest window, none of which the
+    other two consoles have a concept of.
+
+    THERE IS NO --n64lle-ref. The script pins the new project's submodule at
+    the HEAD of the checkout it was run from — "the SHA this scaffold was cut
+    against" — rather than at a ref the caller names. Passing one would be
+    silently ignored, so `opts` carries none and the log says where the pin
+    came from instead.
+    """
+    script = n64_paths.setup_script(None)
+    if not script.is_file():
+        raise FileNotFoundError(f"Missing setup script: {script}")
+
+    env = os.environ.copy()
+
+    cmd: list[str] = [
+        "sh",
+        str(script),
+        "--yes",
+        "--rom",
+        str(Path(opts.disc).expanduser().resolve()),
+        "--name",
+        opts.name.strip(),
+        "--project",
+        n64_project_name(opts),
+        "--slug",
+        n64_slug(opts),
+        "--exe",
+        n64_exe(opts),
+        "--players",
+        str(int(opts.players)),
+        "--dir",
+        str(Path((opts.parent_dir or ".").strip() or ".").expanduser().resolve()),
+    ]
+    # The harvest window. Sent only when set: the scaffolder's own defaults
+    # (900 frames / 3000M steps) are the ones its docs quote, and echoing them
+    # back from here would be a second copy to drift.
+    if opts.harvest_frames > 0:
+        cmd.extend(["--frames", str(int(opts.harvest_frames))])
+    if opts.harvest_step_cap_m > 0:
+        cmd.extend(["--step-cap", str(int(opts.harvest_step_cap_m))])
+    if opts.github_owner:
+        cmd.extend(["--gh-owner", opts.github_owner.strip()])
+
+    # Stage image => --copy-rom. The scaffolder symlinks the dump into roms/ by
+    # default, which is the better answer on this machine; --copy-rom is for a
+    # dump on removable media. Either way no ROM bytes are committed: roms/* is
+    # gitignored in the scaffold.
+    if opts.stage_disc:
+        cmd.append("--copy-rom")
+    # --generate on this scaffolder is the WHOLE pipeline: framework build,
+    # harvest, emit, compile, and ctest. There is no separate --build, so
+    # either switch asking for work maps onto it.
+    cmd.append("--generate" if (opts.do_generate or opts.do_build) else "--no-generate")
+    cmd.append("--git")
+    if opts.create_github:
+        cmd.append("--gh")
+        if (opts.github_visibility or "private").strip().lower() == "public":
+            cmd.append("--public")
+    return cmd, env
+
+
+def n64_ignored_fields(opts: NewProjectOptions) -> list[str]:
+    """Inputs the N64 scaffolder has no flag for.
+
+    Named rather than dropped: they are on screen when Studio runs with --yes,
+    and a scaffold that ignored them without a word looks like it honoured
+    them. Region is here and NOT defaulted — n64lle reads the region out of the
+    cartridge header (`probe_rom.py` -> game.toml [game].region [MEASURED]) and
+    has no flag to override it, which is the right answer and not a gap.
+    """
+    ignored: list[str] = []
+    for label, value in (
+        ("BIOS", opts.bios),
+        ("Boot EXE", opts.boot_exe),
+        ("Zip prefix", opts.zip_prefix),
+        ("Description", opts.description),
+        ("Publisher", opts.publisher),
+        ("Year", opts.year),
+        ("Region", opts.region),
+        ("Lobby URL", opts.lobby_url if opts.enable_netplay else ""),
+    ):
+        if (value or "").strip():
+            ignored.append(label)
+    if opts.enable_netplay or opts.enable_rollback:
+        ignored.append("Netplay")
+    if not opts.enable_recomp_ui:
+        # recomp-ui is not optional in this scaffold: setup_project.sh always
+        # adds the submodule, and the CMake option that skips the launcher
+        # (<SLUG>_BUILD_UI) is a build-time choice in the created repo.
+        ignored.append("Disable recomp-ui")
+    if opts.enable_ci:
+        # n64lle ships no release workflow template, so there is nothing to
+        # emit. Saying so beats a CI tick that quietly does nothing.
+        ignored.append("CI workflow")
+    if opts.fetch_boxart:
+        ignored.append("Boxart")
+    return ignored
+
+
 def snes_ignored_fields(opts: NewProjectOptions) -> list[str]:
     """PSX-only inputs the SNES scaffolder has no flag for.
 
@@ -309,6 +510,8 @@ def build_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, str]]:
     """
     if is_snes(opts):
         return build_snes_command(opts)
+    if is_n64(opts):
+        return build_n64_command(opts)
     sh, ps1 = setup_script_paths()
     env = os.environ.copy()
     env["PSXRECOMP_SETUP_YES"] = "1"
@@ -462,6 +665,11 @@ def run_new_project(
         return CmdResult(False, "Invalid new-project options", "\n".join(errs))
 
     # Match script policy: no UI ⇒ no wizard/netplay; 1P ⇒ no netplay.
+    # On a console whose framework has no netplay at all, the switch is off
+    # before any of that — see PlatformProfile.has_netplay.
+    if not platforms.get(opts_platform(opts)).has_netplay:
+        opts.enable_netplay = False
+        opts.enable_rollback = False
     if not opts.enable_recomp_ui:
         opts.enable_wizard = False
         opts.enable_netplay = False
@@ -469,6 +677,19 @@ def run_new_project(
         opts.enable_netplay = False
         opts.enable_rollback = False
 
+    if is_n64(opts):
+        if on_line:
+            src = n64_paths.wizard_source(None)
+            on_line(f"Using n64lle wizard: {src}")
+            if src == "vendored":
+                on_line(
+                    "note: no n64lle checkout to read a pin from — the new "
+                    "project's n64lle submodule is left at the branch tip. "
+                    "Pin it by hand (see tools/new_project_layout/n64/VENDOR.md)."
+                )
+            ignored = n64_ignored_fields(opts)
+            if ignored:
+                on_line("note: not used by the N64 scaffolder — " + ", ".join(ignored))
     if is_snes(opts):
         if on_line:
             on_line(f"Using snesrecomp wizard: {snes_paths.wizard_source(None)}")

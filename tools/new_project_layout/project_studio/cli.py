@@ -47,7 +47,14 @@ def _print_audit(report, *, as_json: bool) -> int:
     fails = sum(1 for c in report.checks if c.status.value == "fail")
     warns = sum(1 for c in report.checks if c.status.value == "warn")
     print()
-    print(f"Summary: {fails} fail, {warns} warn  (setup-host releases only)")
+    # The release policy is per console, and stating the PSX/SNES one under an
+    # N64 audit would describe a pipeline n64lle does not have.
+    policy = (
+        "local zips only — n64lle ships no release workflow"
+        if platforms.current().key == "n64"
+        else "setup-host releases only"
+    )
+    print(f"Summary: {fails} fail, {warns} warn  ({policy})")
     return 1 if fails else 0
 
 
@@ -90,10 +97,15 @@ def _migration_backend():
     rewrite, none of which exists on SNES. Forcing them through one code path
     would mean a pile of `if platform ==` inside every op.
     """
-    if platforms.current().key == "snes":
+    mod = platforms.current().migrate_module
+    if mod == "snesops":
         from project_studio import snesops
 
         return snesops
+    if mod == "n64ops":
+        from project_studio import n64ops
+
+        return n64ops
     import types
 
     from project_studio import detect, ops as psx_ops, plan as psx_plan
@@ -299,7 +311,11 @@ def cmd_repos_set_cue(args: argparse.Namespace) -> int:
 
     cue = (getattr(args, "cue", None) or "").strip()
     if not cue:
-        label = "ROM (--rom)" if platforms.is_snes() else "disc .cue (--cue)"
+        label = (
+            "ROM (--rom)"
+            if platforms.current().is_cartridge
+            else "disc .cue (--cue)"
+        )
         print(f"error: no {label} given", file=sys.stderr)
         return 2
     args.cue = cue
@@ -532,11 +548,13 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         description=(getattr(args, "description", None) or "").strip(),
         publisher=(getattr(args, "publisher", None) or "").strip(),
         year=(getattr(args, "year", None) or "").strip(),
+        # Blank on the cartridge consoles means "use the header", which is a
+        # better answer than any default Studio could carry: sending a
+        # habitual USA would relabel a Japanese cartridge.
         region=(
-            (getattr(args, "region", None) or "").strip()
-            if platforms.current().key == "snes"
-            else (getattr(args, "region", None) or "USA").strip()
-        ),
+            getattr(args, "region", None)
+            or platforms.current().region_default
+        ).strip(),
         enable_recomp_ui=not bool(getattr(args, "no_recomp_ui", False)),
         enable_wizard=not bool(getattr(args, "no_wizard", False)),
         enable_netplay=bool(getattr(args, "enable_netplay", False)),
@@ -558,12 +576,21 @@ def cmd_new_project(args: argparse.Namespace) -> int:
         recomp_ui_ref=(getattr(args, "recomp_ui_ref", None) or "master").strip(),
         recomp_net_ref=(getattr(args, "recomp_net_ref", None) or "").strip(),
         rbengine_ref=(getattr(args, "rbengine_ref", None) or "").strip(),
+        # --- N64: the names and the harvest window --------------------------
+        # An n64lle port has no single name that serves: project (GloverRecomp),
+        # target prefix (glover-runtime) and executable (glover) are three
+        # different strings. Blank lets the scaffolder derive each, which is
+        # what a terminal run would have offered as the default.
+        n64_slug=(getattr(args, "n64_slug", None) or "").strip(),
+        n64_exe=(getattr(args, "n64_exe", None) or "").strip(),
+        harvest_frames=int(getattr(args, "frames", 0) or 0),
+        harvest_step_cap_m=int(getattr(args, "step_cap", 0) or 0),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
 
-    if bool(getattr(args, "autofill_meta", False)) and platforms.current().key != "snes":
+    if bool(getattr(args, "autofill_meta", False)) and platforms.current().has_disc_meta:
         # Redump/libretro lookup is keyed on disc identity; a cartridge has no
-        # entry there, so on SNES this is skipped rather than failed.
+        # entry there, so on a cartridge console this is skipped, not failed.
         from project_studio.discmeta import apply_hit_to_options, lookup_cue
 
         print("Looking up disc metadata (Redump / libretro / catalog)…", flush=True)
@@ -597,10 +624,80 @@ def cmd_new_project(args: argparse.Namespace) -> int:
     return 0 if ir.ok else 1
 
 
+def _probe_rom_n64(args: argparse.Namespace) -> int:
+    """N64 cartridge identity as JSON, for the GUI's New Project defaults.
+
+    A separate function rather than a flag on the SNES one because the two
+    probes do not share an interface: snesrecomp's writes JSON to a file named
+    by --json-out and prints a human summary to stdout; n64lle's prints JSON to
+    stdout under --json and has no --quiet. Pretending they are one script is
+    how you get an empty dict and a confusing "probe failed".
+    """
+    import json as _json
+    import re as _re
+    import subprocess as _sp
+
+    from project_studio import n64_paths
+
+    rom = Path((getattr(args, "rom", None) or "").strip()).expanduser()
+    if not rom.is_file():
+        print(f"error: ROM not found: {rom}", file=sys.stderr)
+        return 2
+    probe = n64_paths.probe_rom_script(getattr(args, "root", None) or None)
+    if not probe.is_file():
+        print(f"error: probe_rom.py not found ({probe})", file=sys.stderr)
+        return 2
+
+    r = _sp.run(
+        [sys.executable, str(probe), str(rom.resolve()), "--json"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if r.returncode != 0:
+        print(r.stderr or "probe_rom failed", file=sys.stderr)
+        return 1
+    try:
+        data = _json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(r.stderr or "probe_rom produced no JSON", file=sys.stderr)
+        return 1
+
+    # The four names setup_project.sh would offer as defaults, derived by ITS
+    # rules. Studio runs the wizard with --yes, which takes every default
+    # silently, so the page has to show the same values before the run — and
+    # they have to be the same values, not Studio's own idea of a slug.
+    base = _re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", rom.stem).strip()
+    display = base or str(data.get("header_title") or "N64 game")
+    slug = _re.sub(r"[^a-z0-9]+", "", display.lower())
+    project = "".join(
+        w[:1].upper() + w[1:] for w in _re.split(r"[^A-Za-z0-9]+", display) if w
+    ) + "Recomp"
+    data["display_name"] = display
+    data["slug"] = slug
+    data["project"] = project
+    data["exe"] = slug
+    # There is no zip prefix on this console — n64lle ships no packager
+    # template — but the key is present and empty so a caller reading it does
+    # not have to special-case its absence.
+    data["zip_prefix"] = ""
+    data["wizard"] = n64_paths.wizard_source(getattr(args, "root", None) or None)
+    # KI-1 up front. A CIC-6105 cartridge renders black forever on today's
+    # n64lle because its HLE boot zero-fills RSP IMEM; knowing that before
+    # scaffolding is the difference between a known issue and a lost day.
+    if str(data.get("cic") or "") == "CIC-NUS-6105":
+        data["warning"] = (
+            "CIC-6105: n64lle KI-1 applies — the HLE boot zero-fills RSP IMEM "
+            "and this cartridge's IPL3 decrypts IMEM in place, so it renders "
+            "black until the PIF boot FSM lands. See n64lle "
+            "docs/evidence/KNOWN-ISSUES.md."
+        )
+    print(json.dumps(data, indent=2))
+    return 0
+
+
 def cmd_probe_rom(args: argparse.Namespace) -> int:
     """Cartridge identity as JSON, for the GUI's New Project defaults.
 
-    On a terminal snesrecomp's wizard prompts for name / region / description
+    On a terminal each cartridge wizard prompts for name / region / description
     with the probed identity as each default. Studio always runs it with
     --yes, which takes every default silently — so the GUI has to show those
     same values *before* the run, and this is where it gets them.
@@ -610,6 +707,17 @@ def cmd_probe_rom(args: argparse.Namespace) -> int:
     import tempfile as _tf
 
     from project_studio import snes_paths
+
+    profile = platforms.current()
+    if profile.key == "n64":
+        return _probe_rom_n64(args)
+    if not profile.has_image_probe:
+        print(
+            f"error: probe-rom is for the cartridge consoles — {profile.display} "
+            "identity comes from the disc (use lookup-disc-meta).",
+            file=sys.stderr,
+        )
+        return 2
 
     rom = Path((getattr(args, "rom", None) or "").strip()).expanduser()
     if not rom.is_file():
@@ -1105,6 +1213,8 @@ def cmd_git_module_urls(args: argparse.Namespace) -> int:
             print(f"    local       {r.local_url}")
         if r.origin_url and r.origin_url != r.gitmodules_url:
             print(f"    origin      {r.origin_url}")
+        if r.moved_to:
+            print(f"    moved       that repo now lives at {r.moved_to}")
     return 0
 
 
@@ -1614,10 +1724,17 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     # Each console cross-builds through its own script: the PSX one also
     # cross-compiles two emitters, stages OpenBIOS and drives PSX_NETPLAY, none
     # of which a cartridge has. Same flags, same MINGW_ZIP= final line.
-    if platforms.is_snes():
-        script = _TOOLKIT / "scripts" / "build_windows_mingw_snes.sh"
-    else:
-        script = _TOOLKIT / "scripts" / "build_windows_mingw.sh"
+    profile = platforms.current()
+    if not profile.mingw_script:
+        print(
+            f"error: no MinGW cross-build script for {profile.display}. "
+            f"{profile.about_brand} ships none, and psxrecomp's would stage "
+            "OpenBIOS and drive PSX_NETPLAY on a cartridge. Build natively, "
+            "or add the script upstream rather than working around it here.",
+            file=sys.stderr,
+        )
+        return 2
+    script = _TOOLKIT / "scripts" / profile.mingw_script
     if not script.is_file():
         print(f"error: missing {script}", file=sys.stderr)
         return 2
@@ -1641,9 +1758,12 @@ def cmd_build_mingw(args: argparse.Namespace) -> int:
     if getattr(args, "package_only", False):
         cmd.append("--package-only")
     if getattr(args, "setup_host", False):
-        if platforms.is_snes():
-            print("note: --setup-host is a psxrecomp setup-wizard mode; ignored on SNES",
-                  file=sys.stderr)
+        if not platforms.current().has_bios:
+            print(
+                "note: --setup-host is a psxrecomp setup-wizard mode; ignored "
+                f"on {platforms.current().display}",
+                file=sys.stderr,
+            )
         else:
             cmd.append("--setup-host")
     if getattr(args, "package", False) and not getattr(args, "package_only", False):
@@ -1714,11 +1834,12 @@ def cmd_build_configure(args: argparse.Namespace) -> int:
 
 
 def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
-    if platforms.current().key == "snes":
+    profile = platforms.current()
+    if not profile.has_bios:
         print(
-            "error: ensure-bios is psxrecomp-only — a SNES cartridge has no BIOS "
-            "backend and no separate emitter build. Use `build generate` "
-            "(tools/regen.sh) instead.",
+            f"error: ensure-bios is psxrecomp-only — a {profile.display} cartridge "
+            "has no BIOS backend and no separate emitter build. Use "
+            "`build generate` instead.",
             file=sys.stderr,
         )
         return 2
@@ -1739,12 +1860,17 @@ def cmd_build_ensure_bios(args: argparse.Namespace) -> int:
 
 
 def cmd_build_generate(args: argparse.Namespace) -> int:
-    from project_studio.buildops import generate_rom_and_bios, generate_snes_c
+    from project_studio.buildops import (
+        generate_n64_c,
+        generate_rom_and_bios,
+        generate_snes_c,
+    )
 
     root = _root_or_die(args)
     if root is None:
         return 2
-    if platforms.current().key == "snes":
+    kind = platforms.current().generate_kind
+    if kind == "regen-script":
         # --disc carries the ROM path here, same single-image rule as
         # new-project. There is no BIOS half on a cartridge.
         r = generate_snes_c(
@@ -1752,6 +1878,23 @@ def cmd_build_generate(args: argparse.Namespace) -> int:
             rom=getattr(args, "disc", "") or "",
             cfg_roots=bool(getattr(args, "cfg_roots", False)),
             verify=not bool(getattr(args, "no_verify", False)),
+            dry_run=args.dry_run,
+            log=print,
+        )
+        print(f"[{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.detail and not r.ok:
+            print(r.detail)
+        return 0 if r.ok else 1
+    if kind == "cmake-target":
+        # n64lle harvests and emits INSIDE the port's own build graph, so
+        # "generate" is a cmake target rather than a script — and the thing
+        # that must be true first is a built framework, not a CLI vocabulary.
+        # --disc carries the ROM path, as it does on every cartridge console.
+        r = generate_n64_c(
+            root,
+            rom=getattr(args, "disc", "") or "",
+            build_dir=getattr(args, "build_dir", "") or "build-release",
+            build_type=getattr(args, "build_type", "") or "Release",
             dry_run=args.dry_run,
             log=print,
         )
@@ -1774,11 +1917,12 @@ def cmd_build_generate(args: argparse.Namespace) -> int:
 
 
 def cmd_build_ensure_emitters(args: argparse.Namespace) -> int:
-    if platforms.current().key == "snes":
+    profile = platforms.current()
+    if not profile.has_bios:
         print(
-            "error: ensure-emitters is psxrecomp-only — a SNES cartridge has no BIOS "
-            "backend and no separate emitter build. Use `build generate` "
-            "(tools/regen.sh) instead.",
+            f"error: ensure-emitters is psxrecomp-only — a {profile.display} cartridge "
+            "has no BIOS backend and no separate emitter build. Use "
+            "`build generate` instead.",
             file=sys.stderr,
         )
         return 2
@@ -1941,12 +2085,45 @@ def _analyze_run_is_psx_only() -> bool:
     of `analyze` under --platform snes, as this once did, is what left the
     console with no Functions tab at all.
     """
-    if platforms.current().key != "snes":
+    profile = platforms.current()
+    if profile.analysis_kind == "psxrecomp-analyze":
+        return False
+    if profile.analysis_kind == "codegen":
+        print(
+            "error: analyze run wraps psxrecomp-analyze. snesrecomp analyses as "
+            "part of code generation — run tools/regen.sh, which writes "
+            "src/gen/program_manifest.json, then `analyze status` reads it.",
+            file=sys.stderr,
+        )
+        return True
+    print(
+        f"error: {profile.about_brand} has no analysis pass to drive. Its "
+        "discovery is execution-derived and happens inside `build generate` "
+        "(the harvest), and its debug server carries no fn_stats/fn_query — "
+        "so there is no symbol table for Studio to read or edit.",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _analyze_unsupported() -> bool:
+    """True (having said why) when this console has no analysis at all.
+
+    Distinct from _analyze_run_is_psx_only, which is about ONE subcommand on a
+    console that does analyse. Here there is nothing to read: n64lle's
+    discovery is execution-derived inside the harvest, it writes no symbol
+    table a person edits, and its debug server carries only
+    ping/ring_stats/ring_query/help. Refusing at the question is the point —
+    the alternative is an empty Functions tab that looks like a bug.
+    """
+    profile = platforms.current()
+    if profile.has_analysis:
         return False
     print(
-        "error: analyze run wraps psxrecomp-analyze. snesrecomp analyses as part "
-        "of code generation — run tools/regen.sh, which writes "
-        "src/gen/program_manifest.json, then `analyze status` reads it.",
+        f"error: {profile.about_brand} ships no analysis bundle and no symbol "
+        "table, so there is nothing for `analyze` to read or write. Coverage "
+        "on this console is decided by the harvest window in game.toml "
+        "[recompiler], and dispatch misses are read from the run report.",
         file=sys.stderr,
     )
     return True
@@ -1955,6 +2132,8 @@ def _analyze_run_is_psx_only() -> bool:
 def cmd_analyze_status(args: argparse.Namespace) -> int:
     root = _root_or_die(args)
     if root is None:
+        return 2
+    if _analyze_unsupported():
         return 2
     if platforms.is_snes():
         from project_studio.snes_analyzeops import status as snes_status
@@ -2004,6 +2183,8 @@ def cmd_analyze_set_symbol(args: argparse.Namespace) -> int:
     root = _root_or_die(args)
     if root is None:
         return 2
+    if _analyze_unsupported():
+        return 2
     if platforms.is_snes():
         # Not through _parse_pc: it reads a bare "838C" as decimal-or-invalid,
         # and bare hex is how SNES addresses are written everywhere in this
@@ -2044,6 +2225,8 @@ def cmd_analyze_clear_symbol(args: argparse.Namespace) -> int:
     root = _root_or_die(args)
     if root is None:
         return 2
+    if _analyze_unsupported():
+        return 2
     if platforms.is_snes():
         from project_studio.snes_analyzeops import clear_symbol as snes_clear
 
@@ -2065,6 +2248,8 @@ def cmd_analyze_clear_symbol(args: argparse.Namespace) -> int:
 def cmd_analyze_symbols(args: argparse.Namespace) -> int:
     root = _root_or_die(args)
     if root is None:
+        return 2
+    if _analyze_unsupported():
         return 2
     if platforms.is_snes():
         from project_studio.snes_analyzeops import read_symbols as snes_read
@@ -2307,6 +2492,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument("--psxrecomp-ref", "--framework-ref", dest="psxrecomp_ref",
                       default="master")
     p_np.add_argument("--snesrecomp-ref", default="main")
+    # N64. There is deliberately no --n64lle-ref: n64lle's setup_project.sh
+    # pins the new project at the HEAD of the checkout it was run from ("the
+    # SHA this scaffold was cut against") and has no flag to override it, so
+    # offering one here would accept a value nothing reads.
+    p_np.add_argument(
+        "--n64-slug", dest="n64_slug", default="",
+        help="N64: target prefix, lowercase [a-z0-9_] (default: from the name)",
+    )
+    p_np.add_argument(
+        "--n64-exe", dest="n64_exe", default="",
+        help="N64: executable name (default: the slug)",
+    )
+    p_np.add_argument(
+        "--frames", type=int, default=0,
+        help="N64: harvest window in frames (0 = the scaffolder's default, 900)",
+    )
+    p_np.add_argument(
+        "--step-cap", type=int, default=0,
+        help="N64: harvest step cap in millions (0 = the scaffolder's default, 3000)",
+    )
     p_np.add_argument(
         "--multitap",
         choices=("port1", "port2", "both", "off"),
@@ -2999,7 +3204,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_bg = build_sub.add_parser(
         "generate",
-        help="psxrecomp_cli generate: BIOS backends + disc prepare + game C",
+        help=(
+            "Image → C. PSX: psxrecomp_cli (BIOS backends + disc prepare + "
+            "game C). SNES: the project's tools/regen.sh. N64: the project's "
+            "own <slug>-generate CMake target (harvest → emit)."
+        ),
     )
     add_build_root(p_bg)
     p_bg.add_argument(
@@ -3027,6 +3236,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-verify",
         action="store_true",
         help="SNES: skip regen.sh's ROM digest check",
+    )
+    p_bg.add_argument(
+        "--build-type",
+        default="Release",
+        help=(
+            "N64: CMake build type for the harvest/emit configure. Release by "
+            "default because the harvest interprets the real boot for a "
+            "900-frame window — a Debug harvest is not wrong, only very slow."
+        ),
     )
     p_bg.set_defaults(func=cmd_build_generate)
 

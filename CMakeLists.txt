@@ -135,6 +135,8 @@ set(RETCOMM_STUDIO_SOURCES
     src/studio/studio_frames.cpp
     src/studio/studio_frames_data.cpp
     src/studio/studio_debug.cpp
+    src/studio/studio_n64.cpp
+    src/studio/studio_n64_data.cpp
     src/studio/studio_snes.cpp
     src/studio/studio_snes_functions.cpp
     src/studio/studio_snes_data.cpp
@@ -188,6 +190,7 @@ install(DIRECTORY tools/new_project_layout/
         PATTERN "*.pyc" EXCLUDE
         PATTERN "project_studio_repos.json" EXCLUDE
         PATTERN "project_studio_repos_snes.json" EXCLUDE
+        PATTERN "project_studio_repos_n64.json" EXCLUDE
         PATTERN ".cache" EXCLUDE)
 # The PSX analysis tools the Frames tab drives. Deliberately a SIBLING of the
 # toolkit directory, in the source tree and here: gpu_tool_path() resolves them
@@ -249,6 +252,12 @@ target_link_libraries(frames_load_test PRIVATE nlohmann_json::nlohmann_json)
 # also drives a live snesrecomp debug server over the bare line protocol, which
 # is what catches protocol drift between the runtime and this viewer:
 #   ./build/snes_load_test 127.0.0.1 4370
+add_executable(n64_load_test
+    tests/n64_load_test.cpp
+    src/studio/studio_n64_data.cpp
+    src/studio/studio_model.cpp
+)
+
 add_executable(snes_load_test
     tests/snes_load_test.cpp
     src/studio/studio_snes_data.cpp
@@ -259,6 +268,13 @@ target_include_directories(snes_load_test PRIVATE
 target_link_libraries(snes_load_test PRIVATE nlohmann_json::nlohmann_json)
 if(WIN32)
     target_link_libraries(snes_load_test PRIVATE ws2_32)
+endif()
+
+target_include_directories(n64_load_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(n64_load_test PRIVATE nlohmann_json::nlohmann_json)
+if(WIN32)
+    target_link_libraries(n64_load_test PRIVATE ws2_32)
 endif()
 
 # ---- detached-launch test ----------------------------------------------------
@@ -303,11 +319,12 @@ add_executable(json_null_test
 target_include_directories(json_null_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(json_null_test PRIVATE nlohmann_json::nlohmann_json)
 
-# ---- platform-split test (Python) --------------------------------------------
-# The SNES half of Studio is decided in the toolkit, not in C++: which repo
-# index, which framework submodule, which scaffolder, and the SNES migration
-# ops themselves. It needs no GPU and no game — only git and a temp dir:
+# ---- platform-split tests (Python) -------------------------------------------
+# The cartridge halves of Studio are decided in the toolkit, not in C++: which
+# repo index, which framework submodule, which scaffolder, and each console's
+# migration ops. They need no GPU and no game — only git and a temp dir:
 #   python3 tests/snes_platform_test.py
+#   python3 tests/n64_platform_test.py
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_custom_target(snes_platform_test
@@ -315,6 +332,12 @@ if(Python3_Interpreter_FOUND)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/snes_platform_test.py"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Running SNES platform-split test"
+        VERBATIM)
+    add_custom_target(n64_platform_test
+        COMMAND ${Python3_EXECUTABLE}
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/n64_platform_test.py"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Running N64 platform-split test"
         VERBATIM)
 endif()
 

@@ -1,6 +1,7 @@
 #include "studio/studio_model.hpp"
 #include "studio/studio_runner.hpp"
 #include "studio/studio_frames.hpp"
+#include "studio/studio_n64.hpp"
 #include "studio/studio_snes.hpp"
 #include "studio/studio_functions.hpp"
 #include "studio/studio_theme.hpp"
@@ -1077,6 +1078,57 @@ void draw_snes_icon(ImDrawList* dl, const ImVec2& p, float w, float h) {
     }
 }
 
+void draw_n64_icon(ImDrawList* dl, const ImVec2& p, float w, float h) {
+    const ImVec4 box = fit_icon_box(p, w, h);
+    const float x = box.x, y = box.y, bw = box.z, bh = box.w;
+
+    const ImU32 body = IM_COL32(64, 64, 66, 255);
+    const ImU32 body_dk = IM_COL32(44, 44, 46, 255);
+    const ImU32 body_lt = IM_COL32(86, 86, 89, 255);
+    const ImU32 slot = IM_COL32(26, 26, 27, 255);
+    const ImU32 hole = IM_COL32(30, 30, 31, 255);
+    // The four port colours, which is the one cue that reads as "N64" at this
+    // size the way the purple buttons read as "SNES".
+    const ImU32 ports[4] = {
+        IM_COL32(196, 60, 56, 255),   // red
+        IM_COL32(232, 176, 52, 255),  // yellow
+        IM_COL32(58, 138, 200, 255),  // blue
+        IM_COL32(70, 164, 92, 255),   // green
+    };
+
+    const ImVec2 a(x, y);
+    const ImVec2 b(x + bw, y + bh * 0.88f);
+    dl->AddRectFilled(a, b, body, bh * 0.16f);
+
+    // The trapezoid deck: the N64's silhouette is a rounded block whose top is
+    // narrower than its base, with the cartridge slot cut into the middle.
+    dl->AddRectFilled(ImVec2(x + bw * 0.16f, y + bh * 0.04f),
+                      ImVec2(x + bw * 0.84f, y + bh * 0.58f), body_dk, bh * 0.13f);
+    dl->AddRectFilled(ImVec2(x + bw * 0.20f, y + bh * 0.06f),
+                      ImVec2(x + bw * 0.80f, y + bh * 0.54f), body_lt, bh * 0.13f);
+    dl->AddRectFilled(ImVec2(x + bw * 0.31f, y + bh * 0.15f),
+                      ImVec2(x + bw * 0.69f, y + bh * 0.30f), slot, bh * 0.02f);
+
+    // Vent ribs on both shoulders, as on the SNES card.
+    for (int i = 0; i < 4; ++i) {
+        const float ry = y + bh * (0.10f + 0.11f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(x + bw * 0.03f, ry),
+                          ImVec2(x + bw * 0.13f, ry + bh * 0.045f), body_dk, bh * 0.02f);
+        dl->AddRectFilled(ImVec2(x + bw * 0.87f, ry),
+                          ImVec2(x + bw * 0.97f, ry + bh * 0.045f), body_dk, bh * 0.02f);
+    }
+
+    // FOUR controller ports along the front — the console's own headline
+    // feature, and what distinguishes this card from the SNES's two.
+    for (int i = 0; i < 4; ++i) {
+        const float cx = x + bw * (0.20f + 0.20f * static_cast<float>(i));
+        dl->AddRectFilled(ImVec2(cx - bw * 0.065f, b.y - bh * 0.21f),
+                          ImVec2(cx + bw * 0.065f, b.y - bh * 0.04f), hole, bh * 0.07f);
+        dl->AddRectFilled(ImVec2(cx - bw * 0.045f, b.y - bh * 0.19f),
+                          ImVec2(cx + bw * 0.045f, b.y - bh * 0.15f), ports[i], bh * 0.02f);
+    }
+}
+
 // One big pickable card. Returns true when clicked.
 bool platform_card(StudioModel& model, const Theme& th, Platform which, const char* title,
                    const char* subtitle, const ImVec2& size) {
@@ -1100,10 +1152,11 @@ bool platform_card(StudioModel& model, const Theme& th, Platform which, const ch
     const float icon_w = size.x - pad * 2.f;
     const float icon_h = size.y * 0.46f;
     const ImVec2 icon_at(lo.x + pad, lo.y + pad);
-    if (which == Platform::SNES)
-        draw_snes_icon(dl, icon_at, icon_w, icon_h);
-    else
-        draw_psx_icon(dl, icon_at, icon_w, icon_h);
+    switch (which) {
+    case Platform::SNES: draw_snes_icon(dl, icon_at, icon_w, icon_h); break;
+    case Platform::N64: draw_n64_icon(dl, icon_at, icon_w, icon_h); break;
+    default: draw_psx_icon(dl, icon_at, icon_w, icon_h); break;
+    }
 
     const float title_w = ImGui::CalcTextSize(title).x;
     dl->AddText(ImVec2(lo.x + (size.x - title_w) * 0.5f, icon_at.y + icon_h + pad * 0.5f),
@@ -1119,10 +1172,14 @@ bool platform_card(StudioModel& model, const Theme& th, Platform which, const ch
 
 void draw_platform_picker(StudioModel& model, const Theme& th) {
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const float card_w = std::clamp(avail.x * 0.30f, 200.f, 300.f);
+    // Three cards now, so the width each may claim shrinks with the count
+    // rather than staying at the two-card figure and overflowing the window.
+    const int card_count = 3;
+    const float card_w = std::clamp(avail.x * 0.22f, 170.f, 280.f);
     const float card_h = card_w * 0.86f;
     const float gap = th.spacing_lg;
-    const float block_w = card_w * 2.f + gap;
+    const float block_w = card_w * static_cast<float>(card_count) +
+                          gap * static_cast<float>(card_count - 1);
 
     const float head_h = ImGui::GetTextLineHeight() * 3.f + th.spacing_lg;
     const float block_h = head_h + card_h + th.spacing_lg + ImGui::GetTextLineHeight() * 2.f;
@@ -1148,6 +1205,10 @@ void draw_platform_picker(StudioModel& model, const Theme& th) {
     if (platform_card(model, th, Platform::PSX, "PlayStation", "psxrecomp",
                       ImVec2(card_w, card_h)))
         chosen = Platform::PSX;
+    ImGui::SameLine(0.f, gap);
+    if (platform_card(model, th, Platform::N64, "Nintendo 64", "n64lle",
+                      ImVec2(card_w, card_h)))
+        chosen = Platform::N64;
 
     ImGui::Dummy(ImVec2(0, th.spacing_md));
     centered("Switch consoles any time from the header.", th.text_muted);
@@ -1155,6 +1216,7 @@ void draw_platform_picker(StudioModel& model, const Theme& th) {
     if (chosen != Platform::None) {
         model.platform = chosen;
         model.platform_pending = false;
+        model.apply_platform_defaults();
         model.append_log(std::string("Platform: ") + platform_display(chosen) + " (" +
                          platform_framework(chosen) + ")");
         model.set_status(std::string(platform_display(chosen)) + " — loading repos…");
@@ -1255,6 +1317,12 @@ void draw_git_settings_popup(StudioModel& model, const Theme& th) {
             if (!row.local_url.empty() && row.local_url != row.gitmodules_url)
                 ImGui::TextColored(th.text_muted, ".gitmodules says %s",
                                    row.gitmodules_url.c_str());
+            // That repo changed owner or name. The old URL still works — GitHub
+            // redirects it — so nothing looks broken, and the row would sit
+            // there naming a dead pointer forever unless the dialog says so.
+            if (!row.moved_to.empty())
+                ImGui::TextColored(th.warn, "moved → %s (Reset uses it)",
+                                   row.moved_to.c_str());
             ImGui::TableSetColumnIndex(2);
             ImGui::BeginDisabled(model.busy.load());
             if (ImGui::SmallButton("Reset")) {
@@ -1444,6 +1512,20 @@ void draw_header(StudioModel& model, const Theme& th, SDL_Window* window) {
 void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 110.f;
     const bool snes = model.is_snes();
+    if (model.is_n64()) {
+        wrapped(th.text_muted,
+                "Brings an N64 port up to the n64lle scaffold: submodules, .gitignore, "
+                "untracked generated C and ROM bytes, the scaffold stubs, and "
+                "framework_pins.txt.");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "It will NOT rewrite game.toml, CMakeLists.txt, README.md or "
+                "docs/STATUS.md. game.toml is the hand-maintained contract whose "
+                "[MEASURED] tags are only worth something because no program writes it, "
+                "and STATUS.md is the honesty ledger — a fresh one asserts that nothing "
+                "has been measured.");
+        ImGui::Spacing();
+    }
     if (snes) {
         ImGui::TextColored(th.text_muted,
                            "Brings a SNES port up to the snesrecomp scaffold: submodules, "
@@ -1464,7 +1546,11 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     if (disc_typed) persist_selected_image(model);
 
     // Options rows — Players combo (wider than old +/-) + zip field.
-    {
+    // Both are absent on N64: n64ops reads neither. Players only ever gated
+    // netplay, which n64lle does not have, and there is no packager to give a
+    // zip a prefix. A control that reaches no op is worse than no control —
+    // it reads as a setting that was applied.
+    if (!model.is_n64()) {
         left_label("Players", kLabelW);
         if (players_combo("##players", &model.players, 140.f)) {
             if (model.players < 2) model.migrate_netplay = false;
@@ -1480,9 +1566,14 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SetNextItemWidth(zw);
         ImGui::InputText("##zip", model.zip_prefix, sizeof(model.zip_prefix));
     }
-    field_row("##gh_owner", "GitHub owner", model.github_owner, sizeof(model.github_owner),
-              kLabelW);
-    field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo), kLabelW);
+    // GitHub owner/repo feed the README + About patch, which n64lle has no
+    // template for and n64ops therefore has no op for.
+    if (!model.is_n64()) {
+        field_row("##gh_owner", "GitHub owner", model.github_owner,
+                  sizeof(model.github_owner), kLabelW);
+        field_row("##gh_repo", "GitHub repo", model.github_repo, sizeof(model.github_repo),
+                  kLabelW);
+    }
 
     // Every checkbox reaches an op on both consoles now. Netplay maps to
     // enable_netplay / snes_enable_netplay (build-side wiring; on SNES the
@@ -1492,7 +1583,16 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     // snes_patch_readme_metrics, and unlike the others it also silences the
     // matching audit row: a port that writes its own README should not have to
     // read a warning about it on every run.
-    if (!snes) {
+    // On N64 none of the four exist: n64lle has no netplay, no release
+    // workflow, no packager and no README template, and its game.toml is
+    // hand-maintained — so there is no probe-and-rewrite op either. Only the
+    // two that govern how the plan is APPLIED remain.
+    if (model.is_n64()) {
+        model.migrate_netplay = false;
+        model.migrate_ci = false;
+        model.migrate_probe = false;
+        model.migrate_readme = false;
+    } else if (!snes) {
         checkbox_wrapped("Netplay", &model.migrate_netplay);
         checkbox_wrapped("CI", &model.migrate_ci);
         checkbox_wrapped("Probe disc", &model.migrate_probe);
@@ -1506,6 +1606,11 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
     checkbox_wrapped("Dry-run", &model.migrate_dry_run);
     checkbox_wrapped("Force", &model.migrate_force);
     end_wrapped_line();
+    if (model.is_n64()) {
+        wrapped(th.text_muted,
+                "No Netplay / CI / Probe / README options here: n64lle has none of "
+                "those, so a tick would reach no op.");
+    }
 
     accent_button(th);
     if (ImGui::Button("Audit + Plan")) do_audit_plan(model);
@@ -1579,12 +1684,27 @@ void draw_migrate(StudioModel& model, const Theme& th, SDL_Window* window) {
 void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 110.f;
     const bool snes = model.is_snes();
+    const bool n64 = model.is_n64();
+    const bool cart = model.is_cartridge();
     // First visit: load default module branch lists (ls-remote).
     if (model.branches_psx.empty() && !model.branches_loading)
         refresh_branches(model, false);
     ImGui::BeginChild("##np_scroll", ImVec2(0, 0), ImGuiChildFlags_None,
                       ImGuiWindowFlags_None);
     ImGui::BeginDisabled(model.busy.load());
+    if (n64) {
+        wrapped(th.text_muted,
+                "Drives n64lle's tools/new_project/setup_project.sh: probe the cartridge, "
+                "lay out the repo, wire n64lle + recomp-ui, write game.toml, then "
+                "generate / build / publish. The dump is probed where it lies and linked "
+                "into roms/, never copied into git.");
+        ImGui::Spacing();
+        wrapped(th.text_muted,
+                "The new repo carries no host/: the launcher, input, audio and run loop "
+                "come from ONE n64lle_add_runtime_target() call, so host fixes reach it "
+                "on a submodule bump.");
+        ImGui::Spacing();
+    }
     if (snes) {
         ImGui::TextColored(th.text_muted,
                            "Drives snesrecomp's tools/new_project/setup_project.sh: probe the "
@@ -1598,9 +1718,9 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         pick_folder(model, window, "np_parent");
     field_row("##np_name", "Name", model.np_name, sizeof(model.np_name), kLabelW);
     // A cartridge is one image, so the whole disc-set group is PSX-only. On
-    // SNES np_disc carries the ROM and the count is pinned to 1.
-    if (snes) model.np_disc_count = 1;
-    if (!snes) {
+    // both cartridge consoles np_disc carries the ROM and the count is 1.
+    if (cart) model.np_disc_count = 1;
+    if (!cart) {
         left_label("Discs", kLabelW);
         char disc_preview[8];
         std::snprintf(disc_preview, sizeof(disc_preview), "%d", model.np_disc_count);
@@ -1628,7 +1748,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     }
     {
         // With a set, the first field is "Disc 1" rather than just "Disc .cue".
-        const char* disc1_label = (!snes && model.np_disc_count > 1)
+        const char* disc1_label = (!cart && model.np_disc_count > 1)
                                       ? "Disc 1 (.cue)"
                                       : platform_image_label(model.platform);
         if (path_row("##np_disc", disc1_label, model.np_disc, sizeof(model.np_disc),
@@ -1636,7 +1756,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             pick_file(model, window, "np_disc", platform_image_filter_name(model.platform),
                       platform_image_filter_ext(model.platform));
     }
-    if (!snes) {
+    if (!cart) {
         for (int i = 0; i + 1 < model.np_disc_count && i < StudioModel::kMaxDiscs - 1; ++i) {
             char row_id[32], browse_id[32], label[32], target[32];
             std::snprintf(row_id, sizeof(row_id), "##np_disc%d", i + 2);
@@ -1651,7 +1771,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         }
     }
     // A cartridge boots from its own reset vector: there is no BIOS to supply.
-    if (!snes) {
+    if (!cart) {
         if (path_row("##np_bios", "BIOS", model.np_bios, sizeof(model.np_bios), kLabelW,
                      "…##np_bios"))
             pick_file(model, window, "np_bios", "BIOS", "bin;rom");
@@ -1664,6 +1784,17 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         else
             model.np_netplay = false;
     }
+    if (n64) {
+        // The console has four ports and the scaffolder rejects anything else
+        // outright. Clamping here means the seat count on screen is one the
+        // run can actually take, rather than one the script dies on.
+        if (model.np_players > 4) model.np_players = 4;
+        if (model.np_players < 1) model.np_players = 1;
+        ImGui::SameLine();
+        ImGui::TextColored(th.text_muted, "four ports; no netplay on n64lle");
+        model.np_netplay = false;
+        model.np_rollback = false;
+    } else {
     // Netplay lives beside the seat count that gates it: a 1-player title
     // cannot opt in, and bumping the count to 2+ suggests it by default.
     ImGui::SameLine();
@@ -1671,6 +1802,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     ImGui::Checkbox("Netplay##np", &model.np_netplay);
     ImGui::EndDisabled();
     if (model.np_players < 2) model.np_netplay = false;
+    }
     if (snes) {
         // Seats above two need a Super Multitap; the script derives a layout
         // from the count, and this only overrides it.
@@ -1684,10 +1816,56 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "titles use), 6–8 use both ports, 1–2 use none.");
         }
     }
-    field_row("##np_zip", "Zip prefix", model.np_zip, sizeof(model.np_zip), kLabelW);
+    // n64lle ships no packager, so there is no zip to prefix.
+    if (!n64)
+        field_row("##np_zip", "Zip prefix", model.np_zip, sizeof(model.np_zip), kLabelW);
     field_row("##np_gh_owner", "GitHub owner", model.np_gh_owner, sizeof(model.np_gh_owner),
               kLabelW);
     field_row("##np_gh_repo", "GitHub repo", model.np_gh_repo, sizeof(model.np_gh_repo), kLabelW);
+    if (n64) {
+        left_label("", kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "Also the CMake project() and the folder created. "
+                           "Blank = <Name>Recomp.");
+        // The other two names. Kept beside the repo name because the three are
+        // read together, and getting one wrong is only visible next to the
+        // other two: GloverRecomp / glover-runtime / glover.
+        field_row("##np_n64_slug", "Target prefix", model.np_n64_slug,
+                  sizeof(model.np_n64_slug), kLabelW);
+        if (model.np_n64_slug[0] == '\0') {
+            left_label("", kLabelW);
+            ImGui::TextColored(th.text_muted,
+                               "Blank = the name, lowercased. Every target is built from "
+                               "it (<slug>-runtime, <slug>-cosim, <slug>-generate).");
+        }
+        field_row("##np_n64_exe", "Executable", model.np_n64_exe, sizeof(model.np_n64_exe),
+                  kLabelW);
+        if (model.np_n64_exe[0] == '\0') {
+            left_label("", kLabelW);
+            ImGui::TextColored(th.text_muted, "Blank = the target prefix.");
+        }
+        // The harvest window IS the coverage decision on this console:
+        // discovery is execution-derived, so what did not run is not emitted.
+        left_label("Harvest", kLabelW);
+        ImGui::SetNextItemWidth(110.f);
+        ImGui::InputInt("##np_n64_frames", &model.np_n64_frames, 0, 0);
+        if (model.np_n64_frames < 0) model.np_n64_frames = 0;
+        ImGui::SameLine();
+        ImGui::TextColored(th.text_muted, "frames");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.f);
+        ImGui::InputInt("##np_n64_stepcap", &model.np_n64_step_cap, 0, 0);
+        if (model.np_n64_step_cap < 0) model.np_n64_step_cap = 0;
+        ImGui::SameLine();
+        ImGui::TextColored(th.text_muted, "M steps");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            ImGui::SetTooltip(
+                "n64lle's discovery is execution-derived: the harvester runs the real\n"
+                "boot on the interpreter and records what executed. This window is\n"
+                "therefore the coverage decision — code outside it is never emitted.\n"
+                "0 takes the scaffolder's defaults (900 frames / 3000M steps).");
+        }
+    }
     // The SNES wizard prompts for these on a terminal, with the probed ROM
     // identity as each default. Studio runs it with --yes, which takes every
     // default silently — so the fields are here, and Probe ROM fills them with
@@ -1703,6 +1881,15 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         field_row("##np_pub", "Publisher", model.np_publisher, sizeof(model.np_publisher),
                   kLabelW);
         field_row("##np_year", "Year", model.np_year, sizeof(model.np_year), kLabelW);
+    } else if (n64) {
+        // Region, description, publisher and year are absent rather than
+        // ignored: n64lle's scaffolder has no flag for any of them, and its
+        // game.toml takes the region straight off the cartridge header as a
+        // [MEASURED] row. A field Studio could not send would look honoured.
+        left_label("Region", kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "From the cartridge header — game.toml [game].region, "
+                           "measured by probe_rom.py.");
     } else {
         field_row("##np_region", "Region", model.np_region, sizeof(model.np_region), kLabelW);
         field_row("##np_desc", "Description", model.np_desc, sizeof(model.np_desc), kLabelW);
@@ -1712,8 +1899,11 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         field_row("##np_lobby", "Lobby", model.np_lobby, sizeof(model.np_lobby), kLabelW);
     }
 
-    checkbox_wrapped("recomp-ui", &model.np_ui);
-    if (!snes) checkbox_wrapped("Wizard", &model.np_wizard);
+    // recomp-ui is not optional on n64lle: setup_project.sh always adds the
+    // submodule, and skipping the launcher is a build-time option in the
+    // created repo (<SLUG>_BUILD_UI), not a scaffolding choice.
+    if (!n64) checkbox_wrapped("recomp-ui", &model.np_ui);
+    if (!cart) checkbox_wrapped("Wizard", &model.np_wizard);
     if (snes) {
         if (ImGui::Checkbox("Rollback", &model.np_rollback)) {
             if (model.np_rollback) model.np_netplay = true;
@@ -1725,13 +1915,21 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 "Delay-sync stays the runtime default; SNES_NET_MODE=rollback opts in.");
         }
     }
-    checkbox_wrapped("CI##np", &model.np_ci);
+    // n64lle ships no release workflow or packager template, so there is no CI
+    // to emit and no boxart step in its scaffolder.
+    if (!n64) checkbox_wrapped("CI##np", &model.np_ci);
+    if (!cart) checkbox_wrapped("Boxart", &model.np_boxart);
     if (!snes) {
-        checkbox_wrapped("Boxart", &model.np_boxart);
-        checkbox_wrapped("Stage", &model.np_stage);
+        // "Stage" on N64 is --copy-rom: the scaffolder SYMLINKS the dump into
+        // roms/ by default, which is the better answer on a machine that keeps
+        // its library locally. Ticking it copies instead, for a dump on
+        // removable media.
+        checkbox_wrapped(n64 ? "Copy ROM" : "Stage", &model.np_stage);
     }
     checkbox_wrapped("Generate", &model.np_generate);
-    checkbox_wrapped("Build##np", &model.np_build);
+    // n64lle's --generate IS the whole pipeline (framework build, harvest,
+    // emit, compile, ctest); there is no separate build switch to offer.
+    if (!n64) checkbox_wrapped("Build##np", &model.np_build);
     checkbox_wrapped("GitHub", &model.np_github);
     end_wrapped_line();
 
@@ -1747,24 +1945,38 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     // branches_psx holds whichever framework this session is on — the CLI
     // returns it under a stable "framework" key precisely so this widget does
     // not have to know which.
-    if (snes) {
+    if (n64) {
+        // No framework ref to choose. n64lle's setup_project.sh pins the new
+        // project at the HEAD of the checkout it was run from — "the SHA this
+        // scaffold was cut against" — and has no flag to override it. A combo
+        // here would accept a value nothing reads.
+        left_label("n64lle ref", kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "Pinned to the n64lle checkout this scaffold is cut from.");
+    } else if (snes) {
         branch_combo("##np_snes", "snesrecomp ref", model.np_snes_ref,
                      sizeof(model.np_snes_ref), kLabelW, model.branches_psx, kBranchW);
     } else {
         branch_combo("##np_psx", "psxrecomp ref", model.np_psx_ref, sizeof(model.np_psx_ref),
                      kLabelW, model.branches_psx, kBranchW);
     }
-    branch_combo("##np_ui", "recomp-ui ref", model.np_ui_ref, sizeof(model.np_ui_ref), kLabelW,
-                 model.branches_ui, kBranchW);
-    branch_combo("##np_net", "recomp-net ref", model.np_net_ref, sizeof(model.np_net_ref),
-                 kLabelW, model.branches_net, kBranchW);
-    branch_combo("##np_rb", "rbengine ref", model.np_rb_ref, sizeof(model.np_rb_ref), kLabelW,
-                 model.branches_rb, kBranchW);
+    if (!n64) {
+        branch_combo("##np_ui", "recomp-ui ref", model.np_ui_ref, sizeof(model.np_ui_ref),
+                     kLabelW, model.branches_ui, kBranchW);
+    }
+    // recomp-net and retcomm-rbengine live inside psxrecomp/snesrecomp; n64lle
+    // vendors neither, so there is no ref to pick.
+    if (platform_has_netplay(model.platform)) {
+        branch_combo("##np_net", "recomp-net ref", model.np_net_ref, sizeof(model.np_net_ref),
+                     kLabelW, model.branches_net, kBranchW);
+        branch_combo("##np_rb", "rbengine ref", model.np_rb_ref, sizeof(model.np_rb_ref),
+                     kLabelW, model.branches_rb, kBranchW);
+    }
 
     // The cartridge equivalent of Autofill meta. Not a metadata *lookup* —
     // there is no Redump entry for a cartridge — but the ROM's own header,
     // which is exactly what the wizard's prompts offer as defaults.
-    if (snes) {
+    if (cart) {
         ImGui::BeginDisabled(!model.np_disc[0]);
         if (ImGui::Button("Probe ROM")) {
             std::vector<std::string> args = {"probe-rom", "--rom", model.np_disc};
@@ -1772,7 +1984,8 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                 model, std::move(args),
                 [&model](RunResult r) {
                     if (!r.ok()) {
-                        model.append_log("[FAIL] Probe failed — is this a SNES ROM?");
+                        model.append_log(std::string("[FAIL] Probe failed — is this a ") +
+                                         platform_display(model.platform) + " ROM?");
                         model.np_probe_note = "probe failed";
                         return;
                     }
@@ -1784,7 +1997,28 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
                                 if (!v.empty()) std::snprintf(buf, n, "%s", v.c_str());
                             }
                         };
+                        // The name every cartridge probe agrees on. Everything
+                        // below it is per-console: the two probes report
+                        // different fields because the two cartridges carry
+                        // different identities, and pretending otherwise is how
+                        // a blank ends up in a scaffolded contract.
                         set(model.np_name, sizeof(model.np_name), "display_name");
+                        if (model.is_n64()) {
+                            set(model.np_gh_repo, sizeof(model.np_gh_repo), "project");
+                            set(model.np_n64_slug, sizeof(model.np_n64_slug), "slug");
+                            set(model.np_n64_exe, sizeof(model.np_n64_exe), "exe");
+                            model.np_probe_note =
+                                j.value("cartid", "?") + ", region " +
+                                j.value("region_label", "?") + ", " + j.value("cic", "?") +
+                                ", " + j.value("byte_order", "?");
+                            model.append_log("Probed " + j.value("header_title", "ROM") +
+                                             ": " + model.np_probe_note);
+                            // KI-1 before a port is scaffolded around it, not
+                            // after a day of debugging a black screen.
+                            const std::string warn = j.value("warning", "");
+                            if (!warn.empty()) model.append_log("[WARN] " + warn);
+                            return;
+                        }
                         set(model.np_snes_region, sizeof(model.np_snes_region), "region");
                         set(model.np_zip, sizeof(model.np_zip), "zip_prefix");
                         set(model.np_gh_repo, sizeof(model.np_gh_repo), "project_name");
@@ -1820,7 +2054,7 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SameLine();
     }
     // Redump / libretro lookup is disc-keyed; a cartridge has no entry.
-    if (!snes && model.np_disc[0] && ImGui::Button("Autofill meta")) {
+    if (!cart && model.np_disc[0] && ImGui::Button("Autofill meta")) {
         retcomm::studio::run_project_studio_async(
             model, {"lookup-disc-meta", "--disc", model.np_disc, "--json"},
             [&model](RunResult r) {
@@ -1864,6 +2098,53 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         } else if (blank_disc) {
             model.append_log("[FAIL] Disc " + std::to_string(blank_disc) +
                              " is empty — pick it, or lower the disc count");
+        } else if (model.is_n64()) {
+            std::vector<std::string> args = {
+                "new-project",
+                "--name", model.np_name,
+                "--dir", model.np_parent,
+                "--rom", model.np_disc,
+                "--players", std::to_string(model.np_players),
+            };
+            // The three names. Sent only when typed: blank means "let the
+            // scaffolder derive it", and echoing its own rule back would be a
+            // second copy of that rule to drift.
+            if (model.np_gh_repo[0]) {
+                args.push_back("--github-repo");   // == the CMake project name
+                args.push_back(model.np_gh_repo);
+            }
+            if (model.np_n64_slug[0]) {
+                args.push_back("--n64-slug");
+                args.push_back(model.np_n64_slug);
+            }
+            if (model.np_n64_exe[0]) {
+                args.push_back("--n64-exe");
+                args.push_back(model.np_n64_exe);
+            }
+            if (model.np_n64_frames > 0) {
+                args.push_back("--frames");
+                args.push_back(std::to_string(model.np_n64_frames));
+            }
+            if (model.np_n64_step_cap > 0) {
+                args.push_back("--step-cap");
+                args.push_back(std::to_string(model.np_n64_step_cap));
+            }
+            if (model.np_gh_owner[0]) {
+                args.push_back("--github-owner");
+                args.push_back(model.np_gh_owner);
+            }
+            // "Copy ROM" — the scaffolder symlinks by default.
+            if (model.np_stage) args.push_back("--stage-disc");
+            // --generate on this scaffolder is the whole pipeline: framework
+            // build, harvest, emit, compile and ctest. There is no separate
+            // build step, so either switch asking for work maps onto it.
+            if (model.np_generate || model.np_build) args.push_back("--generate");
+            if (model.np_github) args.push_back("--create-github");
+            model.append_log("--- New N64 project setup ---");
+            retcomm::studio::run_project_studio_async(model, args, [&model](RunResult r) {
+                model.set_status(r.ok() ? "New project created" : "New project failed");
+                refresh_repos(model);
+            });
         } else if (snes) {
             std::vector<std::string> args = {
                 "new-project",
@@ -2388,7 +2669,7 @@ void draw_bulk(StudioModel& model, const Theme& th) {
     branch_combo("##bulk_game", "game", model.bulk_game_branch, sizeof(model.bulk_game_branch),
                  kLabelW, game_branches, kBranchW);
     ImGui::SameLine();
-    branch_combo("##bulk_psx", model.is_snes() ? "snes" : "psx", model.bulk_psx_branch,
+    branch_combo("##bulk_psx", platform_key(model.platform), model.bulk_psx_branch,
                  sizeof(model.bulk_psx_branch), 36.f, psx_branches, kBranchW);
     branch_combo("##bulk_ui", "ui", model.bulk_ui_branch, sizeof(model.bulk_ui_branch), kLabelW,
                  ui_branches, kBranchW);
@@ -2613,22 +2894,30 @@ void draw_bulk(StudioModel& model, const Theme& th) {
 void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     constexpr float kLabelW = 100.f;
     const bool snes = model.is_snes();
+    const bool n64 = model.is_n64();
+    const bool cart = model.is_cartridge();
     const std::string root = model.selected_root();
-    // psx-runtime is every PSX port's target; a SNES port names its executable
-    // after the project, so leaving the field blank lets the CLI read
-    // project() out of the repo rather than guessing here.
-    if (snes && std::strcmp(model.build_target, "psx-runtime") == 0)
+    // psx-runtime is every PSX port's target. Neither cartridge console has a
+    // constant to use: a SNES port names its executable after the project, and
+    // an N64 port names every target after a slug that appears in neither the
+    // project() name nor the executable (GloverRecomp / glover-runtime /
+    // glover). Leaving the field blank lets the CLI read the right one out of
+    // the repo instead of guessing here.
+    if (cart && std::strcmp(model.build_target, "psx-runtime") == 0)
         model.build_target[0] = '\0';
-    if (!snes && model.build_target[0] == '\0')
+    if (!cart && model.build_target[0] == '\0')
         std::snprintf(model.build_target, sizeof(model.build_target), "psx-runtime");
     ImGui::BeginChild("##build_scroll", ImVec2(0, 0));
     ImGui::BeginDisabled(model.busy.load() || root.empty());
     field_row("##bdir", "Build dir", model.build_dir, sizeof(model.build_dir), kLabelW);
     field_row("##btype", "Build type", model.build_type, sizeof(model.build_type), kLabelW);
     field_row("##btarget", "Target", model.build_target, sizeof(model.build_target), kLabelW);
-    if (snes && model.build_target[0] == '\0') {
+    if (cart && model.build_target[0] == '\0') {
         left_label("", kLabelW);
-        ImGui::TextColored(th.text_muted, "Blank = the CMake project() name in this repo.");
+        ImGui::TextColored(
+            th.text_muted,
+            n64 ? "Blank = the n64lle_add_runtime_target() name in this repo."
+                : "Blank = the CMake project() name in this repo.");
     }
     generator_combo("##bgen", model.build_generator, sizeof(model.build_generator), kLabelW, root,
                     model.build_dir);
@@ -2643,7 +2932,16 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     // SNES has a debug server too — snesrecomp/runner/src/debug_server.c, gated
     // by SNESRECOMP_ENABLE_TRACE instead of PSX_DEBUG_TOOLS. It used to be
     // hidden here on the claim that "the SNES runner does not have one".
-    {
+    if (n64) {
+        // n64lle has no build option here: the rings and the debug server are
+        // always compiled in, and the port's own game.toml [runtime].debug_port
+        // decides whether one listens. Offering a toggle that sends an unused
+        // -D would be a control that does nothing.
+        left_label("Debug tools", kLabelW);
+        ImGui::TextColored(th.text_muted,
+                           "Always built on n64lle; game.toml [runtime].debug_port "
+                           "decides whether a server listens (0 = ephemeral).");
+    } else {
     left_label("Debug tools", kLabelW);
     ImGui::SetNextItemWidth(240.f);
     ImGui::Combo("##bdbgtools", &model.build_debug_tools,
@@ -2674,6 +2972,50 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
     } // Debug-tools toggle: PSX_DEBUG_TOOLS on psxrecomp,
       // SNESRECOMP_ENABLE_TRACE on snesrecomp.
 
+    // ---- execution policy (SNES only) --------------------------------------
+    // snesrecomp layers optimized (HLE) replacements over the faithful LLE
+    // floor, and OPTIMIZATION.md §2 fixes the vocabulary: off/on/force/verify/
+    // auto. -DSNESRECOMP_EXECUTION_DEFAULT chooses which one a build STARTS
+    // from; the policy itself is resolved at runtime, so the Env box below can
+    // still change it without a rebuild. Shown only where the option exists —
+    // psxrecomp and n64lle have no counterpart, and a port pinned to an older
+    // snesrecomp would collect cmake's unused-variable warning.
+    if (snes) {
+        const auto exec = retcomm::studio::probe_exec_mode(root, model.build_dir);
+        left_label("Execution", kLabelW);
+        if (!exec.supported) {
+            ImGui::TextColored(th.text_muted, "%s", exec.summary.c_str());
+        } else {
+            ImGui::SetNextItemWidth(240.f);
+            ImGui::Combo("##bexecmode", &model.build_exec_mode,
+                         "Leave to framework default\0"
+                         "off     — force the faithful floor\0"
+                         "on      — promoted paths, loud fallback\0"
+                         "force   — a fallback is a FAILURE (gate runs)\0"
+                         "verify  — run both, publish the floor\0"
+                         "auto    — promoted when available, else floor\0");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Sets the build's DEFAULT policy (-DSNESRECOMP_EXECUTION_DEFAULT).\n"
+                    "A run can still be pointed elsewhere without rebuilding:\n"
+                    "  SNESRECOMP_EXECUTION_MODE=off|on|force|verify|auto\n"
+                    "  SNESRECOMP_FORCE_FLOOR=1   (beats everything)\n"
+                    "Put either in the Env box below to override a launch.");
+            }
+            left_label("", kLabelW);
+            ImGui::TextColored(th.text_muted, "%s", exec.summary.c_str());
+            if (model.build_exec_mode == 3) {
+                // force makes a fallback fatal. That is a gate policy; a build
+                // left on it will hard-fail a player on the first unsupported
+                // input, so say so here rather than only in cmake's warning.
+                left_label("", kLabelW);
+                ImGui::TextColored(th.warn,
+                                   "force is for gate runs — a fallback to the floor "
+                                   "becomes a failure, not a recovery.");
+            }
+        }
+    }
+
     field_row("##bexe", "Exe", model.build_exe, sizeof(model.build_exe), kLabelW);
     field_row("##bargs", "Launch args", model.build_launch_args, sizeof(model.build_launch_args),
               kLabelW);
@@ -2699,12 +3041,29 @@ void draw_build(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (model.build_debug_tools == 1 || model.build_debug_tools == 2) {
                 const bool on = (model.build_debug_tools == 1);
                 if (!extra.empty()) extra += " ";
-                // Different option name per framework; same meaning to the user.
+                // Different option name per framework; same meaning to the
+                // user. n64lle declares no such option — its rings and debug
+                // server are always built — so on N64 nothing is appended
+                // rather than a define cmake would warn about as unused.
                 if (model.is_snes())
                     extra += on ? "-DSNESRECOMP_ENABLE_TRACE=ON"
                                 : "-DSNESRECOMP_ENABLE_TRACE=OFF";
-                else
+                else if (!model.is_n64())
                     extra += on ? "-DPSX_DEBUG_TOOLS=ON" : "-DPSX_DEBUG_TOOLS=OFF";
+            }
+            // Execution policy default. Index 0 leaves the framework's own
+            // default alone; anything else pins it. Re-probed rather than
+            // trusted from the draw pass, and skipped when the port's pinned
+            // snesrecomp does not declare the option — sending it there would
+            // be a define cmake reports as unused.
+            if (model.is_snes() && model.build_exec_mode > 0) {
+                static const char* kExecModes[] = {"off", "on", "force", "verify", "auto"};
+                const int idx = model.build_exec_mode - 1;
+                if (idx >= 0 && idx < 5 &&
+                    retcomm::studio::probe_exec_mode(root, model.build_dir).supported) {
+                    if (!extra.empty()) extra += " ";
+                    extra += std::string("-DSNESRECOMP_EXECUTION_DEFAULT=") + kExecModes[idx];
+                }
             }
             if (!extra.empty()) {
                 // "--extra=<value>", not two argv entries: cmake args start
@@ -3564,21 +3923,31 @@ int main(int argc, char** argv) {
                 draw_build(model, th, window);
                 ImGui::EndTabItem();
             }
-            // Same two tabs on both consoles, in the same order — find the
-            // functions, then diagnose what they do — but each backed by its
-            // own toolset. PSX reads psxrecomp's analysis bundle and speaks its
-            // debug protocol against DuckStation or Beetle; SNES reads
-            // recomp/symbols.toml and drives tools/snes_analysis over the Mesen
-            // oracle. Different protocols and different tools, not a reskin, so
-            // they stay separate draw functions behind matching labels.
-            if (ImGui::BeginTabItem("Functions")) {
+            // Same two tabs on the two consoles that have them, in the same
+            // order — find the functions, then diagnose what they do — but
+            // each backed by its own toolset. PSX reads psxrecomp's analysis
+            // bundle and speaks its debug protocol against DuckStation or
+            // Beetle; SNES reads recomp/symbols.toml and drives
+            // tools/snes_analysis over the Mesen oracle. Different protocols
+            // and different tools, not a reskin, so they stay separate draw
+            // functions behind matching labels.
+            //
+            // On N64 only FUNCTIONS is absent: discovery is execution-derived
+            // inside the harvest and a port carries no symbol table, so there
+            // is nothing for that tab to read, and the CLI refuses `analyze` on
+            // the same grounds. Diagnostics is present — it drives n64lle's
+            // Ares oracle and its differential gates, which is a different
+            // surface from the runtime debug server whose thinness was the
+            // original reason both were missing.
+            if (model.has_functions_tab() && ImGui::BeginTabItem("Functions")) {
                 if (model.is_snes()) draw_snes_functions(model, th, window);
                 else                 draw_functions(model, th, window);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Diagnostics")) {
-                if (model.is_snes()) draw_snes(model, th, window);
-                else                 draw_frames(model, th, window);
+            if (model.has_diagnostics_tab() && ImGui::BeginTabItem("Diagnostics")) {
+                if (model.is_snes())     draw_snes(model, th, window);
+                else if (model.is_n64()) draw_n64(model, th, window);
+                else                     draw_frames(model, th, window);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();

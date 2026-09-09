@@ -62,29 +62,6 @@ const char* kColourTool = "gpu_colour_parity.py";
 // Defined below, beside oracle_port(): refresh_oracle() runs before it.
 std::string oracle_tool_path(const StudioModel& model, const std::string& root);
 
-// The Activity log is collapsible, and a failure nobody can see is a failure
-// that looks like a button doing nothing. Pull the actual message up into the
-// tab so the tail of stderr is on screen where the click happened.
-std::string tool_error(const RunResult& r) {
-    std::string text = r.stderr_text.empty() ? r.stdout_text : r.stderr_text;
-    // Last non-empty line: python puts the useful part at the end.
-    std::string last;
-    size_t pos = 0;
-    while (pos <= text.size()) {
-        const size_t nl = text.find('\n', pos);
-        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos
-                                                                    : nl - pos);
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-            line.pop_back();
-        if (!line.empty()) last = line;
-        if (nl == std::string::npos) break;
-        pos = nl + 1;
-    }
-    if (last.empty()) last = "exit code " + std::to_string(r.exit_code);
-    if (last.size() > 240) last = last.substr(0, 240) + " …";
-    return last;
-}
-
 void left_label(const char* text, float w) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(text);
