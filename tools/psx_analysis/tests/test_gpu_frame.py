@@ -303,12 +303,37 @@ class OneShotServer:
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
+    @staticmethod
+    def _deliver_before_close(c):
+        """Stop Windows aborting the connection while the reply is in flight.
+
+        closesocket() on Windows resets a connection that still has
+        undelivered data, so a reply bigger than the socket buffer -- a VRAM
+        or frame dump -- reaches the client truncated with ECONNRESET, at a
+        cut that moves from run to run. SO_LINGER makes close() wait for
+        delivery instead.
+
+        The pack format is NOT portable and getting it wrong is worse than
+        omitting it: Windows' struct linger is two u_shorts, so packing it as
+        two ints ("ii") lands l_linger=0 in the low half, which selects an
+        ABORTIVE close and truncates every reply to nothing. POSIX wants two
+        ints, where the default behaviour is already correct.
+        """
+        import socket as _s
+        import struct
+        fmt = "hh" if sys.platform == "win32" else "ii"
+        try:
+            c.setsockopt(_s.SOL_SOCKET, _s.SO_LINGER, struct.pack(fmt, 1, 30))
+        except OSError:
+            pass
+
     def _serve(self):
         while self.running:
             try:
                 c, _ = self.sock.accept()
             except OSError:
                 return
+            self._deliver_before_close(c)
             try:
                 buf = b""
                 while b"\n" not in buf:

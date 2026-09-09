@@ -74,9 +74,14 @@ void test_fixtures() {
     // The raster CSV is the oracle's answer to "at which scanline", so a
     // silently-dropped row is a split that looks like it never happened.
     {
-        const std::string path = "/tmp/.snes_load_test_raster.csv";
+        const std::string path =
+            (fs::temp_directory_path() / ".snes_load_test_raster.csv").string();
         {
             std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (!f) {
+                check(false, "raster csv fixture is writable");
+                return;
+            }
             std::fputs("frame,scanline,hclock,addr,reg,value\n", f);
             std::fputs("2500,0,12,212C,TM,17\n", f);
             std::fputs("2500,96,340,2131,CGADSUB,3F\n", f);
@@ -95,7 +100,8 @@ void test_fixtures() {
         }
         std::remove(path.c_str());
         std::vector<RasterRow> none;
-        check(!load_raster_csv(none, "/tmp/.no_such_raster.csv", &err),
+        check(!load_raster_csv(
+                  none, (fs::temp_directory_path() / ".no_such_raster.csv").string(), &err),
               "a missing csv is an error, not an empty success");
     }
 
@@ -103,9 +109,14 @@ void test_fixtures() {
     // present: a fixture I invent proves only that I can parse my own guess.
     {
         LoopCompare lc;
-        const char* real =
-            "/home/alex/Documents/GitHub/GundamWingEndlessDuelSNESRecomp/"
-            "analysis/diagnostics/loop_compare.json";
+        const char* env = std::getenv("RETCOMM_LOOP_COMPARE");
+        const std::string real =
+            env && *env
+                ? std::string(env)
+                : (fs::path(
+                       "/home/alex/Documents/GitHub/GundamWingEndlessDuelSNESRecomp")
+                   / "analysis" / "diagnostics" / "loop_compare.json")
+                      .string();
         if (fs::exists(real)) {
             check(load_loop_compare(lc, real), "loop_compare: real artifact loads");
             // A partial artifact (one visit) is a legitimate thing to
@@ -117,10 +128,12 @@ void test_fixtures() {
                         (int)lc.visits.size(), (int)lc.diffs.size(),
                         lc.selector.c_str());
         } else {
-            std::printf("  skip  loop_compare: no artifact at %s\n", real);
+            std::printf("  skip  loop_compare: no artifact at %s\n", real.c_str());
         }
         LoopCompare missing;
-        check(!load_loop_compare(missing, "/tmp/.no_such_loop_compare.json"),
+        check(!load_loop_compare(
+                  missing,
+                  (fs::temp_directory_path() / ".no_such_loop_compare.json").string()),
               "loop_compare: a missing file is an error, not an empty success");
         check(!missing.error.empty(), "loop_compare: missing file carries an error");
     }

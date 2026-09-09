@@ -174,6 +174,15 @@ target_link_libraries(retcomm-studio PRIVATE
     retcomm_studio_imgui
     nlohmann_json::nlohmann_json
 )
+# studio_debug.cpp and studio_snes_data.cpp speak Winsock, so the GUI needs
+# ws2_32 exactly as the test targets do. It was missing here and still linked
+# under MSVC, where SDL3's own link interface happens to drag ws2_32 in -- a
+# transitive dependency this target never declared. MinGW's SDL3 does not
+# export it, so the same source failed to link with a wall of undefined
+# WSAStartup/socket/recv. Depend on it directly rather than on a neighbour.
+if(WIN32)
+    target_link_libraries(retcomm-studio PRIVATE ws2_32)
+endif()
 
 if(UNIX AND NOT APPLE)
     set_target_properties(retcomm-studio PROPERTIES INSTALL_RPATH "$ORIGIN/../lib;$ORIGIN")
@@ -230,6 +239,11 @@ add_executable(analysis_load_test
 target_include_directories(analysis_load_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(analysis_load_test PRIVATE nlohmann_json::nlohmann_json)
+# It compiles studio_debug.cpp, so it needs Winsock for the same reason
+# snes_load_test does. Without this the target fails to LINK on Windows only.
+if(WIN32)
+    target_link_libraries(analysis_load_test PRIVATE ws2_32)
+endif()
 
 # ---- Frames tab data-path test ----------------------------------------------
 # studio_frames_data.cpp is ImGui-free for the same reason studio_analysis.cpp
@@ -353,3 +367,6 @@ target_include_directories(debug_client_test PRIVATE
 target_link_libraries(debug_client_test PRIVATE nlohmann_json::nlohmann_json)
 find_package(Threads REQUIRED)
 target_link_libraries(debug_client_test PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(debug_client_test PRIVATE ws2_32)
+endif()

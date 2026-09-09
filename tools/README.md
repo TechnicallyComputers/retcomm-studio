@@ -123,6 +123,52 @@ session reads that *before* opening the source, not after.
 
 ---
 
+## Open runtime-side defect: large replies truncate on Windows
+
+Recorded here because Studio is the half that suffers it and the half that
+reproduces it, but the fix is a hook and so belongs to the runtime, on its own
+branch, per the rule above. Studio cannot work around it: once the peer sends
+RST the missing bytes are gone.
+
+**Symptom.** A reply larger than the socket buffer — `gpu_frame_dump`,
+`read_vram`, any VRAM or frame dump — arrives truncated, at a cut that moves
+from run to run, and the client sees `WSAECONNRESET` (10054). Windows only.
+
+**Cause.** The debug servers are one request per connection: accept, read a
+line, reply, close. `send()` returning means the bytes reached the socket's
+send buffer, not the peer. Windows aborts a close that still has undelivered
+data, so `closesocket()` discards the remainder and resets the connection.
+Linux keeps delivering after close, which is why this has never shown up
+there.
+
+**Fix.** Set `SO_LINGER` on the accepted socket *before* replying; a plain
+close then blocks until delivery completes. A `shutdown()`-then-drain sequence
+before an aborting close is not enough — measured over 45 transfers of 3 MB:
+60% intact unpatched, 69% with shutdown+drain, 100% with `SO_LINGER`.
+
+```c
+struct linger lg = { 1, 30 };   /* on, 30s */
+setsockopt(fd, SOL_SOCKET, SO_LINGER, (const char *)&lg, sizeof lg);
+```
+
+**If you write it in Python, the pack format is not portable and guessing is
+worse than skipping it.** Windows' `struct linger` is two `u_short`, so
+packing two ints puts `l_linger = 0` in the low half — which selects an
+*abortive* close and truncates every reply to nothing. It reads as a much
+worse version of the bug it was meant to fix:
+
+```python
+fmt = "hh" if sys.platform == "win32" else "ii"   # NOT "ii" everywhere
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack(fmt, 1, 30))
+```
+
+**Already fixed on our side of the wire**, so the stubs stop reproducing the
+runtime's bug and the tests mean something on Windows:
+`tests/debug_client_test.cpp` and `psx_analysis/tests/test_gpu_frame.py`, both
+of which deliberately mimic `io_thread_main()`.
+
+---
+
 ## Layout
 
 ```

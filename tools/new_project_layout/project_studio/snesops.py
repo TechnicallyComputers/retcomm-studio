@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -382,7 +383,18 @@ def _run_probe(probe: Path, rom: Path) -> tuple[int, str]:
     human summary to stdout — there is no ``--json`` that puts it on stdout, so
     reading stdout would parse the summary and silently find no digests.
     """
-    python = os.environ.get("PYTHON") or shutil.which("python3") or shutil.which("python")
+    # sys.executable before the PATH lookups, as analyzeops/buildops already
+    # do. On Windows "python3"/"python" resolve to the WindowsApps App
+    # Execution Alias, which is a stub that exits 9009 with a "install from
+    # the Store" notice and writes no --json-out -- so the probe reported no
+    # CRC32/SHA256 and the ROM looked unreadable. The interpreter already
+    # running this toolkit is by definition a working one.
+    python = (
+        os.environ.get("PYTHON")
+        or sys.executable
+        or shutil.which("python3")
+        or shutil.which("python")
+    )
     if not python:
         return 1, ""
     with tempfile.TemporaryDirectory() as td:

@@ -13,6 +13,7 @@ directory needed renaming; nothing about the build was wrong. These tests pin
 the guard that says so, and pin the boundary: spaces are fine, and a Windows
 drive letter is not a colon fault.
 """
+import os
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,17 @@ def main():
     check("Marvel vs. Capcom" in fixed, "the suggestion keeps the title readable")
 
     # ---- the CLI refuses before it reaches CMake ----------------------------
+    # POSIX only, and not for convenience: Windows forbids ':' in a file name
+    # outright, so a hostile root like this one cannot be created there and the
+    # failure it guards against cannot arise. (The drive-letter colon that DOES
+    # occur on Windows is covered above.) The env below is POSIX-shaped too --
+    # a bare PATH of /usr/bin:/bin with no SystemRoot is not a usable Windows
+    # environment.
+    if os.name == "nt":
+        print("  skip  hostile-root CLI refusal (':' is unrepresentable on NTFS)")
+        print("FAILED" if failures else "PASSED")
+        return 1 if failures else 0
+
     with tempfile.TemporaryDirectory() as td:
         hostile = Path(td) / "Some Game: Subtitle"
         hostile.mkdir()

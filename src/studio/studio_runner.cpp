@@ -125,20 +125,30 @@ fs::path find_toolkit_near(const fs::path& start) {
     return {};
 }
 
+// Declared early so find_system_python() can probe an interpreter by RUNNING
+// it. Defined below in the platform fork.
+RunResult run_process(const std::string& exe, const std::vector<std::string>& args,
+                      StudioModel* log_model, bool log_stdout);
+
 std::string find_system_python() {
 #if defined(_WIN32)
-    const char* candidates[] = {"python.exe", "python3.exe", "py.exe"};
+    // py.exe first: it is the real python.org launcher and is never a stub.
+    // The bare names come after it because a default Windows 11 install ships
+    // App Execution Aliases for python.exe / python3.exe under WindowsApps
+    // that only open the Microsoft Store.
+    const char* candidates[] = {"py.exe", "python.exe", "python3.exe"};
 #else
     const char* candidates[] = {"python3", "python"};
 #endif
     for (const char* c : candidates) {
-#if defined(_WIN32)
-        std::string cmd = std::string("where ") + c + " >nul 2>nul";
-        if (std::system(cmd.c_str()) == 0) return c;
-#else
-        std::string cmd = std::string("command -v ") + c + " >/dev/null 2>&1";
-        if (std::system(cmd.c_str()) == 0) return c;
-#endif
+        // Presence is NOT the test. `where python.exe` happily resolves the
+        // Store alias, which then exits 9009 with "Python was not found" on
+        // every call -- so Studio would pick an interpreter that cannot run a
+        // single toolkit command. Execute a trivial program instead: only a
+        // real interpreter exits 0. run_process() is used rather than
+        // std::system() so this costs no console flash in a GUI build.
+        RunResult r = run_process(c, {"-c", "import sys"}, nullptr, false);
+        if (r.ok()) return c;
     }
 #if defined(_WIN32)
     return "python";
@@ -255,6 +265,23 @@ void prepend_env_path(const char* key, const fs::path& value) {
         next += cur;
     }
     setenv(key, next.c_str(), 1);
+#endif
+}
+
+// Every Python this process spawns has to be able to PRINT what it computes.
+// The toolkit and the analysis tools are full of "A -> B" written with U+2192;
+// the Windows console default is cp1252, which cannot encode it, so one such
+// line aborts the tool with UnicodeEncodeError. Set once at startup rather
+// than per-command: the analysis tools go out through run_python_script_async,
+// which does not pass through run_project_studio, so setting it there only
+// covered them when a toolkit command happened to run first.
+void set_python_utf8_env() {
+#if defined(_WIN32)
+    SetEnvironmentVariableA("PYTHONUTF8", "1");
+    SetEnvironmentVariableA("PYTHONIOENCODING", "utf-8");
+#else
+    setenv("PYTHONUTF8", "1", 1);
+    setenv("PYTHONIOENCODING", "utf-8", 1);
 #endif
 }
 
@@ -451,6 +478,7 @@ bool resolve_runtime(StudioModel& model, std::string* err) {
         if (err) *err = "Could not find Project Studio toolkit (tools/new_project_layout).";
         return false;
     }
+    set_python_utf8_env();
     model.toolchain_root = resolve_toolchain_root();
     model.python_exe = find_python();
     model.toolchain_ready = !find_toolchain_python().empty();
@@ -474,13 +502,10 @@ RunResult run_project_studio(StudioModel& model, const std::vector<std::string>&
         }
     }
     prepend_env_path("PYTHONPATH", model.toolkit_dir);
+    set_python_utf8_env();
 #if defined(_WIN32)
-    SetEnvironmentVariableA("PYTHONUTF8", "1");
-    SetEnvironmentVariableA("PYTHONIOENCODING", "utf-8");
     SetEnvironmentVariableA("RETCOMM_STUDIO_TOOLKIT", model.toolkit_dir.string().c_str());
 #else
-    setenv("PYTHONUTF8", "1", 1);
-    setenv("PYTHONIOENCODING", "utf-8", 1);
     setenv("RETCOMM_STUDIO_TOOLKIT", model.toolkit_dir.string().c_str(), 1);
 #endif
 

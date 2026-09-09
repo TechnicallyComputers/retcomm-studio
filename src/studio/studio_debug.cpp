@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cerrno>
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
@@ -39,8 +40,17 @@ struct WsaInit {
     WsaInit() { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); }
 };
 void ensure_wsa() { static WsaInit once; (void)once; }
+// SO_RCVTIMEO expiring is NOT a broken socket -- it just means nothing arrived
+// in the window. Winsock reports it out of band rather than through errno.
+bool recv_timed_out() {
+    const int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK || e == WSAEINTR;
+}
 #else
 void ensure_wsa() {}
+bool recv_timed_out() {
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+}
 #endif
 
 } // namespace
@@ -217,6 +227,7 @@ bool DebugClient::exchange(const std::string& fields, std::string& response) {
 
     // Newline-framed, then the server closes. Read until the line lands or the
     // peer hangs up; a reply with no newline but a clean EOF is still a reply.
+    int stalls = 0;   // consecutive SO_RCVTIMEO windows with nothing arriving
     for (;;) {
         const size_t nl = rx_.find('\n');
         if (nl != std::string::npos) {
@@ -225,14 +236,29 @@ bool DebugClient::exchange(const std::string& fields, std::string& response) {
             return true;
         }
         char buf[1 << 16];
-        const auto n = ::recv(sock_, buf, sizeof(buf), 0);
+        const auto n = ::recv(sock_, buf, static_cast<int>(sizeof(buf)), 0);
         if (n == 0) {
             const bool have = !rx_.empty();
             if (have) response = rx_;
             close_socket();
             return have;
         }
-        if (n < 0) { close_socket(); return false; }
+        if (n < 0) {
+            // A timeout mid-reply used to be fatal, which threw away every byte
+            // already buffered. gpu_frame_dump is megabytes; one pause longer
+            // than SO_RCVTIMEO anywhere in it lost the whole frame and surfaced
+            // as an intermittently "truncated" dump. Keep waiting while the
+            // peer is still feeding us, and only give up once it has gone quiet
+            // for two full windows -- a genuinely dead runtime still cannot
+            // wedge the worker, which is what the timeout is there for.
+            if (recv_timed_out() && stalls < 2) {
+                ++stalls;
+                continue;
+            }
+            close_socket();
+            return false;
+        }
+        stalls = 0;   // progress: the peer is alive and sending
         rx_.append(buf, static_cast<size_t>(n));
         if (rx_.size() > (64u << 20)) { close_socket(); return false; }  // runaway
     }
