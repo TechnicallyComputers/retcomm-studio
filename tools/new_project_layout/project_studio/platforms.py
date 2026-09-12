@@ -155,7 +155,9 @@ SNES = PlatformProfile(
     framework_marker="runner/runner.cmake",
     repo_markers=("recomp",),
     has_bios=False,
-    has_disc_meta=False,
+    # libretro-database keys SNES metadata (publisher, developer, year) by the
+    # ROM's CRC32; discmeta.lookup_rom resolves it, plus the catalog.
+    has_disc_meta=True,
     max_images=1,
     region_default="",
     has_image_probe=True,

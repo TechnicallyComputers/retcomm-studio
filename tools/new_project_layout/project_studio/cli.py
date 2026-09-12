@@ -591,12 +591,17 @@ def cmd_new_project(args: argparse.Namespace) -> int:
     )
 
     if bool(getattr(args, "autofill_meta", False)) and platforms.current().has_disc_meta:
-        # Redump/libretro lookup is keyed on disc identity; a cartridge has no
-        # entry there, so on a cartridge console this is skipped, not failed.
-        from project_studio.discmeta import apply_hit_to_options, lookup_cue
+        # Discs are keyed by Redump digests and serial; cartridges by the ROM's
+        # CRC32 in libretro-database's metadata DATs. Either way the catalog
+        # is consulted first for a marketing description.
+        from project_studio.discmeta import apply_hit_to_options, lookup_cue, lookup_rom
 
-        print("Looking up disc metadata (Redump / libretro / catalog)…", flush=True)
-        hit = lookup_cue(opts.disc)
+        if platforms.current().is_cartridge:
+            print("Looking up ROM metadata (catalog / libretro-database)…", flush=True)
+            hit = lookup_rom(opts.disc)
+        else:
+            print("Looking up disc metadata (Redump / libretro / catalog)…", flush=True)
+            hit = lookup_cue(opts.disc)
         for note in hit.notes:
             print(f"  meta: {note}", flush=True)
         filled = apply_hit_to_options(opts, hit, only_empty=True)

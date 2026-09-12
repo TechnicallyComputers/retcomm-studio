@@ -507,6 +507,81 @@ def lookup_cue(
     return hit
 
 
+def lookup_rom(
+    rom_path: str | Path,
+    *,
+    force_refresh: bool = False,
+) -> DiscMetaHit:
+    """Cartridge counterpart of lookup_cue: digest the ROM, then look it up.
+
+    Publisher, developer and year come from libretro-database's per-system
+    metadata DATs, which are keyed by the ROM's CRC32 -- through the SNES
+    wizard's own fetch_metadata.py, so Studio and a terminal scaffold agree.
+    A marketing description comes only from the local catalog, when it knows
+    the title; libretro has none, which is why the wizard asks for one after.
+    """
+    import hashlib
+    import importlib.util
+    import zlib
+
+    from . import snes_paths
+
+    rom = Path(rom_path).expanduser().resolve()
+    hit = DiscMetaHit(source="none")
+    if not rom.is_file():
+        hit.notes.append(f"ROM not found: {rom}")
+        return hit
+    raw = rom.read_bytes()
+    if len(raw) % 1024 == 512:
+        raw = raw[512:]   # copier header: not part of the image's identity
+        hit.notes.append("512-byte copier header skipped for the digests")
+    crc = "%08x" % (zlib.crc32(raw) & 0xFFFFFFFF)
+    md5 = hashlib.md5(raw).hexdigest()
+    sha1 = hashlib.sha1(raw).hexdigest()
+    hit.crc32, hit.md5, hit.sha1 = crc, md5, sha1
+    # The catalog, by digest -- not lookup_digests(), whose other source is
+    # the Redump PlayStation DAT and whose notes talk about discs.
+    cat = _catalog_hit(crc32=crc, md5=md5, sha1=sha1)
+    if cat:
+        hit.source = "catalog"
+        hit.sources.append("catalog")
+        hit.name = cat.get("name") or ""
+        hit.description = cat.get("description") or ""
+        hit.publisher = cat.get("publisher") or ""
+        hit.year = cat.get("year") or ""
+        hit.region = cat.get("region") or ""
+        hit.notes.append("catalog: matched by ROM digest")
+
+    fetcher = snes_paths.wizard_dir(None) / "fetch_metadata.py"
+    if fetcher.is_file():
+        try:
+            spec = importlib.util.spec_from_file_location("snes_fetch_metadata", fetcher)
+            mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            assert spec and spec.loader
+            spec.loader.exec_module(mod)
+            meta = mod.lookup(crc, force=force_refresh)
+        except Exception as exc:  # network, parse: say so, do not fail the scaffold
+            meta = {}
+            hit.notes.append(f"libretro-database lookup failed: {exc}")
+        if meta:
+            hit.sources.append("libretro-database")
+            if hit.source == "none":
+                hit.source = "libretro-database"
+            hit.name = hit.name or meta.get("name", "")
+            hit.publisher = hit.publisher or meta.get("publisher", "")
+            hit.year = hit.year or str(meta.get("year", ""))
+            hit.notes.append(
+                f"libretro-database: publisher={meta.get('publisher') or '-'} "
+                f"developer={meta.get('developer') or '-'} year={meta.get('year') or '-'}")
+        else:
+            hit.notes.append(f"no libretro-database entry for crc32 {crc}")
+    else:
+        hit.notes.append("fetch_metadata.py not found in the SNES wizard; libretro lookup skipped")
+    if not hit.name:
+        hit.name = re.sub(r"\s*\([^)]*\)\s*", " ", rom.stem).strip()
+    return hit
+
+
 def suggest_project_name(display: str) -> str:
     """Rough folder name from a Redump / catalog title."""
     stem = re.sub(r"\s*\([^)]*\)\s*", " ", display or "")

@@ -4,7 +4,7 @@
 install can scaffold a SNES title without a framework checkout on disk.
 
 - Upstream: <https://github.com/mstan/snesrecomp> — `tools/new_project/`
-- Vendored at: `244ac3e0ffb4257ab35c8e777699d5f3c6382bfd` (2026-09-12)
+- Vendored at: `f572f833c6717816990e67e5aba2201b218c269f` (2026-09-12)
 
 **This copy is the fallback, not the source of truth.** Studio prefers a live
 checkout, in this order:
