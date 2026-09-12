@@ -573,6 +573,11 @@ def lookup_rom(
             hit.notes.append(
                 f"libretro-database: publisher={meta.get('publisher') or '-'} "
                 f"developer={meta.get('developer') or '-'} year={meta.get('year') or '-'}")
+            # The catalog's own description wins; Wikipedia's summary (found
+            # by the No-Intro title the CRC32 resolved to) fills the gap.
+            if not hit.description and meta.get("description"):
+                hit.description = meta["description"]
+                hit.notes.append(f"description: Wikipedia, {meta.get('description_source', '')}")
         else:
             hit.notes.append(f"no libretro-database entry for crc32 {crc}")
     else:
