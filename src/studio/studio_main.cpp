@@ -1910,6 +1910,11 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     // to emit and no boxart step in its scaffolder.
     if (!n64) checkbox_wrapped("CI##np", &model.np_ci);
     if (!cart) checkbox_wrapped("Boxart", &model.np_boxart);
+    // SNES: one step fetches the launcher's boxart (libretro thumbnails) AND
+    // the README's publisher / developer / year (libretro-database, by the
+    // ROM's CRC32) -- the wizard's "Fetch boxart and metadata". Off, the
+    // scaffold says where custom art goes.
+    if (snes) checkbox_wrapped("Fetch boxart + metadata", &model.np_boxart);
     if (!snes) {
         // "Stage" on N64 is --copy-rom: the scaffolder SYMLINKS the dump into
         // roms/ by default, which is the better answer on a machine that keeps
@@ -2183,6 +2188,12 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             if (!model.np_ui) args.push_back("--no-recomp-ui");
             if (model.np_netplay) args.push_back("--enable-netplay");
             if (!model.np_ci) args.push_back("--no-ci");
+            // Boxart + metadata: the wizard fetches both under one flag, and
+            // --autofill-meta lets Studio fill the description from its
+            // catalog (and publisher / year) into the form before the wizard
+            // runs, so what the player typed always wins over what was fetched.
+            if (!model.np_boxart) args.push_back("--no-fetch-boxart");
+            else args.push_back("--autofill-meta");
             if (model.np_generate) args.push_back("--generate");
             if (model.np_build) args.push_back("--enable-build");
             if (model.np_github) args.push_back("--create-github");
