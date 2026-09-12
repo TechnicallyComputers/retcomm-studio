@@ -307,6 +307,9 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
                     data = {}
                 for key, token in (
                     ("crc32", "crc32"),
+                    ("md5", "md5"),
+                    ("sha1", "sha1"),
+                    ("rom_size", "rom_size"),
                     ("sha256", "sha256"),
                     ("display_name", "display_name"),
                     ("mapping", "mapping"),
@@ -332,7 +335,10 @@ def rom_identity(root: Path, rom: str | None = None) -> dict[str, str]:
             ("display_name", "display_name"),
             ("rom_file", "rom_file"),
             ("expected_crc32", "crc32"),
+            ("expected_md5", "md5"),
+            ("expected_sha1", "sha1"),
             ("expected_sha256", "sha256"),
+            ("rom_size", "rom_size"),
             ("mapping", "mapping"),
             ("region", "region"),
         ):
@@ -1139,11 +1145,18 @@ def _template_values(root: Path, opts: MigrateOptions) -> dict[str, str]:
     ident = rom_identity(root, opts.disc)
     if ident.get("display_name"):
         values["DISPLAY_NAME"] = ident["display_name"]
+    # ROM_MD5 / ROM_SHA1 / ROM_SIZE: the identity file carries every digest
+    # the catalog matches on since snesrecomp 7c5fdc5, so the template needs
+    # them; a project that predates them gets "" (the wizard's probe fills
+    # them on the next probe refresh).
     for token, key in (("ROM_CRC32", "crc32"), ("ROM_SHA256", "sha256"),
+                       ("ROM_MD5", "md5"), ("ROM_SHA1", "sha1"), ("ROM_SIZE", "rom_size"),
                        ("ROM_FILE", "rom_file"), ("ROM_MAPPING", "mapping"),
                        ("REGION", "region")):
         if ident.get(key):
-            values[token] = ident[key]
+            values[str(token)] = str(ident[key])
+    for token in ("ROM_MD5", "ROM_SHA1", "ROM_SIZE"):
+        values.setdefault(token, "")
     if values.get("ROM_FILE"):
         values["ROM_SLUG"] = Path(values["ROM_FILE"]).stem
     return values
