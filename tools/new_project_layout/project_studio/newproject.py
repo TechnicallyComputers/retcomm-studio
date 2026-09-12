@@ -394,14 +394,20 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
     def flag(yes: bool, on: str, off: str) -> None:
         cmd.append(on if yes else off)
 
-    # --rollback implies --netplay in the script; keep our argv consistent
+    # Rollback (retcomm-rbengine) is no longer a scaffold choice: the
+    # framework's desktop host links it for every port. enable_rollback is
+    # accepted from older callers and ignored.
     # with that rather than relying on order.
     flag(opts.enable_netplay or opts.enable_rollback, "--netplay", "--no-netplay")
-    flag(opts.enable_rollback, "--rollback", "--no-rollback")
+    if opts.enable_rollback:
+        cmd.append("--rollback")   # the wizard reads it as netplay too
     flag(opts.enable_ci, "--ci", "--no-ci")
     flag(opts.fetch_boxart, "--fetch-boxart", "--no-fetch-boxart")
     flag(opts.do_generate or opts.do_build, "--generate", "--no-generate")
-    flag(opts.do_build, "--build", "--no-build")
+    # The wizard's own build goes to a plain `build/` tree Studio never looks
+    # at; Studio configures and builds its own tree after the scaffold
+    # instead (see run()), so a new project shows up built on the Build tab.
+    flag(False, "--build", "--no-build")
     flag(opts.create_github, "--create-github", "--no-github")
     return cmd, env
 
@@ -800,6 +806,32 @@ def run_new_project(
                 post_notes.append(r.message)
                 if on_line:
                     on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+
+    # Configure and build STUDIO's tree (build-release, the toolchain's deps,
+    # the same path the Build tab takes), not the wizard's `build/`: a
+    # scaffold that "built" into a directory Studio never reads showed up
+    # unconfigured, and the first thing a new project got was a manual
+    # Configure + Build. Only after generate: an empty src/gen is the
+    # framework's own fatal error, said in its own words.
+    if opts.do_build and not is_n64(opts) and root.is_dir():
+        from . import buildops
+
+        if on_line:
+            on_line("== Configure + build (Studio) ==")
+        r = buildops.configure(root, log=on_line)
+        if on_line:
+            on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.ok:
+            r = buildops.build(root, log=on_line)
+            if on_line:
+                on_line(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if not r.ok:
+            return CmdResult(
+                False,
+                f"Created project at {root}, but Studio's build failed: {r.message}",
+                str(root),
+            )
+        post_notes.append(f"built: {buildops.DEFAULT_BUILD_DIR}")
 
     detail = str(root)
     if post_notes:

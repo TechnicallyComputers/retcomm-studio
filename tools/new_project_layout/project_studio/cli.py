@@ -71,6 +71,7 @@ def _options_from_args(args: argparse.Namespace) -> MigrateOptions:
         github_owner=getattr(args, "github_owner", None) or None,
         github_repo=getattr(args, "github_repo", None) or None,
         window_title=args.window_title,
+        game_id=(getattr(args, "game_id", None) or "").strip() or None,
         enable_recomp_ui=not args.no_recomp_ui,
         enable_wizard=not args.no_wizard,
         enable_netplay=args.enable_netplay,
@@ -945,18 +946,21 @@ def cmd_git_status(args: argparse.Namespace) -> int:
     print()
     print("Submodules:")
     for s in st.submodules:
-        mark = "OK" if s.present else "MISSING"
+        # Three states, not two. "OK" for a registered-but-never-cloned module
+        # was the report that disagreed with every --modules op's "checkout
+        # missing" about the same repo.
+        mark = "OK" if s.initialized else ("UNINIT" if s.present else "MISSING")
         print(
-            f"  [{mark}] {s.path:<12} branch={s.branch or '-':<16} "
+            f"  [{mark:^7}] {s.path:<12} branch={s.branch or '-':<16} "
             f"sha={s.sha or '-':<12} {s.url}"
         )
     if st.nested_submodules and st.framework_root != st.root:
         print()
         print(f"Nested (inside {fw}):")
         for s in st.nested_submodules:
-            mark = "OK" if s.present else "MISSING"
+            mark = "OK" if s.initialized else ("UNINIT" if s.present else "MISSING")
             print(
-                f"  [{mark}] {s.path:<22} branch={s.branch or '-':<16} "
+                f"  [{mark:^7}] {s.path:<22} branch={s.branch or '-':<16} "
                 f"sha={s.sha or '-':<12} {s.url}"
             )
     if st.short_status:
@@ -980,6 +984,52 @@ def cmd_git_ensure_submodules(args: argparse.Namespace) -> int:
         recomp_ui_branch=args.recomp_ui_branch,
         dry_run=args.dry_run,
     )
+    failed = 0
+    for r in results:
+        print(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
+        if r.detail:
+            print(f"         {r.detail}")
+        if not r.ok:
+            failed += 1
+    return 1 if failed else 0
+
+
+def cmd_git_init_modules(args: argparse.Namespace) -> int:
+    """Clone the module checkouts a clone without --recurse-submodules skipped.
+
+    Ensure submodules heals this too, on its way through the .gitmodules work.
+    This is the same cure addressed at the symptom by name, so "checkout
+    missing" has one obvious button and one obvious command behind it.
+    """
+    from project_studio.gitops import CmdResult, init_module_checkouts
+
+    root = _root_or_die(args)
+    if root is None:
+        return 2
+    results: list = []
+    # Default to both scopes: a fresh clone is missing the framework AND the
+    # nested modules inside it, and the nested pass only becomes possible once
+    # the framework itself is on disk — so it has to run second, not instead.
+    do_modules = args.modules or not (args.modules or args.nested)
+    do_nested = args.nested or not (args.modules or args.nested)
+    if do_modules:
+        results.extend(init_module_checkouts(root, dry_run=args.dry_run))
+    if do_nested:
+        nested = init_module_checkouts(root, nested=True, dry_run=args.dry_run)
+        # In a real run the pass above has already cloned the framework, and
+        # --recursive brought its nested modules with it, so this resolves. A
+        # dry-run cannot look inside a checkout that does not exist yet, and
+        # printing that as FAIL reads like the op is broken when the only
+        # thing missing is the clone it just said it would make.
+        if args.dry_run and do_modules and not any(r.ok for r in nested):
+            nested = [
+                CmdResult(
+                    True,
+                    "[dry-run] nested modules arrive with --recursive once the "
+                    "framework is cloned",
+                )
+            ]
+        results.extend(nested)
     failed = 0
     for r in results:
         print(f"  [{'OK' if r.ok else 'FAIL'}] {r.message}")
@@ -2038,6 +2088,7 @@ def cmd_build_run(args: argparse.Namespace) -> int:
         root,
         build_dir=args.build_dir,
         exe=Path(args.exe) if args.exe else None,
+        target=getattr(args, "target", "") or "",
         env_text=args.env or "",
         extra_args=extra,
         dry_run=args.dry_run,
@@ -2059,6 +2110,7 @@ def cmd_build_stop(args: argparse.Namespace) -> int:
 def cmd_build_status(args: argparse.Namespace) -> int:
     from project_studio.buildops import (
         detect_host,
+        default_target,
         find_runtime_exe,
         launch_status,
         resolve_build_dir,
@@ -2069,7 +2121,7 @@ def cmd_build_status(args: argparse.Namespace) -> int:
         return 2
     host = detect_host()
     bdir = resolve_build_dir(root, args.build_dir)
-    exe = find_runtime_exe(bdir)
+    exe = find_runtime_exe(bdir, preferred=default_target(root))
     print(f"host:      {host.label} ({host.system})")
     print(f"cmake:     {host.cmake or '(missing)'}")
     print(f"ninja:     {host.ninja or '(missing)'}")
@@ -2305,6 +2357,13 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--github-owner", help="GitHub owner/org for README download badges")
         p.add_argument("--github-repo", help="GitHub repo name for README download badges")
         p.add_argument("--window-title", help="WINDOW_TITLE override")
+        p.add_argument(
+            "--game-id",
+            default="",
+            help="game_id to record in rom_identity.txt — the id a mod "
+            "package's [[target]] matches. Only needed when nothing in the "
+            "repo records one yet; it is read from there when it does.",
+        )
         p.add_argument("--enable-netplay", action="store_true")
         p.add_argument("--disable-netplay", action="store_true",
                        help="Plan the op that removes netplay from the build")
@@ -2526,7 +2585,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_np.add_argument(
         "--enable-rollback",
         action="store_true",
-        help="SNES: build retcomm-rbengine in (implies netplay)",
+        help="accepted and ignored: retcomm-rbengine is part of every SNES desktop host",
     )
     p_np.add_argument("--recomp-ui-ref", default="master")
     p_np.add_argument("--recomp-net-ref", default="")
@@ -2603,6 +2662,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ge.add_argument("--recomp-ui-branch", default="master")
     p_ge.set_defaults(func=cmd_git_ensure_submodules)
+
+    p_gim = git_sub.add_parser(
+        "init-modules",
+        help="Clone registered-but-empty submodule checkouts (fixes "
+        "'checkout missing')",
+    )
+    add_git_root(p_gim)
+    p_gim.add_argument("--modules", action="store_true")
+    p_gim.add_argument("--nested", action="store_true")
+    p_gim.set_defaults(func=cmd_git_init_modules)
 
     p_gen = git_sub.add_parser(
         "ensure-nested",
@@ -3294,6 +3363,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_br = build_sub.add_parser("run", help="Launch product binary with env")
     add_build_root(p_br)
     p_br.add_argument("--exe", default="", help="Override executable path")
+    p_br.add_argument(
+        "--target",
+        default="",
+        help="Product CMake target / executable stem (default: same as Compile)",
+    )
     p_br.add_argument(
         "--env",
         default="",
