@@ -180,12 +180,35 @@ def project_folder_name(opts: NewProjectOptions) -> str:
     # then be reported as a missing project root.
     if is_n64(opts):
         return n64_project_name(opts)
+    if is_snes(opts):
+        # Also the script's rule: snesrecomp's setup_project.sh creates
+        # "$DIR/$PROJECT_NAME" with PROJECT_NAME = probe_rom.project_name(name)
+        # (<Title>SNESRecomp), whatever --github-repo says. Asked of the
+        # wizard that will run, so the two cannot drift; a scaffold Studio
+        # then "could not find" was this rule being guessed as a slug.
+        return snes_project_name(opts)
     from fill_tokens import install_dir_name, sanitize_github_name
 
     repo = (opts.github_repo or "").strip()
     if repo:
         return sanitize_github_name(repo)
     return install_dir_name(opts.name or "")
+
+
+def snes_project_name(opts: "NewProjectOptions") -> str:
+    """<Title>SNESRecomp, from the wizard's own probe_rom.project_name()."""
+    import importlib.util
+
+    probe = snes_paths.wizard_dir(None) / "probe_rom.py"
+    try:
+        spec = importlib.util.spec_from_file_location("snes_probe_rom", probe)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        assert spec and spec.loader
+        spec.loader.exec_module(mod)
+        return str(mod.project_name(opts.name or ""))
+    except Exception:
+        # Same rule, spelled locally, for a toolkit without the wizard.
+        return _pascal(opts.name) + "SNESRecomp"
 
 
 def project_root_for(opts: NewProjectOptions) -> Path:
