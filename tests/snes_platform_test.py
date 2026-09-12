@@ -382,7 +382,11 @@ def test_digest_recovery(root: Path) -> None:
     r = snesops._op_emit_regen(root, MigrateOptions(force=True))
     check(r.ok, f"regen.sh re-emits once digests are known ({r.message})")
     regen = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
-    check("deadbeef" in regen, "the re-emitted regen.sh keeps the original CRC32")
+    # The current template does not embed the digest at all: regen.sh reads
+    # rom_identity.txt through the framework's parser, so a revision bump is
+    # one edit. Either spelling carries the identity forward.
+    check("deadbeef" in regen or "rom_identity.txt" in regen,
+          "the re-emitted regen.sh keeps the original CRC32 (or reads rom_identity.txt)")
     check("@ROM_SHA256@" not in regen, "no ROM token survives the fill")
 
 
@@ -430,7 +434,8 @@ def test_probe_rom(root: Path) -> None:
         check((root / rel).is_file(), f"probe refresh wrote {rel}")
     regen_after = (root / "tools" / "regen.sh").read_text(encoding="utf-8")
     check(ident["crc32"] in regen_after
-          or "identity_get expected_crc32" in regen_after,
+          or "identity_get expected_crc32" in regen_after
+          or "--get expected_crc32" in regen_after,
           "regen.sh either carries the fresh CRC32 or reads it from the file")
 
 _CODEGEN_SETUP_C = """const GameCodegenIdentity kGameCodegenIdentity = {
@@ -1105,9 +1110,13 @@ def test_probe_rom_cli() -> None:
 def test_dispatch_inputs() -> None:
     """`gh workflow run` rejects an --f the workflow does not declare.
 
-    psxrecomp's release.yml takes four dispatch inputs; snesrecomp's takes
-    none and releases off a tag. Sending PSX's four at a SNES repo fails the
-    whole dispatch, so the flags are filtered to what the file declares.
+    psxrecomp's release.yml takes four dispatch inputs. snesrecomp's used to
+    take none and release off a tag; since the 2026-09 re-vendor it declares
+    its own set (publish_release, version, bump, embed_toolchain,
+    toolchain_tag) -- overlapping PSX's on version/bump, and spelling the
+    publish switch differently. Sending PSX's names at a SNES repo would fail
+    the whole dispatch, so the flags are filtered to what the file declares;
+    this pins what each file declares so a drift shows up here first.
     """
     print("release dispatch inputs")
     from project_studio import snes_paths
@@ -1122,10 +1131,11 @@ def test_dispatch_inputs() -> None:
               f"PSX workflow declares version/bump ({sorted(psx_inputs)})")
         check("publish" in psx_inputs, "PSX workflow declares publish")
     if snes_wf.is_file():
-        check(
-            declared_dispatch_inputs(snes_wf) == set(),
-            "SNES workflow declares no dispatch inputs",
-        )
+        snes_inputs = declared_dispatch_inputs(snes_wf)
+        check("version" in snes_inputs and "bump" in snes_inputs,
+              f"SNES workflow declares version/bump ({sorted(snes_inputs)})")
+        check("publish_release" in snes_inputs and "publish" not in snes_inputs,
+              "SNES workflow spells its publish switch publish_release")
 
 
 def test_rom_discovery() -> None:
