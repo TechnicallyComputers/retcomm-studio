@@ -7,7 +7,9 @@
 #
 # Required:
 #   --rom <file.sfc>      Your legally-owned ROM. Probed for identity; never
-#                         copied into the repo.
+#                         copied into the repo. A bare path works too
+#                         (`setup_project.sh game.sfc`), and on a terminal
+#                         with no ROM given, it is the first question.
 #
 # Common:
 #   --dir <parent>        Parent directory for the new repo (default: .)
@@ -20,13 +22,26 @@
 #   --publisher <name>    README metadata
 #   --year <yyyy>         README metadata
 #   --region <code>       Default: from the cartridge header
-#   --github-owner <org>  Default: RetroPortingToolKit
+#   --github-owner <org>  Default: TechnicallyComputers
 #   --github-repo <name>  Default: the project name
+#
+# Always on (no flag): mod packages. Every project builds the loader, the
+#   launcher's Mods page and the netplay mod-set gate, and ships an (initially
+#   empty) mods/preloaded catalog. A build without them cannot exchange mods
+#   with a peer, so it is not something a title gets to skip.
 #
 # Toggles (each has a --no- form):
 #   --netplay / --no-netplay        recomp-net delay-sync (default: off)
 #   --rollback / --no-rollback      retcomm-rbengine rollback (implies netplay)
 #   --ci / --no-ci                  .github/workflows/release.yml (default: on)
+#   --fetch-boxart / --no-fetch-boxart
+#                                   libretro Named_Boxarts art for the launcher
+#                                   (needs the network; asked on a terminal,
+#                                   off when non-interactive)
+#   --recomp-ui / --no-recomp-ui    Dear ImGui pre-boot launcher: ROM picker,
+#                                   verification, display/audio/input settings
+#                                   (default: on). Without it the host still
+#                                   resolves a ROM, just in text mode.
 #   --no-submodules                 skip submodule add/init (offline scaffold;
 #                                   the project will not build until you run
 #                                   git submodule update --init --recursive)
@@ -37,7 +52,11 @@
 #
 # Framework refs:
 #   --snesrecomp-ref <ref>    default: main
-#   --recomp-ui-ref <ref>     default: master (omit with --no-recomp-ui)
+#   --recomp-ui-ref <ref>     default: the branch this framework checkout
+#                             declares in tools/new_project/RECOMP_UI_REF --
+#                             its lobby client compiles against recomp-ui's
+#                             API, so the framework, not this script, says
+#                             which recomp-ui it needs
 #   --recomp-net-ref <ref>    override the nested pin inside snesrecomp
 #   --rbengine-ref <ref>      override the nested pin inside snesrecomp
 #   --snesrecomp-url / --recomp-ui-url
@@ -50,8 +69,10 @@
 # early push produces a second "initial" commit that collides on re-run.
 #
 # Usage:
-#   sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc
+#   sh tools/new_project/setup_project.sh ~/roms/game.sfc
 #   sh tools/new_project/setup_project.sh --rom game.sfc --dir ~/src --yes
+#   sh tools/new_project/setup_project.sh            # asks for the ROM
+# Windows: powershell -File tools\new_project\setup_project.ps1 -Rom game.sfc
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -104,11 +125,27 @@ ROM=""; PARENT="."; NAME=""; PLAYERS=""; MULTITAP=""; ZIP_PREFIX=""
 DESCRIPTION=""; PUBLISHER=""; YEAR=""; REGION_OVERRIDE=""
 SET_NETPLAY=0; SET_ROLLBACK=0; SET_CI=0; SET_RECOMP_UI=0
 SET_GENERATE=0; SET_BUILD=0; SET_GITHUB=0
-GITHUB_OWNER="RetroPortingToolKit"; GITHUB_REPO=""
-ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=0
+GITHUB_OWNER="TechnicallyComputers"; GITHUB_REPO=""
+ENABLE_NETPLAY=0; ENABLE_ROLLBACK=0; ENABLE_CI=1; ENABLE_RECOMP_UI=1
+FETCH_BOXART=0; SET_BOXART=0
 ADD_SUBMODULES=1
 DO_GENERATE=0; DO_BUILD=0; CREATE_GITHUB=0; GITHUB_VISIBILITY="private"
-SNESRECOMP_REF="main"; RECOMP_UI_REF="master"; RECOMP_NET_REF=""; RBENGINE_REF=""
+# Default the framework ref to the branch this checkout is on, for the same
+# reason the URL is derived: a scaffold cut from a checkout should pin the
+# framework that checkout actually has. Hard-coding "main" silently produced
+# projects that could not generate or build whenever the work lived on a
+# branch.
+SNESRECOMP_REF=$(git -C "$FRAMEWORK_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+[ -n "$SNESRECOMP_REF" ] || SNESRECOMP_REF="main"
+# recomp-ui is not a submodule of the framework, but the framework's lobby
+# client is compiled against its header, so the framework declares the ref
+# it needs (tools/new_project/RECOMP_UI_REF) and a pin bump is one edit there.
+# "master" was hard-coded here once, and every netplay project cut with the
+# default failed to compile snes_host_lobby.c against a recomp-ui that had
+# never heard of the lobby mod-transfer callbacks.
+RECOMP_UI_REF=$(sed -n '1{s/[[:space:]]*$//;p}' "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || true)
+[ -n "$RECOMP_UI_REF" ] || RECOMP_UI_REF="master"
+RECOMP_NET_REF=""; RBENGINE_REF=""
 # The framework URL comes from the checkout this script is running out of, so
 # it cannot drift from where snesrecomp actually lives. (It was hard-coded to
 # the wrong org once; deriving it removes the class.)
@@ -139,6 +176,8 @@ while [ $# -gt 0 ]; do
         --recomp-ui) ENABLE_RECOMP_UI=1; SET_RECOMP_UI=1; shift ;;
         --no-recomp-ui) ENABLE_RECOMP_UI=0; SET_RECOMP_UI=1; shift ;;
         --ci) ENABLE_CI=1; SET_CI=1; shift ;;
+        --fetch-boxart) FETCH_BOXART=1; SET_BOXART=1; shift ;;
+        --no-fetch-boxart) FETCH_BOXART=0; SET_BOXART=1; shift ;;
         --no-submodules) ADD_SUBMODULES=0; shift ;;
         --no-ci) ENABLE_CI=0; SET_CI=1; shift ;;
         --generate) DO_GENERATE=1; SET_GENERATE=1; shift ;;
@@ -149,18 +188,44 @@ while [ $# -gt 0 ]; do
         --no-github) CREATE_GITHUB=0; SET_GITHUB=1; shift ;;
         --github-visibility) GITHUB_VISIBILITY=$2; shift 2 ;;
         --snesrecomp-ref) SNESRECOMP_REF=$2; shift 2 ;;
-        --recomp-ui-ref) RECOMP_UI_REF=$2; shift 2 ;;
+        --recomp-ui-ref) RECOMP_UI_REF=$2; SET_RECOMP_UI_REF=1; shift 2 ;;
         --recomp-net-ref) RECOMP_NET_REF=$2; shift 2 ;;
         --rbengine-ref) RBENGINE_REF=$2; shift 2 ;;
         --snesrecomp-url) SNESRECOMP_URL=$2; shift 2 ;;
         --recomp-ui-url) RECOMP_UI_URL=$2; shift 2 ;;
         --yes|-y) ASSUME_YES=1; shift ;;
         -h|--help) usage 0 ;;
-        *) echo "setup_project: unknown flag: $1" >&2; usage 2 ;;
+        -*) echo "setup_project: unknown flag: $1" >&2; usage 2 ;;
+        *)  # A bare argument is the ROM: `setup_project.sh game.sfc`.
+            if [ -n "$ROM" ]; then
+                echo "setup_project: two ROMs given ('$ROM' and '$1');" >&2
+                echo "               a project is cut from exactly one image." >&2
+                exit 2
+            fi
+            ROM=$1; shift ;;
     esac
 done
 
-[ -n "$ROM" ] || { echo "setup_project: --rom is required" >&2; usage 2; }
+# No ROM on the command line: on a terminal it is simply the first question.
+# Anything else (scripts, CI, --yes) has to say what it means.
+if [ -z "$ROM" ]; then
+    if [ "$ASSUME_YES" != "1" ] && is_tty; then
+        echo "A new project is cut from one legally-owned ROM (.sfc/.smc). It is"
+        echo "probed here and never copied into the repository."
+        while :; do
+            prompt_line "Path to the ROM" ROM ""
+            # Shells and file managers hand over quoted or ~-prefixed paths.
+            ROM=$(printf '%s' "$ROM" | sed -e "s/^['\"]//" -e "s/['\"]\$//")
+            case "$ROM" in "~/"*) ROM="$HOME/${ROM#\~/}" ;; esac
+            [ -n "$ROM" ] || { echo "setup_project: a ROM is required" >&2; exit 2; }
+            [ -f "$ROM" ] && break
+            printf '  not found: %s\n' "$ROM" >/dev/tty
+        done
+    else
+        echo "setup_project: --rom <file.sfc> (or a bare path) is required" >&2
+        usage 2
+    fi
+fi
 [ -f "$ROM" ] || { echo "setup_project: ROM not found: $ROM" >&2; exit 1; }
 ROM_ABS=$(CDPATH= cd -- "$(dirname -- "$ROM")" && pwd)/$(basename -- "$ROM")
 
@@ -273,9 +338,19 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     [ -n "$REGION_OVERRIDE" ] || prompt_line "Region" REGION_OVERRIDE "$REGION"
 fi
 [ -z "$REGION_OVERRIDE" ] || REGION="$REGION_OVERRIDE"
+# The id a mod package's [[target]] names (MOD_PACKAGES.md), e.g. gwed-jp.
+# Derived once, recorded in rom_identity.txt, compiled in from there.
+GAME_ID="$ROM_SLUG-$(printf '%s' "$REGION" | tr 'A-Z' 'a-z')"
 
 if [ "$SET_RECOMP_UI" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
-    prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 0
+    prompt_yn "Include the recomp-ui launcher submodule?" ENABLE_RECOMP_UI 1
+fi
+
+# Boxart is a network fetch, so it is asked rather than assumed, and stays off
+# for a non-interactive run unless --fetch-boxart says otherwise -- a script
+# or a test should not reach the internet because a default said so.
+if [ "$ENABLE_RECOMP_UI" -eq 1 ] && [ "$SET_BOXART" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ]; then
+    prompt_yn "Fetch libretro boxart for the launcher now? (needs the network)" FETCH_BOXART 1
 fi
 
 if [ "$PLAYERS" -eq 1 ]; then
@@ -367,6 +442,46 @@ if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
     NETPLAY_BLOCK="$NETPLAY_BLOCK
 snesrecomp_enable_rollback($PROJECT_NAME)"
 fi
+# The pre-boot GUI launcher lives in recomp-ui, so it is wired only when that
+# submodule is present. Without it the host still resolves a ROM (positional ->
+# beside the exe -> rom.cfg -> native picker) — main.c compiles the GUI blocks
+# out on RECOMP_LAUNCHER, which this call is what defines.
+LAUNCHER_BLOCK="# No GUI launcher: this project was scaffolded with --no-recomp-ui.
+# Add the submodule and re-run this block to get one:
+#   git submodule add https://github.com/mstan/recomp-ui.git recomp-ui
+#   set(RECOMP_UI_ROOT \"\${CMAKE_SOURCE_DIR}/recomp-ui\" CACHE PATH \"\" FORCE)
+#   include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
+#   recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes)"
+if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    LAUNCHER_BLOCK="# Shared Dear ImGui pre-boot launcher (ROM picker, verification, display /
+# audio / input settings). Self-contained: it brings its own ImGui, GL link and
+# staged assets, and defines RECOMP_LAUNCHER so src/main.c compiles its GUI path.
+set(RECOMP_UI_ROOT \"\${CMAKE_SOURCE_DIR}/recomp-ui\" CACHE PATH
+    \"Root directory of the recomp-ui launcher repo\" FORCE)
+if(NOT EXISTS \"\${RECOMP_UI_ROOT}/recomp_ui.cmake\")
+    message(FATAL_ERROR
+        \"recomp-ui missing at \${RECOMP_UI_ROOT}.\\n\"
+        \"Run: git submodule update --init --recursive recomp-ui\")
+endif()
+include(\${RECOMP_UI_ROOT}/recomp_ui.cmake)
+# BOXART stages launcher_assets/img/boxart.tga beside the exe; the launcher
+# shows assets/img/boxart.tga by default. EXISTS-guarded in recomp_ui.cmake,
+# so this configures cleanly before any art is fetched.
+recomp_target_launcher_ui($PROJECT_NAME CONSOLE snes
+    BOXART \"\${CMAKE_SOURCE_DIR}/launcher_assets/img/boxart.tga\")
+
+# Generate & rebuild from inside the launcher: pick ROM -> recompile locally
+# -> cmake --build -> relaunch. The implementation is the framework's; this
+# project contributes no configuration (snesrecomp_codegen_host_autowire in
+# src/main.c). recomp-ui/src is on the include path because the host speaks
+# RecompLauncherCGameInfo.
+target_sources($PROJECT_NAME PRIVATE
+    \${SNESRECOMP_ROOT}/host/snesrecomp_codegen_host.c)
+target_include_directories($PROJECT_NAME PRIVATE
+    \${SNESRECOMP_ROOT}/host
+    \${RECOMP_UI_ROOT}/src)"
+fi
+
 MULTITAP_BLOCK="# No multitap: two seats, one controller per port."
 if [ "$MULTITAP" != "off" ]; then
     MULTITAP_BLOCK="# Seats: $PLAYERS. Call RtlSetMultitap() at startup, or launch with
@@ -386,7 +501,12 @@ echo "  rom:        $ROM_FILE ($ROM_MAPPING, $REGION, crc32 $ROM_CRC32)"
 echo "  zip prefix: $ZIP_PREFIX"
 echo "  players:    $PLAYERS (multitap: $MULTITAP)"
 echo "  netplay:    $ENABLE_NETPLAY (rollback: $ENABLE_ROLLBACK)"
-echo "  recomp-ui:  $ENABLE_RECOMP_UI"
+if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    echo "  recomp-ui:  $RECOMP_UI_REF (boxart: $FETCH_BOXART)"
+else
+    echo "  recomp-ui:  no (text-mode host)"
+fi
+echo "  mods:       on (always: loader, Mods page, netplay mod-set gate)"
 echo "  CI:         $ENABLE_CI"
 echo "  generate:   $DO_GENERATE (build: $DO_BUILD)"
 if [ "$CREATE_GITHUB" -eq 1 ]; then
@@ -405,6 +525,7 @@ fi
 # Check the submodule remotes BEFORE creating anything. A URL that resolves to
 # nothing used to fail half way through and leave a partial project directory
 # behind, which is a worse outcome than not starting.
+FRAMEWORK_REF_UNPUSHED=0
 if [ "$ADD_SUBMODULES" -eq 1 ]; then
     echo "== Checking framework remotes =="
     for _pair in "snesrecomp|$SNESRECOMP_URL" "recomp-ui|$RECOMP_UI_URL"; do
@@ -416,6 +537,16 @@ if [ "$ADD_SUBMODULES" -eq 1 ]; then
         esac
         if git ls-remote --exit-code "$_url" HEAD >/dev/null 2>&1; then
             echo "  ok  $_what -> $_url"
+            if [ "$_what" = "snesrecomp" ] &&
+               ! git ls-remote --exit-code --heads "$_url" "$SNESRECOMP_REF" \
+                   >/dev/null 2>&1; then
+                echo "warning: the framework branch '$SNESRECOMP_REF' is not on" >&2
+                echo "         $_url yet." >&2
+                echo "         The scaffold will pin the commit you have locally," >&2
+                echo "         so it builds here but nobody else can clone it" >&2
+                echo "         until that branch is pushed." >&2
+                FRAMEWORK_REF_UNPUSHED=1
+            fi
         else
             echo "setup_project: cannot reach the $_what remote:" >&2
             echo "  $_url" >&2
@@ -461,7 +592,8 @@ cleanup_partial() {
 trap cleanup_partial EXIT
 
 cd "$ROOT"
-mkdir -p recomp src src/gen tools scripts assets .github/workflows
+mkdir -p recomp src src/gen tools scripts assets .github/workflows \
+         mods/preloaded/packages
 git init -q -b "$DEFAULT_BRANCH" .
 
 fill() {
@@ -477,13 +609,14 @@ fill() {
         --set "ROM_SHA256=$ROM_SHA256" \
         --set "REGION=$REGION" \
         --set "REGION_NAME=$REGION_NAME" \
+        --set "GAME_ID=$GAME_ID" \
         --set "COPROCESSOR=$COPROCESSOR" \
         --set "ZIP_PREFIX=$ZIP_PREFIX" \
         --set "PLAYERS=$PLAYERS" \
         --set "PLAYERS_NOTE=$PLAYERS_NOTE" \
         --set "NETPLAY_BLOCK=$NETPLAY_BLOCK" \
+        --set "LAUNCHER_BLOCK=$LAUNCHER_BLOCK" \
         --set "MULTITAP_BLOCK=$MULTITAP_BLOCK" \
-        --set "DEFAULT_BRANCH=$DEFAULT_BRANCH" \
         --set "SETUP_DATE=$SETUP_DATE" \
         --set "DESCRIPTION=$DESCRIPTION_MD" \
         --set "PUBLISHER=$PUBLISHER_DISP" \
@@ -492,22 +625,61 @@ fill() {
         --set "GITHUB_REPO=$GITHUB_REPO"
 }
 
-fill CMakeLists.txt.in   CMakeLists.txt
-fill VERSION.in          VERSION
-fill gitignore.in        .gitignore
-fill README.md.in        README.md
-fill main.c.in           src/main.c
-fill game_rtl.c.in       src/game_rtl.c
-fill game_rtl.h.in       src/game_rtl.h
-fill gen_stubs.c.in      src/gen_stubs.c
-fill variables.h.in      src/variables.h
-fill host_contract.c.in  src/host_contract.c
-fill codegen_setup.c.in  src/codegen_setup.c
-fill codegen_setup.h.in  src/codegen_setup.h
-fill regen.sh.in         tools/regen.sh
-fill package_release.sh.in scripts/package_release.sh
-fill symbols_readme.md.in  recomp/README.md
-chmod +x tools/regen.sh scripts/package_release.sh
+# Every templated file, in one place, so it can be rendered twice: once now
+# from the copy of the wizard that is running, and again below from the
+# framework the project actually pins (see "Rendering from the pinned
+# framework").
+render_templates() {
+    fill CMakeLists.txt.in   CMakeLists.txt
+    fill VERSION.in          VERSION
+    fill gitignore.in        .gitignore
+    fill README.md.in        README.md
+    fill main.c.in           src/main.c
+    fill game_rtl.c.in       src/game_rtl.c
+    fill game_rtl.h.in       src/game_rtl.h
+    fill gen_stubs.c.in      src/gen_stubs.c
+    fill variables.h.in      src/variables.h
+    fill host_contract.c.in  src/host_contract.c
+    fill rom_identity.txt.in rom_identity.txt
+    fill regen.sh.in         tools/regen.sh
+    fill package_release.sh.in scripts/package_release.sh
+    fill symbols_readme.md.in  recomp/README.md
+    chmod +x tools/regen.sh scripts/package_release.sh
+    if [ "$ENABLE_CI" -eq 1 ]; then
+        fill release.yml.in .github/workflows/release.yml
+    fi
+}
+render_templates
+
+# Empty mod catalog. CMakeLists.txt declares it to the framework
+# (snesrecomp_target_mod_catalog), which stages packages/ beside the executable
+# on every build of it, and the runtime initializes from mods/preloaded there;
+# an empty catalog is a valid one (the Mods page just lists nothing).
+cat > mods/preloaded/README.md <<EOF
+# Preloaded mods
+
+Ship reviewed, default-disabled packages here:
+
+\`\`\`text
+packages/<package-id>/<version>/
+  manifest.toml
+  ...
+\`\`\`
+
+A manifest's \`[[target]]\` names this title as \`game_id = "$GAME_ID"\` with the
+ROM's SHA-256 (both live in \`rom_identity.txt\`). CMakeLists.txt declares this
+directory with \`snesrecomp_target_mod_catalog\` and the FRAMEWORK stages
+\`packages/\` beside the executable on every build -- do not add a copy step of
+your own, and do not spell the destination: it belongs to snesrecomp, so a
+future change to the layout touches one file instead of every port. Nothing
+placed beside the executable by hand survives a build.
+Players install \`.snesmod\` archives through the launcher's Mods page, which
+the runtime keeps under its own state beside the executable.
+
+See \`snesrecomp/docs/MOD_PACKAGES.md\` for the manifest format and the
+trusted-plugin registration a package can activate.
+EOF
+: > mods/preloaded/packages/.gitkeep
 : > src/gen/.gitkeep
 
 echo "== Seeding analysis config =="
@@ -516,10 +688,24 @@ echo "== Seeding analysis config =="
     --write-symbols "$ROOT/recomp/symbols.toml"
 cp "$FRAMEWORK_ROOT/LICENSE" "$ROOT/LICENSE" 2>/dev/null || true
 
-if [ "$ENABLE_CI" -eq 1 ]; then
-    echo "== CI workflow =="
-    fill release.yml.in .github/workflows/release.yml
+if [ "$FETCH_BOXART" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
+    echo "== Fetching boxart (libretro Named_Boxarts) =="
+    # Same flow as psxrecomp's wizard: TGA for the launcher + PNG for the
+    # README, sourced and attributed in BOXART_SOURCE.txt. A miss is a warning
+    # — CMake already carries the BOXART argument and stages the file the
+    # moment it exists.
+    ROM_STEM=${ROM_FILE%.*}
+    if "$PYTHON" "$SCRIPT_DIR/fetch_boxart.py" \
+        --out "$ROOT/launcher_assets/img/boxart.tga" \
+        --cue-stem "$ROM_STEM" \
+        --display-name "$NAME"; then
+        :
+    else
+        echo "warning: boxart fetch failed — launcher shows no art until" \
+             "launcher_assets/img/boxart.tga exists." >&2
+    fi
 fi
+
 
 # ── Submodules ────────────────────────────────────────────────────────────
 FRAMEWORK_GAPS=""
@@ -528,11 +714,63 @@ if [ "$ADD_SUBMODULES" -eq 0 ]; then
     echo "snesrecomp=<not added>" > framework_pins.txt
 else
 echo "== Adding submodules =="
-git submodule add -q -b "$SNESRECOMP_REF" "$SNESRECOMP_URL" snesrecomp
+git submodule add -q -b "$SNESRECOMP_REF" "$SNESRECOMP_URL" snesrecomp 2>/dev/null ||
+    git submodule add -q "$SNESRECOMP_URL" snesrecomp
+if [ "$FRAMEWORK_REF_UNPUSHED" -eq 1 ]; then
+    # Take the commit from the local checkout so generate/build work now.
+    # The pin is recorded either way; pushing the branch later makes it
+    # resolvable for everyone else without changing this project.
+    echo "== Using the local framework commit ($SNESRECOMP_REF) =="
+    git -C snesrecomp fetch -q "$FRAMEWORK_ROOT" "$SNESRECOMP_REF"
+    git -C snesrecomp checkout --detach -q FETCH_HEAD
+    # Record the gitlink NOW. `submodule update` below restores each submodule
+    # to whatever the index says, so a checkout that is not staged first gets
+    # snapped straight back to the commit `submodule add` recorded.
+    git add snesrecomp
+fi
+# The recomp-ui ref, like the templates below, is the PINNED framework's
+# call (its lobby client compiles against recomp-ui's API), not this copy of
+# the wizard's -- unless --recomp-ui-ref said otherwise.
+if [ -z "${SET_RECOMP_UI_REF:-}" ] && [ -f snesrecomp/tools/new_project/RECOMP_UI_REF ]; then
+    _pinned_ui_ref=$(sed -n '1{s/[[:space:]]*$//;p}' snesrecomp/tools/new_project/RECOMP_UI_REF)
+    if [ -n "$_pinned_ui_ref" ] && [ "$_pinned_ui_ref" != "$RECOMP_UI_REF" ]; then
+        echo "== recomp-ui ref from the pinned framework: $_pinned_ui_ref (this wizard said $RECOMP_UI_REF) =="
+        RECOMP_UI_REF=$_pinned_ui_ref
+    fi
+fi
 if [ "$ENABLE_RECOMP_UI" -eq 1 ]; then
     git submodule add -q -b "$RECOMP_UI_REF" "$RECOMP_UI_URL" recomp-ui
 fi
 git submodule update --init --recursive
+
+# Render from the framework the project PINS, not from the copy of this wizard
+# that happens to be running. They are the same files only when this script
+# runs out of the checkout that becomes the submodule; Studio runs it from a
+# sibling checkout or its vendored copy, and a stale one there rendered a
+# host that predated the framework it pinned -- a scaffold that built, then
+# "did not boot", with nothing in it saying why. The pinned framework's
+# templates and its fill_tokens.py are authoritative for the code they
+# generate; a newer framework that needs a token this wizard does not know
+# fails loudly here rather than producing a project that is quietly wrong.
+if [ -f "$ROOT/snesrecomp/tools/new_project/templates/main.c.in" ]; then
+    _pinned_wizard="$ROOT/snesrecomp/tools/new_project"
+    if [ "$(cd "$_pinned_wizard" && pwd)" != "$SCRIPT_DIR" ]; then
+        echo "== Rendering from the pinned framework ($(git -C snesrecomp rev-parse --short HEAD)) =="
+        if ! diff -rq "$TEMPLATE_DIR" "$_pinned_wizard/templates" >/dev/null 2>&1; then
+            echo "   (this wizard's own templates differ from the pinned framework's;"
+            echo "    the pinned ones win -- they match the runtime the project builds)"
+        fi
+        TEMPLATE_DIR="$_pinned_wizard/templates"
+        FILL_TOKENS="$_pinned_wizard/fill_tokens.py"
+        if ! render_templates; then
+            echo "setup_project: the pinned framework's templates could not be" >&2
+            echo "  rendered by this copy of the wizard (it is older than the" >&2
+            echo "  framework). Run snesrecomp/tools/new_project/setup_project.sh" >&2
+            echo "  from a checkout of the ref you are pinning instead." >&2
+            exit 1
+        fi
+    fi
+fi
 
 # Nested modules live inside snesrecomp: recomp-net owns the wire and the
 # episode FSM, retcomm-rbengine the rollback host policy. The gitlink SHA the
@@ -583,6 +821,15 @@ if [ "$DO_GENERATE" -eq 1 ] &&
 fi
 if [ "$ENABLE_NETPLAY" -eq 1 ] && [ ! -f snesrecomp/lib/recomp-net/CMakeLists.txt ]; then
     note_gap "netplay: snesrecomp/lib/recomp-net is missing"
+fi
+# The lobby client (runner/src/netplay/snes_host_lobby.c) fills recomp-ui's
+# netplay callback table, mod-transfer entries included, whether or not this
+# project enables netplay -- so the recomp-ui ref must carry that API. Check
+# the header now instead of letting the first build fail on a struct member.
+if [ "$ENABLE_NETPLAY" -eq 1 ] && [ "$ENABLE_RECOMP_UI" -eq 1 ] &&
+   [ -f recomp-ui/src/recomp_launcher.h ] &&
+   ! grep -q 'lobby_mods_can_download' recomp-ui/src/recomp_launcher.h; then
+    note_gap "netplay: recomp-ui ref '$RECOMP_UI_REF' lacks the lobby mod-transfer API the framework's lobby client needs (try --recomp-ui-ref $(cat "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || echo merge/frameblend-localization))"
 fi
 if [ "$ENABLE_ROLLBACK" -eq 1 ]; then
     if [ ! -f snesrecomp/lib/retcomm-rbengine/CMakeLists.txt ]; then
@@ -669,11 +916,14 @@ if [ "$DO_GENERATE" -eq 1 ]; then
 fi
 
 BUILT=0
+GAME_EXE=""
 if [ "$DO_BUILD" -eq 1 ] && [ "$GENERATED" -eq 1 ]; then
     echo "== Building =="
     if cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null &&
        cmake --build build -j >/dev/null; then
         BUILT=1
+        GAME_EXE="build/$PROJECT_NAME"
+        [ -f "$GAME_EXE.exe" ] && GAME_EXE="$GAME_EXE.exe"
     else
         echo "warning: build failed — see the output above." >&2
         echo "         A fresh scaffold is not expected to run yet; src/game_rtl.c" >&2
@@ -693,6 +943,18 @@ fi
 
 echo
 echo "Ready: $ROOT"
+if [ "$GENERATED" -eq 1 ]; then
+    echo "  generated: $(find src/gen -name '*.c' | wc -l | tr -d ' ') C files in src/gen"
+    echo "  Expected build result: generated-code static library only"
+fi
+if [ "$BUILT" -eq 1 ] && [ -f "$GAME_EXE" ]; then
+    echo "  built:     $GAME_EXE ($(du -h "$GAME_EXE" | cut -f1))"
+    echo
+    echo "Run it:"
+    echo "  '$ROOT/$GAME_EXE' '$ROM_ABS'"
+    echo
+    echo "It will not play yet — src/game_rtl.c is where the port starts."
+fi
 echo
 echo "Next:"
 echo "  cd '$ROOT'"

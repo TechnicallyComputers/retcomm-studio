@@ -4,15 +4,23 @@ Scaffold a new SNES recomp title end to end: probe the ROM, lay out the repo,
 wire the submodules, seed the analysis config, generate C, build, and publish.
 
 ```sh
-sh tools/new_project/setup_project.sh --rom ~/roms/game.sfc --dir ~/src
+sh tools/new_project/setup_project.sh ~/roms/game.sfc --dir ~/src
 ```
 
-On a terminal that is the only argument you need: everything else is asked,
-with the probed ROM identity supplying the defaults. Flags are for scripting —
-anything passed explicitly skips its question, and `--yes` (or a non-TTY run)
-takes every default without asking.
+```powershell
+powershell -File tools\new_project\setup_project.ps1 -Rom C:\roms\game.sfc -Dir C:\src
+```
 
-`sh setup_project.sh --help` lists every flag.
+On a terminal the ROM is the only argument you need — and with none at all it
+is the first question. Everything else is asked, with the probed ROM identity
+supplying the defaults. Flags are for scripting: anything passed explicitly
+skips its question, and `--yes` (or a non-TTY run) takes every default without
+asking, with network toggles (boxart, GitHub) off unless flagged.
+
+`sh setup_project.sh --help` lists every flag. The PowerShell entry point is a
+thin launcher: it finds Git for Windows' bash and runs the same script with the
+same arguments, so there is one scaffolder to fix. It needs Git for Windows,
+Python 3 and CMake on `PATH`; WSL and Git Bash users can run the `.sh` directly.
 
 ## What it asks
 
@@ -24,7 +32,8 @@ takes every default without asking.
 | Release zip / CI artifact prefix | slug of the name |
 | Description, publisher, year | blank (README metadata) |
 | Region | from the cartridge header |
-| Include the recomp-ui launcher submodule? | no |
+| Include the recomp-ui launcher submodule? | yes |
+| Fetch libretro boxart now? (network) | yes on a terminal; off when non-interactive |
 | Enable netplay? | no — skipped entirely for a 1-player title |
 | Also build rollback? | yes, when netplay is on |
 | Add the GitHub Actions workflow? | yes |
@@ -41,6 +50,29 @@ same publish order for the same reason: scaffold + CI → commit → `gh repo
 create` (no push) → generate/build → one push. Pushing earlier leaves a second
 "initial" commit that collides when the script is re-run.
 
+## Existing projects: the release workflow on its own
+
+A project that predates the scaffolder, or was cut before the CI template
+gained a step, gets the same workflow from `tools/generate_ci`:
+
+```sh
+sh snesrecomp/tools/generate_ci.sh            # in the project; --check, --force, --dry-run
+```
+
+```powershell
+powershell -File snesrecomp\tools\generate_ci.ps1
+```
+
+It fills `templates/release.yml.in` with values read from the project --
+`project()` in CMakeLists.txt, `display_name` from `rom_identity.txt` (or the
+old `codegen_setup.c`), the zip prefix from `scripts/package_release.sh` --
+using the template from the project's own snesrecomp submodule, so the
+workflow matches the framework it pins. An installed workflow is compared by
+step name: `--check` exits 1 when it is missing or stale, and only `--force`
+overwrites one. It warns about anything the run will reach for and the
+project lacks (`VERSION`, `framework_pins.txt`, `rom_identity.txt`, the
+packager).
+
 ## What it produces
 
 ```text
@@ -49,13 +81,29 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 ├── VERSION                 release pin used for lobby version matching
 ├── framework_pins.txt      exact framework SHAs this project was cut against
 ├── recomp/                 bank*.cfg, symbols.toml — analysis input you own
-├── src/                    main.c, game_rtl.c, host_contract.c, codegen_setup.c
+├── rom_identity.txt        ROM digests + game_id — the one place a revision changes
+├── mods/preloaded/         mod catalog (staged beside the exe; empty to start)
+├── src/                    main.c (host shim), game_rtl.c, host_contract.c
 │   └── gen/                generated C (gitignored — never committed)
 ├── tools/regen.sh          ROM → C, with digest verification
 ├── scripts/package_release.sh
 ├── .github/workflows/release.yml
 └── snesrecomp/             framework submodule (owns lib/recomp-net, lib/retcomm-rbengine)
 ```
+
+## Which framework the scaffold is cut from
+
+The project pins `snesrecomp` as a submodule at the ref you name
+(`--snesrecomp-ref`, default `main`), and every templated file is rendered
+from THAT checkout's `tools/new_project/templates`, not from the copy of this
+wizard that happens to be running. The two are the same only when you run the
+wizard out of the checkout that becomes the submodule; Studio runs it from a
+sibling checkout or its vendored copy, and a stale one there once rendered a
+host that predated the framework it pinned: a project that built and did not
+boot. The recomp-ui ref comes from the pinned framework's `RECOMP_UI_REF` the
+same way. A wizard older than the framework it pins fails at the render with
+the missing token named, rather than producing a project that is quietly
+wrong.
 
 ## Pieces
 
@@ -65,6 +113,23 @@ create` (no push) → generate/build → one push. Pushing earlier leaves a seco
 | `probe_rom.py` | Cartridge-header identity: mapping, title, region, coprocessor, vectors, digests |
 | `fill_tokens.py` | `@TOKEN@` substitution; unknown tokens are an error, not a blank |
 | `templates/` | Everything written into the new repo |
+
+## The workflow it writes
+
+`.github/workflows/release.yml` builds four **setup packs** — Linux x86-64,
+Windows x86-64, macOS arm64, macOS Intel — and can attach them to a GitHub
+Release from a `v*` tag. It is manual-trigger only.
+
+A setup pack is not the game. `src/gen/` is derived from a ROM that never
+enters CI, so the pack holds the *setup host* (the executable built with
+`-DSNESRECOMP_SETUP_HOST=ON`, without recompiled code), the recompiler, and
+this source tree. On the player's machine the launcher's first-run wizard
+takes their own ROM, generates, rebuilds, and relaunches into the real game.
+The build tools (the retcomm `cmake-clang-v1` pack) are embedded in the zip by
+default, or downloaded on first run.
+
+See `snesrecomp/docs/ci/README.md` for the mechanics, and
+`snesrecomp/docs/LOCAL_CODEGEN_SDK.md` for the launcher side.
 
 `probe_rom.py` is usable on its own — `python3 probe_rom.py game.sfc` prints
 what the scaffold would bake in, which is the fastest way to check whether a
@@ -96,21 +161,54 @@ The ROM is probed where it lies and is never copied in. `tools/regen.sh` takes
 generated `.gitignore` blocks `*.sfc` / `*.smc` / `src/gen/` regardless.
 `scripts/package_release.sh` refuses to build a zip that contains ROM data.
 
+Which means the host has to *ask* for one, and the framework's desktop host
+(`runner/src/desktop/host_main.c`, linked by `snesrecomp_target_desktop_host()`;
+`src/main.c` is the shim that names the title) does — in this order, each candidate checked against the digests in
+`rom_identity.txt`, the same ones the C was generated from. The build turns
+that file into `snesrecomp_rom_identity.h`; `tools/regen.sh` and the release
+workflow read it directly, so a revision bump is a one-line edit:
+
+1. **The recomp-ui launcher** (`--recomp-ui`, on by default). A pre-boot GUI
+   with a ROM picker and verification badge, plus display / audio / input
+   settings, wired by one `recomp_target_launcher_ui(<target> CONSOLE snes)`
+   call. It is skipped when a ROM is passed on the command line, and when
+   `SDL_VIDEODRIVER=dummy` says nobody is there to answer it.
+2. **`snesrecomp_launcher_resolve_rom_sha256()`** — the positional argument,
+   then a copy beside the executable, then the `<exe_dir>/rom.cfg` cache, then
+   a native file picker (zenity / kdialog / qarma / osascript).
+
+Scaffolding with `--no-recomp-ui` keeps step 2 and compiles step 1 out; the
+generated `CMakeLists.txt` carries the block to paste back in. What no longer
+happens either way is the old behavior: printing a usage line and exiting 1
+because the ROM was not already sitting in the working directory.
+
 ## Failure handling
 
 The framework remotes are checked **before** anything is created, and a
 failure part way through removes the directory the script made rather than
 leaving a partial project the next run would refuse to overwrite.
 
-The framework URL is read from the checkout this script runs out of
-(`git remote get-url origin`) instead of being hard-coded, so it cannot drift
-from where snesrecomp actually lives.
+The framework **URL and ref** both come from the checkout this script runs out
+of, rather than being hard-coded — so a scaffold pins the framework that
+checkout actually has. Hard-coding `main` silently produced projects that
+could not generate or build whenever the work lived on a branch, which is the
+normal state while a feature is in progress.
+
+If that branch is not on the remote yet, the scaffolder says so, pins the
+local commit anyway, and carries on: the project generates and builds here,
+and pushing the branch later makes the pin resolvable for everyone else
+without touching the project.
+
+The pinned ref is then checked for the features the project asked for
+(`generate`, recomp-net, retcomm-rbengine, `snesrecomp_enable_rollback`), so a
+gap is reported up front instead of failing later with an argparse error that
+names nothing.
 
 ## Tests
 
 `tests/test_new_project.py` (in the framework suite, `python3
 tests/run_tests.py`) runs the scaffolder against a synthetic, redistributable
 image with `--no-submodules`, and checks the layout, that no `@TOKEN@`
-survives, that the ROM digests reach `regen.sh` / `codegen_setup.c` / the
-README identically, that multitap and rollback flags reach CMake, and that no
-ROM is ever staged.
+survives, that the ROM digests live in `rom_identity.txt` and are NOT copied
+into `regen.sh` / `main.c` / `CMakeLists.txt`, that multitap and rollback flags
+reach CMake, and that no ROM is ever staged.

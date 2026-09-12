@@ -13,14 +13,15 @@
 /dist/
 /saves/
 
-# Diagnostic capture bundles (tools/snes_analysis: snes_frame_capture.py,
-# snes_asset_decode.py, snes_loop_compare.py). These embed VRAM/CGRAM/WRAM
-# dumps taken from a running game — data derived from the ROM, for the same
-# reason /src/gen/ is never committed. They are evidence, not source:
-# regenerate them locally.
-/analysis/
-
 # Local probe output that names paths on one machine
 /rom_probe.json
+
+# Launcher/runtime state written beside the executable (and in the repo root
+# when the game is run from there): the cached ROM path, keybinds, settings.
+# All of it is one machine's, none of it is the project's.
+/rom.cfg
+/keybinds.ini
+/config.ini
+/input.ini
 
 .DS_Store
