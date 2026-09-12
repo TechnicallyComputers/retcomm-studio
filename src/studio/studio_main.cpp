@@ -1793,7 +1793,6 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
         ImGui::SameLine();
         ImGui::TextColored(th.text_muted, "four ports; no netplay on n64lle");
         model.np_netplay = false;
-        model.np_rollback = false;
     } else {
     // Netplay lives beside the seat count that gates it: a 1-player title
     // cannot opt in, and bumping the count to 2+ suggests it by default.
@@ -1904,17 +1903,9 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
     // created repo (<SLUG>_BUILD_UI), not a scaffolding choice.
     if (!n64) checkbox_wrapped("recomp-ui", &model.np_ui);
     if (!cart) checkbox_wrapped("Wizard", &model.np_wizard);
-    if (snes) {
-        if (ImGui::Checkbox("Rollback", &model.np_rollback)) {
-            if (model.np_rollback) model.np_netplay = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
-            ImGui::SetTooltip(
-                "Builds retcomm-rbengine in and implies netplay.\n"
-                "Delay-sync stays the runtime default; SNES_NET_MODE=rollback opts in.");
-        }
-    }
+    // No Rollback checkbox: retcomm-rbengine is part of every SNES desktop
+    // host now (run-ahead, rewind, and the netplay rollback session), so it
+    // is not a scaffolding choice any more.
     // n64lle ships no release workflow or packager template, so there is no CI
     // to emit and no boxart step in its scaffolder.
     if (!n64) checkbox_wrapped("CI##np", &model.np_ci);
@@ -2191,7 +2182,6 @@ void draw_new_project(StudioModel& model, const Theme& th, SDL_Window* window) {
             }
             if (!model.np_ui) args.push_back("--no-recomp-ui");
             if (model.np_netplay) args.push_back("--enable-netplay");
-            if (model.np_rollback) args.push_back("--enable-rollback");
             if (!model.np_ci) args.push_back("--no-ci");
             if (model.np_generate) args.push_back("--generate");
             if (model.np_build) args.push_back("--enable-build");

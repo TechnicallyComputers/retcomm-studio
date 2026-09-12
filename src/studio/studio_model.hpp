@@ -960,7 +960,6 @@ struct StudioModel {
     int np_n64_frames = 0;
     int np_n64_step_cap = 0;
     int  np_multitap = 0;   // 0 auto (from players), 1 port1, 2 port2, 3 both, 4 off
-    bool np_rollback = false;
     // Separate from np_region, which carries the PSX default "USA". Blank here
     // means "whatever the cartridge header says" — a habitual USA would
     // relabel a Japanese cartridge, and the header already knows.
