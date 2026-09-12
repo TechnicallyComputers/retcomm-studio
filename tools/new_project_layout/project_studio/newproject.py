@@ -311,6 +311,14 @@ def build_snes_command(opts: NewProjectOptions) -> tuple[list[str], dict[str, st
 
     env = os.environ.copy()
     env["SNESRECOMP_SETUP_YES"] = "1"
+    # The wizard's own --build runs a plain `cmake -S . -B build` with the
+    # toolchain compiler on PATH but nothing pointing find_package() at the
+    # toolchain's SDL3 -- so it found the host's /usr/lib/cmake/SDL3, whose
+    # headers the hermetic clang cannot see, and every fresh scaffold failed
+    # with "SDL3/SDL.h file not found" while Studio's own configure step (which
+    # applies this overlay) built the same tree fine.
+    from .buildops import toolchain_env
+    env.update(toolchain_env())
 
     cmd: list[str] = [
         "sh",
